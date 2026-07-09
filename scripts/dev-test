@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+export HOME="$PWD/.home"
+exec .venv/bin/python -m pytest tests/ -q "$@"
