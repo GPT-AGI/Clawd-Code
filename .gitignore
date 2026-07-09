@@ -64,7 +64,6 @@ archive/
 .env
 .env.local
 .env.*.local
-.home/
 *.pem
 *.key
 *.secret
