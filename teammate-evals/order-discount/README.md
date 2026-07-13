@@ -57,3 +57,6 @@ Inspect the complete run locally after or during execution:
 The viewer shows the event timeline, agent lanes, task graph, tool inputs and
 results, message handoffs, failures, timing, and token usage. It follows a run
 through server-sent events when opened before execution starts.
+
+Scheduler recovery, retry, cancellation, budget, parallelism, and worktree
+behavior are covered separately by `../runtime-resilience/evaluate.py`.

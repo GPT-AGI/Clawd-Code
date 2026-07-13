@@ -23,7 +23,7 @@ class Team:
         "running": {"completed", "failed", "cancelled"},
         "failed": {"running", "cancelled"},
         "completed": set(),
-        "cancelled": set(),
+        "cancelled": {"running"},
     }
 
     team_id: str
@@ -32,9 +32,14 @@ class Team:
     description: str | None = None
     agent_type: str | None = None
     status: str = "created"
+    settings: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, int] = field(default_factory=dict)
+    cancel_requested_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "team")
@@ -63,7 +68,7 @@ class AgentRecord:
         "idle": {"running", "completed", "cancelled"},
         "failed": {"running", "cancelled"},
         "completed": set(),
-        "cancelled": set(),
+        "cancelled": {"running"},
     }
 
     agent_id: str
@@ -74,13 +79,18 @@ class AgentRecord:
     model: str | None = None
     instructions: str = ""
     tools: list[str] = field(default_factory=list)
+    workspace_mode: str = "shared"
+    workspace_path: str | None = None
+    auto_integrate: bool = False
     status: str = "created"
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "agent")
+        if self.workspace_mode not in {"shared", "worktree"}:
+            raise ValueError("workspace_mode must be 'shared' or 'worktree'")
 
     def transition_to(self, status: str) -> None:
         _require_status(status, self.STATUSES, "agent")
@@ -102,10 +112,10 @@ class TeamTask:
     STATUSES: ClassVar[set[str]] = {"pending", "in_progress", "completed", "failed", "cancelled"}
     TRANSITIONS: ClassVar[dict[str, set[str]]] = {
         "pending": {"in_progress", "completed", "cancelled"},
-        "in_progress": {"completed", "failed", "cancelled"},
+        "in_progress": {"pending", "completed", "failed", "cancelled"},
         "failed": {"pending", "in_progress", "cancelled"},
         "completed": set(),
-        "cancelled": set(),
+        "cancelled": {"pending"},
     }
 
     id: str
@@ -119,9 +129,16 @@ class TeamTask:
     blockedBy: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     output: str = ""
+    attempt: int = 0
+    max_retries: int = 0
+    lease_id: str | None = None
+    lease_expires_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    last_error: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "task")

@@ -79,6 +79,8 @@ CLAUDE.md
 sessions/
 .transcripts/
 .port_sessions/
+.clawd/team.json
+.clawd/teams/
 
 # Claude Code personal settings
 CLAUDE.local.md

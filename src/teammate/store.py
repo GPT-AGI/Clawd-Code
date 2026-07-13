@@ -2,11 +2,43 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
 
 from .models import AgentRecord, Message, Team, TeamTask, utc_now
+
+
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def _locked_path(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _thread_lock(lock_path):
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class TeamStore:
@@ -82,6 +114,52 @@ class TeamStore:
     def save_tasks(self, team_id: str, tasks: dict[str, dict[str, Any]]) -> None:
         serialized = {task_id: TeamTask.from_dict(task).to_dict() for task_id, task in tasks.items()}
         self._write_json(self.team_dir(team_id) / "tasks.json", serialized)
+
+    def update_task(self, team_id: str, task: TeamTask) -> dict[str, dict[str, Any]]:
+        path = self.team_dir(team_id) / "tasks.json"
+        with _locked_path(path):
+            data = self._read_json(path) if path.exists() else {}
+            data[task.id] = task.to_dict()
+            self._write_json_unlocked(path, data)
+        return self.load_tasks(team_id)
+
+    def claim_task(
+        self,
+        team_id: str,
+        task_id: str,
+        *,
+        lease_id: str,
+        lease_expires_at: str,
+        max_retries: int,
+    ) -> TeamTask | None:
+        path = self.team_dir(team_id) / "tasks.json"
+        with _locked_path(path):
+            data = self._read_json(path) if path.exists() else {}
+            raw = data.get(task_id)
+            if not isinstance(raw, dict):
+                return None
+            task = TeamTask.from_dict(raw)
+            if task.status != "pending":
+                return None
+            task.transition_to("in_progress")
+            task.attempt += 1
+            task.max_retries = max(task.max_retries, max_retries)
+            task.lease_id = lease_id
+            task.lease_expires_at = lease_expires_at
+            task.started_at = utc_now()
+            task.completed_at = None
+            task.last_error = None
+            data[task_id] = task.to_dict()
+            self._write_json_unlocked(path, data)
+            return task
+
+    def delete_task(self, team_id: str, task_id: str) -> dict[str, dict[str, Any]]:
+        path = self.team_dir(team_id) / "tasks.json"
+        with _locked_path(path):
+            data = self._read_json(path) if path.exists() else {}
+            data.pop(task_id, None)
+            self._write_json_unlocked(path, data)
+        return self.load_tasks(team_id)
 
     def save_agent(self, agent: AgentRecord) -> Path:
         path = self.team_dir(agent.team_id) / "agents" / f"{agent.agent_id}.json"
@@ -170,10 +248,11 @@ class TeamStore:
             "created_at": created_at or utc_now(),
             "data": data or {},
         }
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        with _locked_path(path):
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
 
     def disband_active_team(self) -> Team | None:
         team = self.load_active_team()
@@ -218,6 +297,11 @@ class TeamStore:
 
     @staticmethod
     def _write_json(path: Path, data: dict[str, Any]) -> None:
+        with _locked_path(path):
+            TeamStore._write_json_unlocked(path, data)
+
+    @staticmethod
+    def _write_json_unlocked(path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:

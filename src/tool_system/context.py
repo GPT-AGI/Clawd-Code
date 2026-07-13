@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 from .errors import ToolPermissionError
 from .permissions import ToolPermissionContext
 from .task_manager import TaskManager
+from ..teammate.models import TeamTask
 from ..teammate.store import TeamStore
 
 
@@ -67,7 +68,11 @@ class ToolContext:
             return
         team_id = self.team.get("team_id")
         if isinstance(team_id, str) and team_id:
-            self.team_store.save_tasks(team_id, self.tasks)
+            if self.actor_id is not None and self.current_task_id in self.tasks:
+                task = TeamTask.from_dict(self.tasks[self.current_task_id])
+                self.tasks = self.team_store.update_task(team_id, task)
+            else:
+                self.team_store.save_tasks(team_id, self.tasks)
 
     def reload_team_state(self) -> None:
         active_team = self.team_store.load_active_team()

@@ -11,11 +11,15 @@ from src.tool_system.errors import ToolInputError
 from src.tool_system.tools import (
     SendMessageTool,
     TaskCreateTool,
+    TaskRetryTool,
     TaskUpdateTool,
+    TeamCancelTool,
     TeamCreateTool,
     TeamDeleteTool,
+    TeamIntegrateTool,
     TeammateCreateTool,
     TeamRunTool,
+    TeamResumeTool,
 )
 
 
@@ -176,12 +180,16 @@ class TestTeamPersistence(unittest.TestCase):
 
     def test_mutating_tools_are_not_marked_read_only(self) -> None:
         self.assertFalse(TeamCreateTool().spec().is_read_only)
+        self.assertFalse(TeamCancelTool().spec().is_read_only)
         self.assertFalse(TeamDeleteTool().spec().is_read_only)
+        self.assertFalse(TeamIntegrateTool().spec().is_read_only)
         self.assertFalse(TaskCreateTool().spec().is_read_only)
         self.assertFalse(TaskUpdateTool().spec().is_read_only)
+        self.assertFalse(TaskRetryTool().spec().is_read_only)
         self.assertFalse(SendMessageTool().spec().is_read_only)
         self.assertFalse(TeammateCreateTool().spec().is_read_only)
         self.assertFalse(TeamRunTool().spec().is_read_only)
+        self.assertFalse(TeamResumeTool().spec().is_read_only)
 
 
 if __name__ == "__main__":

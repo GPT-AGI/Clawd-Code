@@ -267,6 +267,27 @@ can come from `clawd login` or standard environment variables such as
 | `/clear`     | Clear history         |
 | `/exit`      | Exit REPL             |
 
+### Teammate Workflows
+
+The lead can create persistent teammates, assign dependency-aware tasks, and
+run them with bounded concurrency:
+
+```text
+TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
+```
+
+`TeamRun` accepts `max_workers`, `max_retries`, `lease_timeout_s`, `timeout_s`,
+`token_budget`, and `turn_budget`. Use `TeamResume` to recover expired leases or
+resume a failed/cancelled team, `TaskRetry` for an explicit task retry, and
+`TeamCancel` for cooperative cancellation. Every state transition, model call,
+tool call, and message handoff is persisted for `clawd trace`.
+
+Set `workspace_mode: "worktree"` on `TeammateCreate` for git isolation. With
+`auto_integrate: true`, successful changes are committed in the isolated
+worktree and cherry-picked into the lead repository. Downstream reviewers that
+must inspect newly integrated changes should use the shared workspace. The
+resilience evaluator is in `teammate-evals/runtime-resilience/`.
+
 ### Skills (Slash Commands)
 
 Skills are markdown-based slash commands stored under `.clawd/skills`. Each skill lives in its own directory and must be named `SKILL.md`.
@@ -705,6 +726,24 @@ Provider 凭据既可来自 `clawd login`，也可使用 `ANTHROPIC_AUTH_TOKEN`�
 | `/multiline` | 切换多行模式  |
 | `/clear`     | 清空历史    |
 | `/exit`      | 退出 REPL |
+
+### Teammate 工作流
+
+Lead 可以创建持久化 teammate、分配带依赖的任务，并限制并行度执行：
+
+```text
+TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
+```
+
+`TeamRun` 支持 `max_workers`、`max_retries`、`lease_timeout_s`、`timeout_s`、
+`token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，
+`TaskRetry` 显式重试单个任务，`TeamCancel` 执行协作式取消。所有状态迁移、模型调用、
+工具调用和消息交接都会持久化，可通过 `clawd trace` 查看。
+
+在 `TeammateCreate` 中设置 `workspace_mode: "worktree"` 可启用 Git 隔离；配合
+`auto_integrate: true`，成功改动会在隔离 worktree 中提交并 cherry-pick 回 lead 仓库。
+需要检查新整合改动的下游 reviewer 应使用 shared workspace。稳定性评测位于
+`teammate-evals/runtime-resilience/`。
 
 ### Skills（技能 / 斜杠命令）教程
 

@@ -259,6 +259,12 @@ class TaskUpdateTool:
         updated_fields: list[str] = []
         status_change: dict[str, str] | None = None
         requested_status = tool_input.get("status")
+        if context.actor_id is not None:
+            structural = {"owner", "addBlocks", "addBlockedBy"}
+            if structural.intersection(tool_input):
+                raise ToolInputError("teammates cannot change task ownership or dependencies")
+            if requested_status == "deleted":
+                raise ToolInputError("teammates cannot delete tasks")
         if requested_status is not None:
             if not isinstance(requested_status, str) or (
                 requested_status not in _TASK_STATUSES and requested_status != "deleted"
@@ -391,4 +397,56 @@ class TaskOutputTool:
                     "output": output,
                 },
             },
+        )
+
+
+class TaskRetryTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TaskRetry",
+            description="Reset a failed or cancelled task to pending for an explicit retry.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "taskId": {"type": "string"},
+                    "clearOutput": {"type": "boolean"},
+                },
+                "required": ["taskId"],
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may retry tasks")
+        identity = tool_input.get("taskId")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ToolInputError("taskId must be a non-empty task ID or key")
+        task_id = _resolve_task_id(context.tasks, identity)
+        if task_id is None:
+            raise ToolInputError(f"unknown task: {identity}")
+        task = TeamTask.from_dict(context.tasks[task_id])
+        if task.status not in {"failed", "cancelled"}:
+            raise ToolInputError("only failed or cancelled tasks can be retried")
+        previous = task.status
+        task.transition_to("pending")
+        task.lease_id = None
+        task.lease_expires_at = None
+        task.completed_at = None
+        if bool(tool_input.get("clearOutput", True)):
+            task.output = ""
+        context.tasks[task.id] = task.to_dict()
+        context.persist_tasks()
+        if context.team is not None:
+            context.team_store.append_event(
+                str(context.team["team_id"]),
+                "task.retry_requested",
+                {"task_id": task.id, "from": previous, "attempt": task.attempt},
+            )
+        return ToolResult(
+            name="TaskRetry",
+            output={"success": True, "taskId": task.id, "status": "pending"},
         )
