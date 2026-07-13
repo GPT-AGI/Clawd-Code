@@ -53,5 +53,39 @@ not invoke `Bash`, `cat`, `webReader`, or another web tool. A separate smoke run
 also invoked `Bash` successfully and reported the expected acceptance result of
 four passing and two failing checks.
 
-The remaining evaluation blocker is now genuine teammate spawning, messaging,
-and task scheduling rather than local engineering tool discovery.
+At that point, the remaining evaluation blocker was genuine teammate spawning,
+messaging, and task scheduling rather than local engineering tool discovery.
+
+## Native teammate run
+
+Date: 2026-07-13
+
+After adding the persistent teammate runtime and native trace instrumentation,
+a fresh-copy GLM 5.2 run completed the full workflow without manual source
+edits. The lead created exactly the required researcher, coder, and reviewer;
+scheduled the dependency chain; and received all three required message
+handoffs.
+
+Combined evaluator result:
+
+```text
+Collaboration evidence: PASSED
+Ran 6 tests
+OK
+Business acceptance: PASSED
+```
+
+Persisted trace summary:
+
+- 237 native events
+- 59 tool calls
+- 3 teammate messages
+- 67,945 aggregate input and output tokens
+- 5 minutes 44 seconds elapsed
+- all agents, tasks, and the team completed
+
+Eight tool attempts failed during the run, including incorrect path casing,
+unavailable Python aliases, expected failing baseline tests, and one malformed
+review command. Each failure was visible in the trace and the agents recovered
+without operator intervention. The trace was recorded natively rather than
+reconstructed from teammate sessions.

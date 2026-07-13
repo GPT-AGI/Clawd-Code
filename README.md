@@ -239,7 +239,15 @@ The configuration file is saved in in `~/.clawd/config.json`. Example structure:
 ```bash
 python -m src.cli          # Start REPL
 python -m src.cli --help   # Show help
+clawd run -C ./project --prompt-file TASK.md  # Run one task non-interactively
+clawd trace ./project      # Inspect teammate traces locally
 ```
+
+`clawd run` also accepts a quoted prompt or piped stdin. Local file operations
+are scoped to the selected workspace, progress is written to stderr, and the
+final answer is written to stdout for scripting and CI use. Provider credentials
+can come from `clawd login` or standard environment variables such as
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and `OPENAI_API_KEY`.
 
 **That's it!** Start chatting with AI in 3 steps.
 
@@ -671,7 +679,14 @@ python -m src.cli login
 ```bash
 python -m src.cli          # 启动 REPL
 python -m src.cli --help   # 显示帮助
+clawd run -C ./project --prompt-file TASK.md  # 非交互执行单次任务
+clawd trace ./project      # 在本地查看 teammate 运行轨迹
 ```
+
+`clawd run` 也支持直接传入 prompt 或从 stdin 读取。本地文件操作范围限制在指定
+workspace 内，执行进度输出到 stderr，最终回答输出到 stdout，便于脚本和 CI 使用。
+Provider 凭据既可来自 `clawd login`，也可使用 `ANTHROPIC_AUTH_TOKEN`、
+`ANTHROPIC_BASE_URL`、`OPENAI_API_KEY` 等标准环境变量。
 
 **就这样！** 3 步开始与 AI 对话。
 

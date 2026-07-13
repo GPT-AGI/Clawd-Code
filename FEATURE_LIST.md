@@ -43,6 +43,9 @@
 | Token / Cost 跟踪 | 🚫 | 当前聊天 CLI 尚未形成完整统计视图 |
 | 上下文构建 | 🟡 | 已有 `context_system` 基础版，支持 workspace / git / `CLAUDE.md` 注入，仍缺 README 摘要、memory、compact |
 | Claude Code Agent Loop | ✅ | 已实现 agent_loop.py，支持工具调用循环 |
+| 非交互任务执行 | ✅ | `clawd run` 支持 prompt 文件、stdin、workspace、模型与 turn 限制 |
+| Teammate Runtime | ✅ | 持久化团队、独立会话、依赖调度、消息交接与真实模型执行闭环 |
+| Teammate Trace Viewer | ✅ | `clawd trace` 提供实时事件、工具调用、消息与任务依赖可视化 |
 | `/resume` 会话恢复体验 | 🚫 | 暂无独立恢复流程与 UI |
 | `/compact` 对话压缩 | 🚫 | 暂无自动/手动压缩能力 |
 | `/doctor` 诊断系统 | 🚫 | 暂无环境、配置、权限、依赖诊断命令 |
@@ -132,6 +135,8 @@
 | Provider 测试 | ✅ | `test_providers.py` (113 行) |
 | 输出样式测试 | ✅ | `test_output_styles.py` (64 行) |
 | 配置测试 | ✅ | `test_config.py` |
+| Teammate runtime / trace 测试 | ✅ | `test_teammate_runtime.py`、`test_teammate_viewer.py` |
+| 非交互 runner 测试 | ✅ | `test_runner.py` |
 
 
 ## 路线图
