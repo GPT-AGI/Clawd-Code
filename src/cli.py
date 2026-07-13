@@ -27,6 +27,7 @@ Examples:
   clawd --version          Show version
   clawd login              Configure API keys
   clawd config             Show current configuration
+  clawd trace .             Inspect teammate tool calls and messages
   clawd --stream           Start REPL with live response rendering
   clawd                    Start interactive REPL
 """
@@ -56,6 +57,13 @@ Examples:
     # config subcommand
     config_parser = subparsers.add_parser('config', help='Show current configuration')
 
+    trace_parser = subparsers.add_parser('trace', help='Open the teammate trace viewer')
+    trace_parser.add_argument('workspace', nargs='?', default='.', help='Workspace containing .clawd state')
+    trace_parser.add_argument('--host', default='127.0.0.1', help='Viewer bind host')
+    trace_parser.add_argument('--port', type=int, default=8765, help='Viewer bind port (0 chooses a free port)')
+    trace_parser.add_argument('--team', help='Team ID to select initially')
+    trace_parser.add_argument('--open', action='store_true', help='Open the viewer in the default browser')
+
     args = parser.parse_args()
 
     # Handle --version
@@ -73,6 +81,16 @@ Examples:
         return handle_login()
     elif args.command == 'config':
         return show_config()
+    elif args.command == 'trace':
+        from src.teammate.viewer import serve_trace_viewer
+
+        return serve_trace_viewer(
+            Path(args.workspace),
+            host=args.host,
+            port=args.port,
+            team_id=args.team,
+            open_browser=args.open,
+        )
 
     # Default: start REPL
     return start_repl(stream=args.stream)

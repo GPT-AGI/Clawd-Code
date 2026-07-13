@@ -31,3 +31,13 @@ No API key is stored in this fixture. Clawd reads it from the user's normal
 After the run, execute the baseline command again and inspect the team state in
 `.clawd/teams/`. The expected collaboration evidence is described in
 `acceptance.json`.
+
+Run the combined automated evaluator from this directory:
+
+```bash
+../../.venv/bin/python evaluate.py
+```
+
+It verifies the business checks plus teammate records, independent sessions,
+task ownership and dependencies, message handoffs, event history, and final
+team status.

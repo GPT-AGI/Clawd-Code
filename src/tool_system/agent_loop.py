@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .registry import ToolRegistry
@@ -14,6 +16,7 @@ from ..outputStyles import resolve_output_style
 from ..providers.base import BaseProvider, ChatResponse
 from ..providers.anthropic_provider import AnthropicProvider
 from ..providers.minimax_provider import MinimaxProvider
+from ..teammate.trace import TeamTraceRecorder
 
 
 _LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
@@ -100,12 +103,23 @@ def summarize_tool_result(name: str, output: Any) -> str:
 @dataclass(frozen=True)
 class ToolEvent:
     kind: str
-    tool_name: str
+    tool_name: str | None = None
     tool_input: dict[str, Any] | None = None
     tool_output: Any | None = None
     tool_use_id: str | None = None
     is_error: bool = False
     error: str | None = None
+    content: str | None = None
+    model: str | None = None
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+    turn: int | None = None
+    duration_ms: int | None = None
+    created_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.created_at:
+            object.__setattr__(self, "created_at", datetime.now(timezone.utc).isoformat())
 
 
 @dataclass(frozen=True)
@@ -183,6 +197,8 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
     except Exception:
         context_prompt = ""
     sections = [style_prompt, _LOCAL_TOOL_GUIDANCE]
+    if tool_context.system_prompt_extra and tool_context.system_prompt_extra.strip():
+        sections.append(tool_context.system_prompt_extra.strip())
     if context_prompt.strip():
         sections.append(context_prompt)
     return "\n\n".join(sections)
@@ -301,6 +317,30 @@ def run_agent_loop(
     # Track usage across all turns
     total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
     turn_count = 0
+    trace_recorder = TeamTraceRecorder(tool_context)
+
+    def emit(event: ToolEvent) -> None:
+        _safe_call_handler(on_event, event)
+        trace_recorder.record(event)
+
+    def finish(response_text: str, *, failed: bool = False) -> AgentLoopResult:
+        usage = total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None
+        emit(ToolEvent(
+            kind="run_failed" if failed else "run_completed",
+            content=response_text,
+            model=tool_context.model_override or getattr(provider, "model", None),
+            usage=usage,
+            turn=turn_count,
+            is_error=failed,
+            error=response_text if failed else None,
+        ))
+        return AgentLoopResult(response_text=response_text, usage=usage, num_turns=turn_count)
+
+    emit(ToolEvent(
+        kind="run_started",
+        model=tool_context.model_override or getattr(provider, "model", None),
+        turn=0,
+    ))
 
     for turn in range(max_turns):
         if _is_anthropic_provider(provider):
@@ -310,18 +350,37 @@ def run_agent_loop(
             api_messages = openai_messages
 
         call_kwargs: dict[str, Any] = {"tools": tool_schemas}
+        if tool_context.model_override:
+            call_kwargs["model"] = tool_context.model_override
         if _is_anthropic_provider(provider):
             call_kwargs["system"] = effective_system_prompt
         else:
             if turn == 0:
                 api_messages = [{"role": "system", "content": effective_system_prompt}, *api_messages]
-        response, streamed_live_text = _call_provider_for_turn(
-            provider=provider,
-            api_messages=api_messages,
-            call_kwargs=call_kwargs,
-            stream=stream,
-            on_text_chunk=on_text_chunk,
-        )
+        model_name = tool_context.model_override or getattr(provider, "model", None)
+        emit(ToolEvent(kind="model_started", model=model_name, turn=turn + 1))
+        model_started_at = time.monotonic()
+        try:
+            response, streamed_live_text = _call_provider_for_turn(
+                provider=provider,
+                api_messages=api_messages,
+                call_kwargs=call_kwargs,
+                stream=stream,
+                on_text_chunk=on_text_chunk,
+            )
+        except Exception as exc:
+            duration_ms = round((time.monotonic() - model_started_at) * 1000)
+            error = f"{type(exc).__name__}: {exc}"
+            emit(ToolEvent(
+                kind="model_error",
+                model=model_name,
+                turn=turn + 1,
+                duration_ms=duration_ms,
+                is_error=True,
+                error=error,
+            ))
+            finish(error, failed=True)
+            raise
         turn_count += 1
 
         # Collect usage info
@@ -331,6 +390,15 @@ def run_agent_loop(
 
         # Build assistant content for Anthropic or just text for OpenAI
         final_assistant_content = response.content or ""
+        emit(ToolEvent(
+            kind="model_response",
+            content=final_assistant_content,
+            model=response.model or model_name,
+            usage=response.usage,
+            finish_reason=response.finish_reason,
+            turn=turn_count,
+            duration_ms=round((time.monotonic() - model_started_at) * 1000),
+        ))
 
         if _is_anthropic_provider(provider):
             assistant_blocks: list = []
@@ -376,26 +444,18 @@ def run_agent_loop(
             if stream and final_assistant_content and not streamed_live_text:
                 _emit_text_chunks(on_text_chunk, final_assistant_content)
             if (final_assistant_content or "").strip() == "" and last_user_visible_message is not None:
-                return AgentLoopResult(
-                    response_text=last_user_visible_message,
-                    usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-                    num_turns=turn_count,
-                )
-            return AgentLoopResult(
-                response_text=final_assistant_content,
-                usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-                num_turns=turn_count,
-            )
+                return finish(last_user_visible_message)
+            return finish(final_assistant_content)
 
         # Call each tool
         for tool_use in tool_uses:
             tool_id = tool_use["id"]
             tool_name = tool_use["name"]
             tool_input = tool_use["input"]
+            tool_started_at = time.monotonic()
 
             try:
-                _safe_call_handler(
-                    on_event,
+                emit(
                     ToolEvent(
                         kind="tool_use",
                         tool_name=tool_name,
@@ -426,14 +486,14 @@ def run_agent_loop(
                     summary = summarize_tool_result(tool_name, result_output)
                     print(f"{summary}")
 
-                _safe_call_handler(
-                    on_event,
+                emit(
                     ToolEvent(
                         kind="tool_result",
                         tool_name=tool_name,
                         tool_output=result_output,
                         tool_use_id=tool_id,
                         is_error=result.is_error,
+                        duration_ms=round((time.monotonic() - tool_started_at) * 1000),
                     ),
                 )
                 if _is_anthropic_provider(provider):
@@ -449,8 +509,7 @@ def run_agent_loop(
                 error_str = f"Error: {e}"
                 if verbose:
                     print(f"[Tool Error] {error_str}")
-                _safe_call_handler(
-                    on_event,
+                emit(
                     ToolEvent(
                         kind="tool_error",
                         tool_name=tool_name,
@@ -458,6 +517,7 @@ def run_agent_loop(
                         tool_use_id=tool_id,
                         is_error=True,
                         error=error_str,
+                        duration_ms=round((time.monotonic() - tool_started_at) * 1000),
                     ),
                 )
                 if _is_anthropic_provider(provider):
@@ -470,8 +530,4 @@ def run_agent_loop(
                     })
 
     # Reached max turns
-    return AgentLoopResult(
-        response_text="[Max tool turns reached]",
-        usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-        num_turns=turn_count,
-    )
+    return finish("[Max tool turns reached]", failed=True)

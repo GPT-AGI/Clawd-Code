@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import platform
+import uuid
 from typing import Any
 
+from ...teammate.models import Message
 from ..context import ToolContext
 from ..errors import ToolInputError, ToolPermissionError
 from ..protocol import ToolResult
@@ -13,7 +15,7 @@ class SendMessageTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="SendMessage",
-            description="Send a message to another recipient (best-effort, local only).",
+            description="Send and persist a message to a teammate or to the lead.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -36,8 +38,55 @@ class SendMessageTool:
             raise ToolInputError("to must be a non-empty string")
         if summary is not None and not isinstance(summary, str):
             raise ToolInputError("summary must be a string when provided")
-        context.outbox.append({"tool": "SendMessage", "to": to, "summary": summary, "message": message})
-        return ToolResult(name="SendMessage", output={"success": True, "message": f"Message queued for {to}"})
+        if context.team is None:
+            raise ToolInputError("SendMessage requires an active team")
+
+        team_id = str(context.team["team_id"])
+        lead_id = str(context.team["lead_agent_id"])
+        recipient_name = to.strip()
+        if recipient_name.lower() == "lead" or recipient_name == lead_id:
+            recipient_id = lead_id
+        else:
+            recipient = context.team_store.find_agent(team_id, recipient_name)
+            if recipient is None:
+                raise ToolInputError(f"unknown message recipient: {recipient_name}")
+            recipient_id = recipient.agent_id
+        sender_id = context.actor_id or lead_id
+        if sender_id != lead_id and context.team_store.load_agent(team_id, sender_id) is None:
+            raise ToolInputError(f"unknown message sender: {sender_id}")
+
+        persisted = Message(
+            message_id=uuid.uuid4().hex,
+            team_id=team_id,
+            sender_id=sender_id,
+            recipient_id=recipient_id,
+            content=message,
+            summary=summary,
+        )
+        persisted.transition_to("delivered")
+        path = context.team_store.save_message(persisted)
+        context.team_store.append_event(team_id, "message.delivered", {"message": persisted.to_dict()})
+        context.outbox.append(
+            {
+                "tool": "SendMessage",
+                "message_id": persisted.message_id,
+                "from": sender_id,
+                "to": recipient_id,
+                "summary": summary,
+                "message": message,
+            }
+        )
+        return ToolResult(
+            name="SendMessage",
+            output={
+                "success": True,
+                "message_id": persisted.message_id,
+                "sender_id": sender_id,
+                "recipient_id": recipient_id,
+                "status": persisted.status,
+                "message_file_path": str(path),
+            },
+        )
 
 
 class RemoteTriggerTool:

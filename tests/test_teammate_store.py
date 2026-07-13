@@ -8,7 +8,15 @@ from pathlib import Path
 from src.teammate.models import AgentRecord, Message, Team, TeamTask
 from src.tool_system.context import ToolContext
 from src.tool_system.errors import ToolInputError
-from src.tool_system.tools import SendMessageTool, TaskCreateTool, TaskUpdateTool, TeamCreateTool, TeamDeleteTool
+from src.tool_system.tools import (
+    SendMessageTool,
+    TaskCreateTool,
+    TaskUpdateTool,
+    TeamCreateTool,
+    TeamDeleteTool,
+    TeammateCreateTool,
+    TeamRunTool,
+)
 
 
 class TestTeammateModels(unittest.TestCase):
@@ -83,6 +91,7 @@ class TestTeamPersistence(unittest.TestCase):
         self.assertTrue((team_dir / "agents").is_dir())
         self.assertTrue((team_dir / "sessions").is_dir())
         self.assertTrue((team_dir / "messages").is_dir())
+        self.assertEqual(context.team_store.list_events(team_id)[0]["type"], "team.created")
 
         task = TaskCreateTool().run(
             {"subject": "Inspect", "description": "Inspect the runtime"}, context
@@ -94,7 +103,7 @@ class TestTeamPersistence(unittest.TestCase):
         restored = ToolContext(workspace_root=self.root)
         self.assertEqual(restored.team["team_id"], team_id)
         self.assertEqual(restored.tasks[task["id"]]["status"], "in_progress")
-        self.assertEqual(restored.tasks[task["id"]]["owner"], "lead")
+        self.assertEqual(restored.tasks[task["id"]]["owner"], created["lead_agent_id"])
 
     def test_disband_removes_active_pointer_and_preserves_history(self) -> None:
         context = ToolContext(workspace_root=self.root)
@@ -125,6 +134,31 @@ class TestTeamPersistence(unittest.TestCase):
         self.assertEqual(restored, agent)
         self.assertEqual(context.team_store.list_agents(team_id), [agent])
 
+    def test_messages_and_sessions_roundtrip_through_team_store(self) -> None:
+        context = ToolContext(workspace_root=self.root)
+        created = TeamCreateTool().run({"team_name": "demo"}, context).output
+        teammate = TeammateCreateTool().run(
+            {
+                "name": "researcher",
+                "role": "research",
+                "instructions": "Inspect only",
+                "tools": ["Read"],
+            },
+            context,
+        ).output
+
+        result = SendMessageTool().run(
+            {"to": "researcher", "summary": "start", "message": "Inspect requirements"},
+            context,
+        ).output
+
+        stored = context.team_store.load_message(created["team_id"], result["message_id"])
+        self.assertEqual(stored.sender_id, created["lead_agent_id"])
+        self.assertEqual(stored.recipient_id, teammate["agent_id"])
+        self.assertEqual(stored.status, "delivered")
+        session = context.team_store.load_session(created["team_id"], teammate["session_id"])
+        self.assertEqual(session["agent_id"], teammate["agent_id"])
+
     def test_task_tool_enforces_state_transitions_without_partial_update(self) -> None:
         context = ToolContext(workspace_root=self.root)
         TeamCreateTool().run({"team_name": "demo"}, context)
@@ -146,6 +180,8 @@ class TestTeamPersistence(unittest.TestCase):
         self.assertFalse(TaskCreateTool().spec().is_read_only)
         self.assertFalse(TaskUpdateTool().spec().is_read_only)
         self.assertFalse(SendMessageTool().spec().is_read_only)
+        self.assertFalse(TeammateCreateTool().spec().is_read_only)
+        self.assertFalse(TeamRunTool().spec().is_read_only)
 
 
 if __name__ == "__main__":

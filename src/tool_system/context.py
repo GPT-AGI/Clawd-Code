@@ -27,6 +27,11 @@ class ToolContext:
     ask_user: Callable[[list[dict[str, Any]]], dict[str, str]] | None = None
     crons: dict[str, dict[str, Any]] = field(default_factory=dict)
     team: dict[str, Any] | None = None
+    actor_id: str | None = None
+    current_task_id: str | None = None
+    system_prompt_extra: str | None = None
+    model_override: str | None = None
+    teammate_runtime: Any | None = None
     output_style_name: str | None = None
     output_style_dir: Path | None = None
     team_store: TeamStore = field(init=False, repr=False)
@@ -63,6 +68,15 @@ class ToolContext:
         team_id = self.team.get("team_id")
         if isinstance(team_id, str) and team_id:
             self.team_store.save_tasks(team_id, self.tasks)
+
+    def reload_team_state(self) -> None:
+        active_team = self.team_store.load_active_team()
+        if active_team is None:
+            self.team = None
+            self.tasks = {}
+            return
+        self.team = active_team.to_dict()
+        self.tasks = self.team_store.load_tasks(active_team.team_id)
 
     def mark_file_read(self, path: Path) -> None:
         stat = path.stat()

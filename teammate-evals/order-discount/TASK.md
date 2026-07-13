@@ -25,9 +25,27 @@ The lead agent must:
 7. Summarize changed files, test results, messages exchanged, and each
    teammate's contribution.
 
+Use `TeammateCreate` for each teammate and give it an explicit tool allowlist:
+
+- researcher: `Read`, `Glob`, `Grep`
+- coder: `Read`, `Glob`, `Grep`, `Write`, `Edit`, `Bash`
+- reviewer: `Read`, `Glob`, `Grep`, `Bash`
+
+Create tasks with `TaskCreate` keys `analysis`, `implementation`, and `review`.
+Set each task's `owner` to the matching teammate name and declare `blockedBy`
+using the preceding task key. After setup, call `TeamRun`; it schedules ready
+tasks, delivers teammate messages, and completes the team only after all tasks
+succeed. `SendMessage` determines the sender from the active teammate session.
+
 Do not modify `requirements.md`, `TASK.md`, or files under `checks/`. Do not
 weaken or delete tests. The final command below must pass:
 
 ```bash
 python -m unittest checks.order_acceptance -v
+```
+
+The complete business-and-collaboration evaluation must also pass:
+
+```bash
+python evaluate.py
 ```

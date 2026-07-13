@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import re
 from typing import Any
 
 from ..context import ToolContext
@@ -17,18 +18,66 @@ def _new_task_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _task_key(subject: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", subject.strip().lower()).strip("-")
+    return normalized or _new_task_id()
+
+
+def _resolve_task_id(tasks: dict[str, dict[str, Any]], identity: str) -> str | None:
+    if identity in tasks:
+        return identity
+    normalized = identity.strip().lower()
+    matches = [
+        task_id
+        for task_id, task in tasks.items()
+        if str(task.get("key") or "").lower() == normalized
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_owner(context: ToolContext, identity: str) -> str:
+    if context.team is None:
+        return identity
+    team_id = str(context.team["team_id"])
+    lead_id = str(context.team["lead_agent_id"])
+    if identity.strip().lower() == "lead" or identity == lead_id:
+        return lead_id
+    agent = context.team_store.find_agent(team_id, identity)
+    if agent is None:
+        raise ToolInputError(f"unknown task owner: {identity}")
+    return agent.agent_id
+
+
+def _resolve_dependencies(context: ToolContext, identities: Any, field_name: str) -> list[str]:
+    if identities is None:
+        return []
+    if not isinstance(identities, list) or not all(isinstance(item, str) and item.strip() for item in identities):
+        raise ToolInputError(f"{field_name} must be an array of task IDs or keys")
+    resolved: list[str] = []
+    for identity in identities:
+        task_id = _resolve_task_id(context.tasks, identity)
+        if task_id is None:
+            raise ToolInputError(f"unknown task dependency: {identity}")
+        if task_id not in resolved:
+            resolved.append(task_id)
+    return resolved
+
+
 class TaskCreateTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TaskCreate",
-            description="Create a task in the task list.",
+            description="Create a task. For teammate work, provide a stable key, owner name, and blockedBy task keys.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
+                    "key": {"type": "string"},
                     "subject": {"type": "string"},
                     "description": {"type": "string"},
                     "activeForm": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "blockedBy": {"type": "array", "items": {"type": "string"}},
                     "metadata": {"type": "object"},
                 },
                 "required": ["subject", "description"],
@@ -42,6 +91,8 @@ class TaskCreateTool:
         subject = tool_input.get("subject")
         description = tool_input.get("description")
         active_form = tool_input.get("activeForm") or ""
+        requested_key = tool_input.get("key")
+        owner = tool_input.get("owner")
         metadata = tool_input.get("metadata") or {}
         if not isinstance(subject, str) or not subject.strip():
             raise ToolInputError("subject must be a non-empty string")
@@ -49,19 +100,51 @@ class TaskCreateTool:
             raise ToolInputError("description must be a non-empty string")
         if not isinstance(active_form, str):
             raise ToolInputError("activeForm must be a string when provided")
+        if requested_key is not None and (not isinstance(requested_key, str) or not requested_key.strip()):
+            raise ToolInputError("key must be a non-empty string when provided")
+        if owner is not None and (not isinstance(owner, str) or not owner.strip()):
+            raise ToolInputError("owner must be a non-empty string when provided")
         if not isinstance(metadata, dict):
             raise ToolInputError("metadata must be an object when provided")
 
+        key = requested_key.strip() if isinstance(requested_key, str) else _task_key(subject)
+        if any(str(task.get("key") or "").lower() == key.lower() for task in context.tasks.values()):
+            raise ToolInputError(f"task key already exists: {key}")
+        dependencies = _resolve_dependencies(context, tool_input.get("blockedBy"), "blockedBy")
         task_id = _new_task_id()
         context.tasks[task_id] = TeamTask(
             id=task_id,
             subject=subject.strip(),
             description=description,
+            key=key,
             activeForm=active_form,
+            owner=_resolve_owner(context, owner.strip()) if isinstance(owner, str) else None,
+            blockedBy=dependencies,
             metadata=dict(metadata),
         ).to_dict()
+        for dependency_id in dependencies:
+            blocks = list(context.tasks[dependency_id].get("blocks") or [])
+            if task_id not in blocks:
+                blocks.append(task_id)
+                context.tasks[dependency_id]["blocks"] = blocks
+                context.tasks[dependency_id]["updated_at"] = utc_now()
         context.persist_tasks()
-        return ToolResult(name="TaskCreate", output={"task": {"id": task_id, "subject": subject}})
+        if context.team is not None:
+            context.team_store.append_event(
+                str(context.team["team_id"]), "task.created", {"task": context.tasks[task_id]}
+            )
+        return ToolResult(
+            name="TaskCreate",
+            output={
+                "task": {
+                    "id": task_id,
+                    "key": key,
+                    "subject": subject,
+                    "owner": context.tasks[task_id].get("owner"),
+                    "blockedBy": dependencies,
+                }
+            },
+        )
 
 
 class TaskGetTool:
@@ -92,11 +175,14 @@ class TaskGetTool:
             output={
                 "task": {
                     "id": task["id"],
+                    "key": task.get("key"),
                     "subject": task["subject"],
                     "description": task["description"],
                     "status": task["status"],
                     "blocks": list(task.get("blocks") or []),
                     "blockedBy": list(task.get("blockedBy") or []),
+                    "owner": task.get("owner"),
+                    "output": task.get("output") or "",
                 }
             },
         )
@@ -119,6 +205,7 @@ class TaskListTool:
             tasks.append(
                 {
                     "id": t["id"],
+                    "key": t.get("key"),
                     "subject": t["subject"],
                     "status": t["status"],
                     **({"owner": t["owner"]} if t.get("owner") else {}),
@@ -146,6 +233,7 @@ class TaskUpdateTool:
                     "addBlocks": {"type": "array", "items": {"type": "string"}},
                     "addBlockedBy": {"type": "array", "items": {"type": "string"}},
                     "owner": {"type": "string"},
+                    "output": {"type": "string"},
                     "metadata": {"type": "object"},
                 },
                 "required": ["taskId"],
@@ -165,6 +253,8 @@ class TaskUpdateTool:
                 name="TaskUpdate",
                 output={"success": False, "taskId": task_id, "updatedFields": [], "error": "Task not found"},
             )
+        if context.actor_id is not None and context.current_task_id is not None and task_id != context.current_task_id:
+            raise ToolInputError("teammates may only update their current task")
 
         updated_fields: list[str] = []
         status_change: dict[str, str] | None = None
@@ -191,7 +281,7 @@ class TaskUpdateTool:
                     raise ToolInputError(str(exc)) from exc
                 status_change = {"from": str(task.get("status")), "to": requested_status}
 
-        for field in ("subject", "description", "activeForm", "owner"):
+        for field in ("subject", "description", "activeForm", "output"):
             if field in tool_input and tool_input[field] is not None:
                 v = tool_input[field]
                 if not isinstance(v, str):
@@ -200,15 +290,24 @@ class TaskUpdateTool:
                     task[field] = v
                     updated_fields.append(field)
 
+        if "owner" in tool_input and tool_input["owner"] is not None:
+            value = tool_input["owner"]
+            if not isinstance(value, str) or not value.strip():
+                raise ToolInputError("owner must be a non-empty string when provided")
+            resolved_owner = _resolve_owner(context, value.strip())
+            if resolved_owner != task.get("owner"):
+                task["owner"] = resolved_owner
+                updated_fields.append("owner")
+
         if status_change is not None:
             task["status"] = requested_status
             updated_fields.append("status")
 
         for rel_field, input_key in (("blocks", "addBlocks"), ("blockedBy", "addBlockedBy")):
             if input_key in tool_input and tool_input[input_key] is not None:
-                ids = tool_input[input_key]
-                if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
-                    raise ToolInputError(f"{input_key} must be an array of strings when provided")
+                ids = _resolve_dependencies(context, tool_input[input_key], input_key)
+                if task_id in ids:
+                    raise ToolInputError("a task cannot depend on or block itself")
                 cur = list(task.get(rel_field) or [])
                 for x in ids:
                     if x not in cur:
@@ -216,6 +315,14 @@ class TaskUpdateTool:
                 if cur != task.get(rel_field):
                     task[rel_field] = cur
                     updated_fields.append(rel_field)
+                reciprocal = "blocks" if rel_field == "blockedBy" else "blockedBy"
+                for related_id in ids:
+                    related = context.tasks[related_id]
+                    values = list(related.get(reciprocal) or [])
+                    if task_id not in values:
+                        values.append(task_id)
+                        related[reciprocal] = values
+                        related["updated_at"] = utc_now()
 
         if "metadata" in tool_input and tool_input["metadata"] is not None:
             md = tool_input["metadata"]

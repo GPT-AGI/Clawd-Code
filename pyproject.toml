@@ -51,3 +51,6 @@ Documentation = "https://github.com/GPT-AGI/Clawd-Codex#readme"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.teammate" = ["trace_viewer.html"]

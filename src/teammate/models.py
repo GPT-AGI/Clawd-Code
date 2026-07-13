@@ -72,6 +72,8 @@ class AgentRecord:
     role: str
     session_id: str
     model: str | None = None
+    instructions: str = ""
+    tools: list[str] = field(default_factory=list)
     status: str = "created"
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -109,6 +111,7 @@ class TeamTask:
     id: str
     subject: str
     description: str
+    key: str | None = None
     activeForm: str = ""
     status: str = "pending"
     owner: str | None = None

@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .models import AgentRecord, Team, TeamTask
+from .models import AgentRecord, Message, Team, TeamTask, utc_now
 
 
 class TeamStore:
@@ -45,6 +45,7 @@ class TeamStore:
         self._write_json(directory / "tasks.json", {})
         (directory / "events.jsonl").touch(exist_ok=True)
         self._write_json(self.active_team_path, team.to_dict())
+        self.append_event(team.team_id, "team.created", {"team": team.to_dict()})
         return team
 
     def load_active_team(self) -> Team | None:
@@ -54,6 +55,20 @@ class TeamStore:
         if "team_id" not in data:
             data = self._migrate_legacy_team(data)
         return Team.from_dict(data)
+
+    def load_team(self, team_id: str) -> Team | None:
+        path = self.team_dir(team_id) / "team.json"
+        if not path.exists():
+            return None
+        return Team.from_dict(self._read_json(path))
+
+    def save_team(self, team: Team) -> Path:
+        path = self.team_dir(team.team_id) / "team.json"
+        self._write_json(path, team.to_dict())
+        active = self.load_active_team()
+        if active is not None and active.team_id == team.team_id:
+            self._write_json(self.active_team_path, team.to_dict())
+        return path
 
     def load_tasks(self, team_id: str) -> dict[str, dict[str, Any]]:
         path = self.team_dir(team_id) / "tasks.json"
@@ -85,13 +100,89 @@ class TeamStore:
             return []
         return [AgentRecord.from_dict(self._read_json(path)) for path in sorted(directory.glob("*.json"))]
 
+    def find_agent(self, team_id: str, identity: str) -> AgentRecord | None:
+        normalized = identity.strip().lower()
+        for agent in self.list_agents(team_id):
+            if agent.agent_id == identity or agent.name.lower() == normalized:
+                return agent
+        return None
+
+    def save_message(self, message: Message) -> Path:
+        path = self.team_dir(message.team_id) / "messages" / f"{message.message_id}.json"
+        self._write_json(path, message.to_dict())
+        return path
+
+    def load_message(self, team_id: str, message_id: str) -> Message | None:
+        path = self.team_dir(team_id) / "messages" / f"{message_id}.json"
+        if not path.exists():
+            return None
+        return Message.from_dict(self._read_json(path))
+
+    def list_messages(self, team_id: str) -> list[Message]:
+        directory = self.team_dir(team_id) / "messages"
+        if not directory.exists():
+            return []
+        messages = [Message.from_dict(self._read_json(path)) for path in directory.glob("*.json")]
+        messages.sort(key=lambda message: (message.created_at, message.message_id))
+        return messages
+
+    def save_session(self, team_id: str, session_id: str, data: dict[str, Any]) -> Path:
+        path = self.team_dir(team_id) / "sessions" / f"{session_id}.json"
+        self._write_json(path, data)
+        return path
+
+    def load_session(self, team_id: str, session_id: str) -> dict[str, Any] | None:
+        path = self.team_dir(team_id) / "sessions" / f"{session_id}.json"
+        if not path.exists():
+            return None
+        return self._read_json(path)
+
+    def list_events(self, team_id: str) -> list[dict[str, Any]]:
+        path = self.team_dir(team_id) / "events.jsonl"
+        if not path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+        return events
+
+    def append_event(
+        self,
+        team_id: str,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        *,
+        created_at: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        path = self.team_dir(team_id) / "events.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "event_id": event_id or uuid.uuid4().hex,
+            "team_id": team_id,
+            "type": event_type,
+            "created_at": created_at or utc_now(),
+            "data": data or {},
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
     def disband_active_team(self) -> Team | None:
         team = self.load_active_team()
         if team is None:
             return None
         if team.status in {"created", "running", "failed"}:
             team.transition_to("cancelled")
-            self._write_json(self.team_dir(team.team_id) / "team.json", team.to_dict())
+            self.save_team(team)
+            self.append_event(team.team_id, "team.cancelled")
         self.active_team_path.unlink(missing_ok=True)
         return team
 
