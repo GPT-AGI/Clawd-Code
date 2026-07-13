@@ -65,6 +65,8 @@ class TestContextSystem(unittest.TestCase):
             system_message = provider.chat.call_args.args[0][0]
             self.assertEqual(system_message["role"], "system")
             self.assertIn("## Runtime Context", system_message["content"])
+            self.assertIn("## Local Engineering Tools", system_message["content"])
+            self.assertIn("Never send local paths", system_message["content"])
             self.assertIn("## Project Instructions", system_message["content"])
             self.assertIn("Follow the CLAUDE instructions.", system_message["content"])
 

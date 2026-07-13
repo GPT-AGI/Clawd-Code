@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 from .errors import ToolPermissionError
 from .permissions import ToolPermissionContext
 from .task_manager import TaskManager
+from ..teammate.store import TeamStore
 
 
 @dataclass
@@ -28,6 +29,7 @@ class ToolContext:
     team: dict[str, Any] | None = None
     output_style_name: str | None = None
     output_style_dir: Path | None = None
+    team_store: TeamStore = field(init=False, repr=False)
 
     # Permission handler callback: called when a tool needs user consent.
     # Signature: (tool_name: str, message: str, suggestion: str | None)
@@ -37,6 +39,7 @@ class ToolContext:
 
     def __post_init__(self) -> None:
         self.workspace_root = Path(self.workspace_root).resolve()
+        self.team_store = TeamStore(self.workspace_root)
         if self.cwd is None:
             self.cwd = self.workspace_root
         else:
@@ -49,6 +52,17 @@ class ToolContext:
                 additional_working_directories=self.permission_context.additional_working_directories,
                 allow_docs=self.permission_context.allow_docs,
             )
+        active_team = self.team_store.load_active_team()
+        if active_team is not None:
+            self.team = active_team.to_dict()
+            self.tasks = self.team_store.load_tasks(active_team.team_id)
+
+    def persist_tasks(self) -> None:
+        if self.team is None:
+            return
+        team_id = self.team.get("team_id")
+        if isinstance(team_id, str) and team_id:
+            self.team_store.save_tasks(team_id, self.tasks)
 
     def mark_file_read(self, path: Path) -> None:
         stat = path.stat()

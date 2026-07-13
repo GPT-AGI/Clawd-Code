@@ -384,6 +384,24 @@ class TestNewParityTools(ToolSystemTests):
         out = ToolSearchTool(reg).run({"query": "read"}, self.ctx).output
         self.assertIn("Read", out["matches"])
 
+    def test_tool_search_matches_natural_language_and_returns_schema(self) -> None:
+        reg = build_default_registry(include_user_tools=False)
+        out = ToolSearchTool(reg).run({"query": "read file content local"}, self.ctx).output
+        self.assertEqual(out["matches"][0], "Read")
+        read = next(tool for tool in out["tools"] if tool["name"] == "Read")
+        self.assertIn("file_path", read["input_schema"]["properties"])
+
+    def test_tool_search_supports_wildcard_and_synonyms(self) -> None:
+        reg = build_default_registry(include_user_tools=False)
+        search = ToolSearchTool(reg)
+        all_tools = search.run({"query": "*", "max_results": 50}, self.ctx).output
+        self.assertIn("Read", all_tools["matches"])
+        self.assertIn("Bash", all_tools["matches"])
+        self.assertGreaterEqual(all_tools["total_matches"], len(all_tools["matches"]))
+
+        shell = search.run({"query": "execute shell command"}, self.ctx).output
+        self.assertEqual(shell["matches"][0], "Bash")
+
     def test_cron_tools_roundtrip(self) -> None:
         created = CronCreateTool().run({"cron": "*/5 * * * *", "prompt": "ping"}, self.ctx).output
         cron_id = created["id"]

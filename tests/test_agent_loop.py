@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 
 from src.agent.conversation import Conversation
+from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.base import ChatResponse
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.context import ToolContext
@@ -132,6 +133,44 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(result.response_text, "File created successfully!")
         self.assertTrue(hello_path.exists())
         self.assertEqual(hello_path.read_text(), "print('hello world')")
+
+    def test_anthropic_tool_results_are_serialized_as_text(self):
+        requirements = self.workspace / "requirements.md"
+        requirements.write_text("First pricing rule.\n", encoding="utf-8")
+        conversation = Conversation()
+        conversation.add_user_message("Read requirements.md")
+        provider = AnthropicProvider(api_key="test", model="test-model")
+        provider.chat = MagicMock(side_effect=[
+            ChatResponse(
+                content="",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="tool_use",
+                tool_uses=[{
+                    "id": "toolu_read",
+                    "name": "Read",
+                    "input": {"file_path": "requirements.md"},
+                }],
+            ),
+            ChatResponse(
+                content="The first pricing rule is present.",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+        ])
+
+        run_agent_loop(
+            conversation=conversation,
+            provider=provider,
+            tool_registry=self.registry,
+            tool_context=self.context,
+        )
+
+        tool_result = conversation.messages[2].content[0]
+        self.assertIsInstance(tool_result.content, str)
+        self.assertIn("First pricing rule.", tool_result.content)
 
     def test_agent_loop_stream_emits_final_text_chunks(self):
         """Streaming mode emits final response chunks without changing the result."""

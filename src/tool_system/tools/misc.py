@@ -24,7 +24,7 @@ class SendMessageTool:
                 },
                 "required": ["to", "message"],
             },
-            is_read_only=True,
+            is_read_only=False,
             max_result_size_chars=100_000,
         )
 
@@ -117,4 +117,3 @@ class TestingPermissionTool:
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
         return ToolResult(name="TestingPermission", output="TestingPermission executed successfully", content_type="text")
-

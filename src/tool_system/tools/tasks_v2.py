@@ -7,9 +7,10 @@ from ..context import ToolContext
 from ..errors import ToolInputError
 from ..protocol import ToolResult
 from ..registry import ToolSpec
+from ...teammate.models import TeamTask, utc_now
 
 
-_TASK_STATUSES = {"pending", "in_progress", "completed"}
+_TASK_STATUSES = TeamTask.STATUSES
 
 
 def _new_task_id() -> str:
@@ -32,7 +33,7 @@ class TaskCreateTool:
                 },
                 "required": ["subject", "description"],
             },
-            is_read_only=True,
+            is_read_only=False,
             max_result_size_chars=100_000,
             strict=True,
         )
@@ -52,18 +53,14 @@ class TaskCreateTool:
             raise ToolInputError("metadata must be an object when provided")
 
         task_id = _new_task_id()
-        context.tasks[task_id] = {
-            "id": task_id,
-            "subject": subject,
-            "description": description,
-            "activeForm": active_form,
-            "status": "pending",
-            "owner": None,
-            "blocks": [],
-            "blockedBy": [],
-            "metadata": dict(metadata),
-            "output": "",
-        }
+        context.tasks[task_id] = TeamTask(
+            id=task_id,
+            subject=subject.strip(),
+            description=description,
+            activeForm=active_form,
+            metadata=dict(metadata),
+        ).to_dict()
+        context.persist_tasks()
         return ToolResult(name="TaskCreate", output={"task": {"id": task_id, "subject": subject}})
 
 
@@ -153,7 +150,7 @@ class TaskUpdateTool:
                 },
                 "required": ["taskId"],
             },
-            is_read_only=True,
+            is_read_only=False,
             max_result_size_chars=100_000,
             strict=True,
         )
@@ -171,6 +168,28 @@ class TaskUpdateTool:
 
         updated_fields: list[str] = []
         status_change: dict[str, str] | None = None
+        requested_status = tool_input.get("status")
+        if requested_status is not None:
+            if not isinstance(requested_status, str) or (
+                requested_status not in _TASK_STATUSES and requested_status != "deleted"
+            ):
+                raise ToolInputError(
+                    "status must be pending|in_progress|completed|failed|cancelled|deleted when provided"
+                )
+            if requested_status == "deleted":
+                context.tasks.pop(task_id, None)
+                context.persist_tasks()
+                return ToolResult(
+                    name="TaskUpdate",
+                    output={"success": True, "taskId": task_id, "updatedFields": ["deleted"]},
+                )
+            if requested_status != task.get("status"):
+                task_state = TeamTask.from_dict(task)
+                try:
+                    task_state.transition_to(requested_status)
+                except ValueError as exc:
+                    raise ToolInputError(str(exc)) from exc
+                status_change = {"from": str(task.get("status")), "to": requested_status}
 
         for field in ("subject", "description", "activeForm", "owner"):
             if field in tool_input and tool_input[field] is not None:
@@ -181,20 +200,9 @@ class TaskUpdateTool:
                     task[field] = v
                     updated_fields.append(field)
 
-        if "status" in tool_input and tool_input["status"] is not None:
-            status = tool_input["status"]
-            if not isinstance(status, str) or status not in _TASK_STATUSES and status != "deleted":
-                raise ToolInputError("status must be pending|in_progress|completed|deleted when provided")
-            if status == "deleted":
-                context.tasks.pop(task_id, None)
-                return ToolResult(
-                    name="TaskUpdate",
-                    output={"success": True, "taskId": task_id, "updatedFields": ["deleted"]},
-                )
-            if status != task.get("status"):
-                status_change = {"from": str(task.get("status")), "to": status}
-                task["status"] = status
-                updated_fields.append("status")
+        if status_change is not None:
+            task["status"] = requested_status
+            updated_fields.append("status")
 
         for rel_field, input_key in (("blocks", "addBlocks"), ("blockedBy", "addBlockedBy")):
             if input_key in tool_input and tool_input[input_key] is not None:
@@ -221,6 +229,10 @@ class TaskUpdateTool:
                     existing[k] = v
             task["metadata"] = existing
             updated_fields.append("metadata")
+
+        if updated_fields:
+            task["updated_at"] = utc_now()
+            context.persist_tasks()
 
         out: dict[str, Any] = {"success": True, "taskId": task_id, "updatedFields": updated_fields}
         if status_change is not None:
@@ -273,4 +285,3 @@ class TaskOutputTool:
                 },
             },
         )
-

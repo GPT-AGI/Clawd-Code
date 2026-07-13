@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..context import ToolContext
@@ -15,7 +16,7 @@ class ToolSearchTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="ToolSearch",
-            description="Search for available tools by name or keywords.",
+            description="Search registered tools by name or keywords. Use '*' to list all tools.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -43,27 +44,76 @@ class ToolSearchTool:
         if lowered.startswith("select:"):
             name = q.split(":", 1)[1].strip()
             tool = self._registry.get(name)
-            matches = [tool.spec().name] if tool else []
-            return ToolResult(
-                name="ToolSearch",
-                output={
-                    "matches": matches,
-                    "query": query,
-                    "total_deferred_tools": 0,
-                },
-            )
+            specs = [tool.spec()] if tool else []
+            return self._result(query, specs)
 
-        scored: list[tuple[int, str]] = []
-        for spec in self._registry.list_specs():
-            hay = f"{spec.name}\n{spec.description}".lower()
-            if lowered in spec.name.lower():
-                scored.append((0, spec.name))
+        all_specs = self._registry.list_specs()
+        if lowered in {"*", "all", "list all", "all tools"}:
+            return self._result(query, all_specs[:max_results], total_matches=len(all_specs))
+
+        query_terms = self._query_terms(lowered)
+        scored: list[tuple[int, int, str, ToolSpec]] = []
+        for spec in all_specs:
+            name = spec.name.lower()
+            aliases = " ".join(spec.aliases).lower()
+            hay = f"{name} {aliases} {spec.description.lower()}"
+            matched_terms = sum(1 for term in query_terms if term in hay)
+            if lowered == name:
+                rank = 0
+            elif lowered in name:
+                rank = 1
             elif lowered in hay:
-                scored.append((1, spec.name))
-        scored.sort(key=lambda t: (t[0], t[1].lower()))
-        matches = [name for _, name in scored[:max_results]]
+                rank = 2
+            elif matched_terms:
+                rank = 3
+            else:
+                continue
+            scored.append((rank, -matched_terms, name, spec))
+        scored.sort(key=lambda item: item[:3])
+        matched_specs = [item[3] for item in scored]
+        return self._result(query, matched_specs[:max_results], total_matches=len(matched_specs))
+
+    @staticmethod
+    def _query_terms(query: str) -> set[str]:
+        terms = set(re.findall(r"[a-z0-9_]+", query))
+        synonyms = {
+            "cat": {"read"},
+            "content": {"read"},
+            "execute": {"bash"},
+            "filesystem": {"file"},
+            "local": {"file"},
+            "modify": {"edit", "write"},
+            "run": {"bash"},
+            "shell": {"bash"},
+        }
+        expanded = set(terms)
+        for term in terms:
+            expanded.update(synonyms.get(term, set()))
+        return expanded
+
+    @staticmethod
+    def _tool_details(spec: ToolSpec) -> dict[str, Any]:
+        return {
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": dict(spec.input_schema),
+            **({"aliases": list(spec.aliases)} if spec.aliases else {}),
+        }
+
+    def _result(
+        self,
+        query: str,
+        specs: list[ToolSpec],
+        *,
+        total_matches: int | None = None,
+    ) -> ToolResult:
         return ToolResult(
             name="ToolSearch",
-            output={"matches": matches, "query": query, "total_deferred_tools": 0},
+            output={
+                "matches": [spec.name for spec in specs],
+                "tools": [self._tool_details(spec) for spec in specs],
+                "query": query,
+                "total_matches": len(specs) if total_matches is None else total_matches,
+                "total_deferred_tools": 0,
+            },
         )
-

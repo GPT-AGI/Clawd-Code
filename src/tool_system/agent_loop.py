@@ -16,12 +16,20 @@ from ..providers.anthropic_provider import AnthropicProvider
 from ..providers.minimax_provider import MinimaxProvider
 
 
+_LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
+- Local workspace files are accessed with `Read`, `Glob`, and `Grep`.
+- Use `Write` to create files and `Edit` for exact replacements in files you have read.
+- Use `Bash` to run local commands and tests.
+- Use web tools only for HTTP or HTTPS resources. Never send local paths or `file://` URLs to `webReader`, `WebFetch`, or other web tools.
+- These local tools are registered even if a provider also offers built-in web tools. If unsure, call `ToolSearch` with focused keywords or query `*`; do not conclude that a tool is unavailable after one empty search."""
+
+
 def _is_anthropic_provider(provider: BaseProvider) -> bool:
     return isinstance(provider, (AnthropicProvider, MinimaxProvider))
 
 
-def _build_openai_tool_result_content(result_output: Any) -> str:
-    """Format tool result as string for OpenAI/GLM."""
+def _build_tool_result_content(result_output: Any) -> str:
+    """Serialize structured tool output into provider-safe text."""
     if isinstance(result_output, str):
         return result_output
     return json.dumps(result_output, ensure_ascii=False)
@@ -174,9 +182,10 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
         )
     except Exception:
         context_prompt = ""
-    if not context_prompt.strip():
-        return style_prompt
-    return f"{style_prompt}\n\n{context_prompt}"
+    sections = [style_prompt, _LOCAL_TOOL_GUIDANCE]
+    if context_prompt.strip():
+        sections.append(context_prompt)
+    return "\n\n".join(sections)
 
 
 def summarize_tool_use(name: str, tool_input: dict[str, Any]) -> str:
@@ -428,13 +437,13 @@ def run_agent_loop(
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, result_output)
+                    conversation.add_tool_result_message(tool_id, _build_tool_result_content(result_output))
                 else:
                     # Add tool result in OpenAI format
                     openai_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_id,
-                        "content": _build_openai_tool_result_content(result_output)
+                        "content": _build_tool_result_content(result_output)
                     })
             except Exception as e:
                 error_str = f"Error: {e}"
