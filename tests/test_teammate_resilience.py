@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.providers.base import ChatResponse
+from src.teammate.control import reassign_task
 from src.teammate.models import TeamTask
 from src.teammate.runtime import TeammateRuntime
 from src.tool_system.context import ToolContext
@@ -22,7 +23,10 @@ from src.tool_system.tools import (
     TeamResumeTool,
     TeamRunTool,
     TeammateCreateTool,
+    TeammateResumeTool,
+    TeammateStopTool,
 )
+from src.tool_system.errors import ToolInputError
 
 
 class FinalProvider:
@@ -158,6 +162,31 @@ class BlockingProvider(FinalProvider):
         self.release.wait(timeout=2)
         return ChatResponse(
             content="finished after cancellation",
+            model=self.model,
+            usage={"input_tokens": 1, "output_tokens": 1},
+            finish_reason="stop",
+            tool_uses=None,
+        )
+
+
+class SelectiveBlockingProvider(FinalProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+
+    def chat(self, messages, tools=None, **kwargs):
+        with self.lock:
+            self.calls += 1
+        if "stop-me" in str(messages):
+            self.started.set()
+            self.release.wait(timeout=2)
+            content = "stopped worker returned"
+        else:
+            content = "survivor completed"
+        return ChatResponse(
+            content=content,
             model=self.model,
             usage={"input_tokens": 1, "output_tokens": 1},
             finish_reason="stop",
@@ -367,6 +396,106 @@ class TestTeammateResilience(unittest.TestCase):
         self.assertEqual(result_box[0].output["status"], "cancelled")
         task = self.context.team_store.load_tasks(self.team["team_id"])[task_id]
         self.assertEqual(task["status"], "cancelled")
+
+    def test_lead_stops_one_worker_without_cancelling_team(self) -> None:
+        stopped = self._agent("stopped-worker")
+        self._agent("survivor")
+        stopped_task = self._task("stop-me", "stopped-worker")
+        survivor_task = self._task("keep-going", "survivor")
+        provider = SelectiveBlockingProvider()
+        self._runtime(provider)
+        holder: dict[str, object] = {}
+
+        def run_team() -> None:
+            holder["result"] = TeamRunTool().run(
+                {"max_workers": 2}, self.context
+            ).output
+
+        thread = threading.Thread(target=run_team)
+        thread.start()
+        self.assertTrue(provider.started.wait(timeout=1))
+        stop_context = ToolContext(workspace_root=self.root)
+        stopped_result = TeammateStopTool().run(
+            {
+                "teammate": stopped["agent_id"],
+                "task_policy": "requeue",
+                "reason": "lead replaced this worker",
+            },
+            stop_context,
+        ).output
+        self.assertEqual(stopped_result["status"], "stopping")
+        provider.release.set()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+
+        tasks = self.context.team_store.load_tasks(self.team["team_id"])
+        self.assertEqual(tasks[stopped_task]["status"], "pending")
+        self.assertIsNone(tasks[stopped_task]["owner"])
+        self.assertEqual(tasks[survivor_task]["status"], "completed")
+        agent = self.context.team_store.load_agent(
+            self.team["team_id"], stopped["agent_id"]
+        )
+        self.assertEqual(agent.status, "cancelled")
+        self.assertIsNotNone(agent.stopped_at)
+        self.assertEqual(holder["result"]["status"], "blocked")
+        self.assertEqual(
+            self.context.team_store.load_active_team().status,
+            "running",
+        )
+        event_types = [
+            event["type"]
+            for event in self.context.team_store.list_events(self.team["team_id"])
+        ]
+        self.assertIn("agent.stop_requested", event_types)
+        self.assertIn("agent.stopped", event_types)
+        self.assertIn("run.cancelled", event_types)
+        self.assertIn("task.requeued", event_types)
+        self.assertEqual(event_types.count("agent.stopped"), 1)
+        self.assertEqual(event_types.count("task.requeued"), 1)
+
+    def test_stop_cancel_policy_and_worker_permissions(self) -> None:
+        worker = self._agent("worker")
+        task_id = self._task("cancel-me", "worker")
+        child_context = ToolContext(
+            workspace_root=self.root,
+            actor_id=worker["agent_id"],
+        )
+        with self.assertRaisesRegex(ToolInputError, "only the lead"):
+            TeammateStopTool().run({"teammate": "worker"}, child_context)
+
+        result = TeammateStopTool().run(
+            {"teammate": "worker", "task_policy": "cancel"},
+            self.context,
+        ).output
+        self.assertEqual(result["cancelled_task_ids"], [task_id])
+        task = self.context.team_store.load_tasks(self.team["team_id"])[task_id]
+        self.assertEqual(task["status"], "cancelled")
+        self.assertEqual(
+            self.context.team_store.load_active_team().status,
+            "created",
+        )
+
+    def test_stopped_worker_can_resume_and_receive_requeued_task(self) -> None:
+        self._agent("worker")
+        replacement = self._agent("replacement")
+        task_id = self._task("handoff", "worker")
+        TeammateStopTool().run(
+            {"teammate": "worker", "task_policy": "requeue"},
+            self.context,
+        )
+        resumed = TeammateResumeTool().run(
+            {"teammate": "worker"}, self.context
+        ).output
+        self.assertEqual(resumed["status"], "idle")
+        reassigned = reassign_task(
+            self.context.team_store,
+            task_id,
+            replacement["agent_id"],
+        )
+        self.assertEqual(reassigned["owner"], replacement["agent_id"])
+        task = self.context.team_store.load_tasks(self.team["team_id"])[task_id]
+        self.assertEqual(task["status"], "pending")
+        self.assertEqual(task["owner"], replacement["agent_id"])
 
     def test_ready_tasks_run_in_parallel_without_lost_updates(self) -> None:
         self._agent("one")

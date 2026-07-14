@@ -282,6 +282,25 @@ resume a failed/cancelled team, `TaskRetry` for an explicit task retry, and
 `TeamCancel` for cooperative cancellation. Every state transition, model call,
 tool call, and message handoff is persisted for `clawd trace`.
 
+Only the lead may call `TeammateStop` or `TeammateResume`. `TeammateStop` stops
+one worker without cancelling the team and applies `task_policy: "requeue"`
+(the default) or `task_policy: "cancel"` to unfinished work. Active model and
+tool calls stop cooperatively at the next safe boundary; they are not force-killed.
+
+Human operators can inspect and control the same persisted state without a lead
+model round trip. The worker lifecycle and process-based force-stop migration
+are documented in `docs/guide/TEAMMATE_WORKER_LIFECYCLE.md`:
+
+```bash
+clawd team list -C ./project
+clawd team status -C ./project
+clawd team stop coder --task-policy requeue -C ./project
+clawd team resume-worker coder -C ./project
+clawd team reassign implementation replacement-coder -C ./project
+clawd team cancel --reason "operator request" -C ./project
+clawd team resume --provider anthropic --model glm-5.2 -C ./project
+```
+
 Set `workspace_mode: "worktree"` on `TeammateCreate` for git isolation. With
 `auto_integrate: true`, successful changes are committed in the isolated
 worktree and cherry-picked into the lead repository. Downstream reviewers that
@@ -739,6 +758,25 @@ TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 `token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，
 `TaskRetry` 显式重试单个任务，`TeamCancel` 执行协作式取消。所有状态迁移、模型调用、
 工具调用和消息交接都会持久化，可通过 `clawd trace` 查看。
+
+只有 Lead 可以调用 `TeammateStop` 和 `TeammateResume`。`TeammateStop` 只停止一个
+worker，不会取消整个团队；未完成任务可选择默认的 `task_policy: "requeue"`，或使用
+`task_policy: "cancel"`。当前停止会在模型/工具调用的下一个安全边界生效，不会伪装成
+能够强杀线程中的 HTTP 或 Bash 调用。
+
+人类操作者也可以直接控制同一份持久化状态，无需额外消耗 Lead 模型回合。
+完整生命周期与进程级 force-stop 迁移设计见
+`docs/guide/TEAMMATE_WORKER_LIFECYCLE.md`：
+
+```bash
+clawd team list -C ./project
+clawd team status -C ./project
+clawd team stop coder --task-policy requeue -C ./project
+clawd team resume-worker coder -C ./project
+clawd team reassign implementation replacement-coder -C ./project
+clawd team cancel --reason "operator request" -C ./project
+clawd team resume --provider anthropic --model glm-5.2 -C ./project
+```
 
 在 `TeammateCreate` 中设置 `workspace_mode: "worktree"` 可启用 Git 隔离；配合
 `auto_integrate: true`，成功改动会在隔离 worktree 中提交并 cherry-pick 回 lead 仓库。

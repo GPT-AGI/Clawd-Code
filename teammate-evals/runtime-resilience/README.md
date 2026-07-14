@@ -7,6 +7,7 @@ to verify reliably with one live-model task:
 - automatic and lead-requested retries
 - reviewer rejection followed by coder repair and re-review
 - cooperative cancellation
+- lead-only worker stop with task requeue and survivor progress
 - timeout, token, and turn budgets
 - parallel ready-task execution without lost task updates
 - isolated git worktree execution and integration

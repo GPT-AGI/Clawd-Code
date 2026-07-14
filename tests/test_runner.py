@@ -127,6 +127,33 @@ class TestRunner(unittest.TestCase):
             quiet=True,
         )
 
+    def test_cli_dispatches_team_stop_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argv = [
+                "clawd",
+                "team",
+                "stop",
+                "coder",
+                "--workspace",
+                str(root),
+                "--task-policy",
+                "cancel",
+                "--reason",
+                "replace worker",
+            ]
+            with patch("src.cli.sys.argv", argv), patch(
+                "src.cli.handle_team_command", return_value=0
+            ) as team_command:
+                self.assertEqual(main(), 0)
+
+        args = team_command.call_args.args[0]
+        self.assertEqual(args.team_command, "stop")
+        self.assertEqual(args.teammate, "coder")
+        self.assertEqual(args.task_policy, "cancel")
+        self.assertEqual(args.reason, "replace worker")
+        self.assertEqual(args.workspace, root)
+
 
 if __name__ == "__main__":
     unittest.main()

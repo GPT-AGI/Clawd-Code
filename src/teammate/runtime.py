@@ -13,6 +13,7 @@ from ..tool_system.agent_loop import ToolEvent, run_agent_loop
 from ..tool_system.context import ToolContext
 from ..tool_system.permissions import ToolPermissionContext
 from ..tool_system.registry import ToolRegistry
+from .control import mark_teammate_stopped
 from .models import AgentRecord, Message, Team, TeamTask, utc_now
 from .store import TeamStore
 from .worktree import TeammateWorktreeManager
@@ -34,6 +35,8 @@ _FORBIDDEN_TEAMMATE_TOOLS = {
     "TeamCancel",
     "TeamIntegrate",
     "TeamDelete",
+    "TeammateStop",
+    "TeammateResume",
     "TaskRetry",
 }
 
@@ -187,10 +190,18 @@ class TeammateRuntime:
                     names = ", ".join(str(task.get("key") or task.get("id")) for task in failed)
                     return self._fail_team(lead_context, current, f"failed tasks: {names}", executed)
 
+                agents = {
+                    agent.agent_id: agent
+                    for agent in lead_context.team_store.list_agents(team.team_id)
+                }
                 ready = [
                     task
                     for task in tasks.values()
-                    if task.get("status") == "pending" and self._dependencies_completed(task, tasks)
+                    if task.get("status") == "pending"
+                    and self._dependencies_completed(task, tasks)
+                    and task.get("owner") in agents
+                    and agents[str(task.get("owner"))].status
+                    not in {"stopping", "cancelled", "completed"}
                 ]
                 if not ready:
                     active = [
@@ -206,9 +217,7 @@ class TeammateRuntime:
                         reason += f" ({', '.join(pending)})"
                     if active:
                         return self._blocked_result(lead_context, current, reason, executed)
-                    return self._fail_team(
-                        lead_context, current, reason, executed, status="blocked"
-                    )
+                    return self._blocked_result(lead_context, current, reason, executed)
 
                 ready.sort(
                     key=lambda task: (
@@ -244,6 +253,8 @@ class TeammateRuntime:
                     elif outcome.status == "cancelled":
                         latest = lead_context.team_store.load_team(current.team_id) or current
                         return self._cancelled_result(lead_context, latest, executed)
+                    elif outcome.status == "stopped":
+                        continue
 
                 if terminal_failures:
                     first = terminal_failures[0]
@@ -356,6 +367,8 @@ class TeammateRuntime:
             error = f"unknown task owner: {task.owner}"
             self._set_task_failed(store, team, task, error)
             return TaskOutcome("failed", task.id, error=error)
+        if agent.status in {"stopping", "cancelled"} or agent.stop_requested_at:
+            return TaskOutcome("stopped", task.id)
 
         lease_id = uuid.uuid4().hex
         try:
@@ -369,7 +382,9 @@ class TeammateRuntime:
             if claimed is None:
                 return TaskOutcome("leased", task.id)
             task = claimed
-            self._transition_agent(store, agent, "running")
+            agent = self._transition_agent(store, agent, "running")
+            if agent.status in {"stopping", "cancelled"} or agent.stop_requested_at:
+                return self._finalize_worker_stop(store, agent, task, {})
             store.append_event(
                 team.team_id,
                 "task.started",
@@ -405,6 +420,16 @@ class TeammateRuntime:
                         options.lease_timeout_s,
                     )
 
+            def should_stop() -> bool:
+                current_team = store.load_team(team.team_id) or team
+                current_agent = store.load_agent(team.team_id, agent.agent_id) or agent
+                return bool(
+                    current_team.status == "cancelled"
+                    or current_team.cancel_requested_at
+                    or current_agent.status in {"stopping", "cancelled"}
+                    or current_agent.stop_requested_at
+                )
+
             result = run_agent_loop(
                 conversation=conversation,
                 provider=self.provider,
@@ -414,6 +439,7 @@ class TeammateRuntime:
                 stream=False,
                 verbose=False,
                 on_event=heartbeat,
+                should_stop=should_stop,
             )
             self._save_session(store, agent, conversation)
             usage = result.usage or {}
@@ -443,9 +469,22 @@ class TeammateRuntime:
                 )
                 return TaskOutcome("cancelled", task.id, **outcome_usage)
 
+            latest_agent = store.load_agent(team.team_id, agent.agent_id) or agent
+            if latest_agent.status in {"stopping", "cancelled"} or latest_agent.stop_requested_at:
+                return self._finalize_worker_stop(
+                    store,
+                    latest_agent,
+                    persisted,
+                    outcome_usage,
+                )
+
             if result.response_text == "[Max tool turns reached]":
                 self._set_task_failed(store, team, persisted, result.response_text)
-                self._transition_agent(store, agent, "failed")
+                transitioned = self._transition_agent(store, agent, "failed")
+                if transitioned.status in {"stopping", "cancelled"} or transitioned.stop_requested_at:
+                    return self._finalize_worker_stop(
+                        store, transitioned, persisted, outcome_usage
+                    )
                 return TaskOutcome(
                     "failed", task.id, error=result.response_text, **outcome_usage
                 )
@@ -454,7 +493,11 @@ class TeammateRuntime:
                     persisted.output = result.response_text
                     persisted.updated_at = utc_now()
                     self._save_task(store, team.team_id, persisted)
-                self._transition_agent(store, agent, "failed")
+                transitioned = self._transition_agent(store, agent, "failed")
+                if transitioned.status in {"stopping", "cancelled"} or transitioned.stop_requested_at:
+                    return self._finalize_worker_stop(
+                        store, transitioned, persisted, outcome_usage
+                    )
                 return TaskOutcome(
                     "failed", task.id, error=persisted.output, **outcome_usage
                 )
@@ -479,7 +522,11 @@ class TeammateRuntime:
             self._clear_lease(persisted)
             persisted.completed_at = utc_now()
             self._save_task(store, team.team_id, persisted)
-            self._transition_agent(store, agent, "idle")
+            transitioned = self._transition_agent(store, agent, "idle")
+            if transitioned.status in {"stopping", "cancelled"} or transitioned.stop_requested_at:
+                return self._finalize_worker_stop(
+                    store, transitioned, persisted, outcome_usage
+                )
             store.append_event(
                 team.team_id,
                 "task.completed",
@@ -498,7 +545,18 @@ class TeammateRuntime:
                 self._set_task_failed(store, team, current, str(exc))
             latest_agent = store.load_agent(team.team_id, agent.agent_id) or agent
             if latest_agent.status in {"created", "running", "idle"}:
-                self._transition_agent(store, latest_agent, "failed")
+                latest_agent = self._transition_agent(store, latest_agent, "failed")
+            if latest_agent.status in {"stopping", "cancelled"} and latest_agent.stop_requested_at:
+                return self._finalize_worker_stop(
+                    store,
+                    latest_agent,
+                    current,
+                    {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "turns": turns,
+                    },
+                )
             return TaskOutcome(
                 "failed",
                 task.id,
@@ -507,6 +565,90 @@ class TeammateRuntime:
                 turns=turns,
                 error=str(exc),
             )
+
+    @staticmethod
+    def _finalize_worker_stop(
+        store: TeamStore,
+        agent: AgentRecord,
+        task: TeamTask,
+        usage: dict[str, int],
+    ) -> TaskOutcome:
+        reason = agent.stop_reason or "worker stopped by lead"
+        policy = agent.stop_task_policy or "requeue"
+        state: dict[str, Any] = {"outcome": "stopped", "event": None}
+
+        def mutate(tasks: dict[str, TeamTask]) -> None:
+            current = tasks.get(task.id)
+            if current is None:
+                current = task
+                tasks[task.id] = current
+            if current.status == "completed":
+                state["outcome"] = "completed"
+                TeammateRuntime._clear_lease(current)
+                current.completed_at = current.completed_at or utc_now()
+                state["event"] = (
+                    "task.completed",
+                    {
+                        "task_id": current.id,
+                        "task_key": current.key,
+                        "agent_id": agent.agent_id,
+                        "attempt": current.attempt,
+                    },
+                )
+            elif policy == "requeue":
+                already_requeued = (
+                    current.status == "pending"
+                    and current.owner is None
+                    and current.lease_id is None
+                    and current.lease_expires_at is None
+                )
+                if already_requeued:
+                    return
+                if current.status != "pending":
+                    current.transition_to("pending")
+                current.owner = None
+                current.output = ""
+                current.completed_at = None
+                current.last_error = reason
+                TeammateRuntime._clear_lease(current)
+                state["event"] = (
+                    "task.requeued",
+                    {
+                        "task_id": current.id,
+                        "agent_id": agent.agent_id,
+                        "reason": reason,
+                    },
+                )
+            else:
+                already_cancelled = (
+                    current.status == "cancelled"
+                    and current.lease_id is None
+                    and current.lease_expires_at is None
+                    and current.last_error == reason
+                )
+                if already_cancelled:
+                    return
+                if current.status != "cancelled":
+                    current.transition_to("cancelled")
+                current.completed_at = utc_now()
+                current.last_error = reason
+                TeammateRuntime._clear_lease(current)
+                state["event"] = (
+                    "task.cancelled",
+                    {
+                        "task_id": current.id,
+                        "agent_id": agent.agent_id,
+                        "reason": reason,
+                    },
+                )
+
+        store.mutate_tasks(agent.team_id, mutate)
+        if state["event"] is not None:
+            event_type, payload = state["event"]
+            store.append_event(agent.team_id, event_type, payload)
+
+        mark_teammate_stopped(store, agent.team_id, agent.agent_id)
+        return TaskOutcome(str(state["outcome"]), task.id, **usage)
 
     def _recover_tasks(
         self,
@@ -707,15 +849,28 @@ class TeammateRuntime:
         )
 
     @staticmethod
-    def _transition_agent(store: TeamStore, agent: AgentRecord, status: str) -> None:
-        if agent.status != status:
-            agent.transition_to(status)
-            store.save_agent(agent)
+    def _transition_agent(
+        store: TeamStore, agent: AgentRecord, status: str
+    ) -> AgentRecord:
+        changed = False
+
+        def mutate(current: AgentRecord) -> None:
+            nonlocal changed
+            if current.stop_requested_at and status != "cancelled":
+                return
+            if current.status != status:
+                current.transition_to(status)
+                changed = True
+
+        updated = store.mutate_agent(agent.team_id, agent.agent_id, mutate)
+        current = updated or agent
+        if changed:
             store.append_event(
-                agent.team_id,
+                current.team_id,
                 f"agent.{status}",
-                {"agent_id": agent.agent_id, "name": agent.name},
+                {"agent_id": current.agent_id, "name": current.name},
             )
+        return current
 
     @staticmethod
     def _reset_agent_for_retry(
@@ -726,8 +881,10 @@ class TeammateRuntime:
         agent = store.load_agent(team_id, agent_id)
         if agent is None:
             return
+        if agent.stop_requested_at or agent.status == "stopping":
+            return
         if agent.status in {"failed", "cancelled"}:
-            TeammateRuntime._transition_agent(store, agent, "running")
+            agent = TeammateRuntime._transition_agent(store, agent, "running")
         if agent.status == "running":
             TeammateRuntime._transition_agent(store, agent, "idle")
 
@@ -811,12 +968,12 @@ class TeammateRuntime:
         store = lead_context.team_store
         for agent in store.list_agents(team.team_id):
             if agent.status == "created":
-                self._transition_agent(store, agent, "running")
+                agent = self._transition_agent(store, agent, "running")
                 self._transition_agent(store, agent, "completed")
             elif agent.status in {"running", "idle"}:
                 self._transition_agent(store, agent, "completed")
             elif agent.status == "failed":
-                self._transition_agent(store, agent, "running")
+                agent = self._transition_agent(store, agent, "running")
                 self._transition_agent(store, agent, "completed")
         current = store.load_team(team.team_id) or team
         if current.status != "completed":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -29,6 +30,8 @@ Examples:
   clawd config             Show current configuration
   clawd run --prompt-file TASK.md
   clawd trace .             Inspect teammate tool calls and messages
+  clawd team status         Inspect the active teammate team
+  clawd team stop coder     Stop one worker and requeue its work
   clawd --stream           Start REPL with live response rendering
   clawd                    Start interactive REPL
 """
@@ -75,6 +78,58 @@ Examples:
     trace_parser.add_argument('--team', help='Team ID to select initially')
     trace_parser.add_argument('--open', action='store_true', help='Open the viewer in the default browser')
 
+    team_parser = subparsers.add_parser('team', help='Inspect and control teammate workers')
+    team_subparsers = team_parser.add_subparsers(dest='team_command', required=True)
+
+    def add_team_workspace(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            '-C', '--workspace', type=Path, default=Path('.'),
+            help='Workspace containing persistent teammate state',
+        )
+
+    team_list_parser = team_subparsers.add_parser('list', help='List persisted teams')
+    add_team_workspace(team_list_parser)
+
+    team_status_parser = team_subparsers.add_parser('status', help='Show team, worker, and task status')
+    add_team_workspace(team_status_parser)
+    team_status_parser.add_argument('--team-id', help='Historical team ID; defaults to the active team')
+
+    team_stop_parser = team_subparsers.add_parser('stop', help='Stop one worker without cancelling the team')
+    add_team_workspace(team_stop_parser)
+    team_stop_parser.add_argument('teammate', help='Worker name or ID')
+    team_stop_parser.add_argument('--reason', help='Reason recorded in the trace')
+    team_stop_parser.add_argument(
+        '--task-policy', choices=('requeue', 'cancel'), default='requeue',
+        help='How to handle unfinished tasks',
+    )
+
+    worker_resume_parser = team_subparsers.add_parser('resume-worker', help='Make a stopped worker available again')
+    add_team_workspace(worker_resume_parser)
+    worker_resume_parser.add_argument('teammate', help='Worker name or ID')
+
+    reassign_parser = team_subparsers.add_parser('reassign', help='Assign a stopped or pending task to a worker')
+    add_team_workspace(reassign_parser)
+    reassign_parser.add_argument('task', help='Task ID or stable key')
+    reassign_parser.add_argument('teammate', help='Replacement worker name or ID')
+
+    team_cancel_parser = team_subparsers.add_parser('cancel', help='Cancel the entire active team')
+    add_team_workspace(team_cancel_parser)
+    team_cancel_parser.add_argument('--reason', help='Reason recorded in the trace')
+
+    team_resume_parser = team_subparsers.add_parser('resume', help='Resume active persisted team execution')
+    add_team_workspace(team_resume_parser)
+    team_resume_parser.add_argument('--provider', help='Configured provider to use')
+    team_resume_parser.add_argument('--model', help='Model override for worker runs')
+    team_resume_parser.add_argument('--max-turns', type=int, default=30, help='Maximum turns per worker task')
+    team_resume_parser.add_argument('--max-workers', type=int, help='Maximum concurrent workers')
+    team_resume_parser.add_argument('--timeout', type=float, help='Team timeout in seconds')
+    team_resume_parser.add_argument('--token-budget', type=int, help='Aggregate token budget')
+    team_resume_parser.add_argument('--turn-budget', type=int, help='Aggregate model turn budget')
+    team_resume_parser.add_argument('--max-retries', type=int, help='Automatic retries per task')
+    team_resume_parser.add_argument('--lease-timeout', type=int, help='Task lease timeout in seconds')
+    team_resume_parser.add_argument('--no-retry-failed', action='store_true', help='Do not retry failed tasks')
+    team_resume_parser.add_argument('--no-retry-cancelled', action='store_true', help='Do not retry cancelled tasks')
+
     args = parser.parse_args()
 
     # Handle --version
@@ -116,6 +171,8 @@ Examples:
             team_id=args.team,
             open_browser=args.open,
         )
+    elif args.command == 'team':
+        return handle_team_command(args)
 
     # Default: start REPL
     return start_repl(stream=args.stream)
@@ -196,6 +253,121 @@ def run_once(
     else:
         output.print(result.response_text, markup=False, highlight=False)
     return 2 if result.response_text == "[Max tool turns reached]" else 0
+
+
+def handle_team_command(args: argparse.Namespace) -> int:
+    from src.teammate.control import (
+        cancel_team,
+        list_teams,
+        reassign_task,
+        resume_teammate,
+        stop_teammate,
+        team_status,
+    )
+    from src.teammate.store import TeamStore
+
+    output = Console()
+    errors = Console(stderr=True)
+    workspace = Path(args.workspace).expanduser().resolve()
+
+    try:
+        if args.team_command == 'list':
+            teams = list_teams(workspace)
+            table = Table(title="Teammate Teams")
+            table.add_column("Active")
+            table.add_column("Team")
+            table.add_column("ID")
+            table.add_column("Status")
+            table.add_column("Updated")
+            for team in teams:
+                table.add_row(
+                    "*" if team["active"] else "",
+                    str(team["team_name"]),
+                    str(team["team_id"]),
+                    str(team["status"]),
+                    str(team["updated_at"]),
+                )
+            output.print(table)
+            return 0
+
+        if args.team_command == 'status':
+            snapshot = team_status(workspace, args.team_id)
+            team = snapshot["team"]
+            output.print(
+                f"[bold]{team['team_name']}[/bold] ({team['team_id']}) "
+                f"status=[cyan]{team['status']}[/cyan]"
+            )
+            agents = Table(title="Workers")
+            agents.add_column("Name")
+            agents.add_column("Role")
+            agents.add_column("Status")
+            agents.add_column("Model")
+            for agent in snapshot["agents"]:
+                agents.add_row(
+                    str(agent["name"]),
+                    str(agent["role"]),
+                    str(agent["status"]),
+                    str(agent.get("model") or "default"),
+                )
+            output.print(agents)
+            tasks = Table(title="Tasks")
+            tasks.add_column("Key")
+            tasks.add_column("Status")
+            tasks.add_column("Owner")
+            tasks.add_column("Subject")
+            names = {agent["agent_id"]: agent["name"] for agent in snapshot["agents"]}
+            for task in snapshot["tasks"]:
+                owner = task.get("owner")
+                tasks.add_row(
+                    str(task.get("key") or task["id"]),
+                    str(task["status"]),
+                    str(names.get(owner, owner or "unassigned")),
+                    str(task["subject"]),
+                )
+            output.print(tasks)
+            output.print(
+                f"Messages: {snapshot['message_count']}  Events: {snapshot['event_count']}"
+            )
+            return 0
+
+        store = TeamStore(workspace)
+        if args.team_command == 'stop':
+            result = stop_teammate(
+                store,
+                args.teammate,
+                task_policy=args.task_policy,
+                reason=args.reason,
+            )
+        elif args.team_command == 'resume-worker':
+            result = resume_teammate(store, args.teammate)
+        elif args.team_command == 'reassign':
+            result = reassign_task(store, args.task, args.teammate)
+        elif args.team_command == 'cancel':
+            result = cancel_team(store, args.reason)
+        elif args.team_command == 'resume':
+            from src.runner import resume_team
+
+            result = resume_team(
+                workspace=workspace,
+                provider_name=args.provider,
+                model=args.model,
+                max_turns=args.max_turns,
+                max_workers=args.max_workers,
+                timeout_s=args.timeout,
+                token_budget=args.token_budget,
+                turn_budget=args.turn_budget,
+                max_retries=args.max_retries,
+                lease_timeout_s=args.lease_timeout,
+                retry_failed=not args.no_retry_failed,
+                retry_cancelled=not args.no_retry_cancelled,
+            )
+        else:  # pragma: no cover - argparse enforces known commands
+            raise ValueError(f"unknown team command: {args.team_command}")
+        output.print(json.dumps(result, indent=2, ensure_ascii=False), markup=False)
+        return 0 if result.get("status") not in {"failed", "blocked"} else 2
+    except (OSError, ValueError) as exc:
+        errors.print(f"[red]Team command failed: {exc}[/red]")
+        return 1
 
 
 def _show_provider_defaults_table() -> None:

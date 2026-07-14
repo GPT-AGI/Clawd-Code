@@ -61,12 +61,21 @@ class Team:
 
 @dataclass
 class AgentRecord:
-    STATUSES: ClassVar[set[str]] = {"created", "running", "idle", "completed", "failed", "cancelled"}
+    STATUSES: ClassVar[set[str]] = {
+        "created",
+        "running",
+        "idle",
+        "stopping",
+        "completed",
+        "failed",
+        "cancelled",
+    }
     TRANSITIONS: ClassVar[dict[str, set[str]]] = {
-        "created": {"running", "cancelled"},
-        "running": {"idle", "completed", "failed", "cancelled"},
-        "idle": {"running", "completed", "cancelled"},
-        "failed": {"running", "cancelled"},
+        "created": {"running", "stopping", "cancelled"},
+        "running": {"idle", "stopping", "completed", "failed", "cancelled"},
+        "idle": {"running", "stopping", "completed", "cancelled"},
+        "stopping": {"cancelled"},
+        "failed": {"running", "stopping", "cancelled"},
         "completed": set(),
         "cancelled": {"running"},
     }
@@ -83,14 +92,20 @@ class AgentRecord:
     workspace_path: str | None = None
     auto_integrate: bool = False
     status: str = "created"
+    stop_requested_at: str | None = None
+    stop_reason: str | None = None
+    stop_task_policy: str | None = None
+    stopped_at: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 2
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "agent")
         if self.workspace_mode not in {"shared", "worktree"}:
             raise ValueError("workspace_mode must be 'shared' or 'worktree'")
+        if self.stop_task_policy not in {None, "requeue", "cancel"}:
+            raise ValueError("stop_task_policy must be 'requeue' or 'cancel'")
 
     def transition_to(self, status: str) -> None:
         _require_status(status, self.STATUSES, "agent")
@@ -104,7 +119,9 @@ class AgentRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AgentRecord":
-        return cls(**{key: data[key] for key in cls.__dataclass_fields__ if key in data})
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        values["schema_version"] = 3
+        return cls(**values)
 
 
 @dataclass

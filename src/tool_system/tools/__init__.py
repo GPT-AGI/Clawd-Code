@@ -19,7 +19,7 @@ from .send_user_message import SendUserMessageTool
 from .sleep import SleepTool
 from .skill import SkillTool
 from .structured_output import StructuredOutputTool
-from .team import TeamCancelTool, TeamCreateTool, TeamDeleteTool, TeamIntegrateTool, TeamResumeTool, TeammateCreateTool, TeamRunTool
+from .team import TeamCancelTool, TeamCreateTool, TeamDeleteTool, TeamIntegrateTool, TeamResumeTool, TeammateCreateTool, TeammateResumeTool, TeammateStopTool, TeamRunTool
 from .task_stop import TaskStopTool
 from .tasks_v2 import TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskRetryTool, TaskUpdateTool
 from .todo_write import TodoWriteTool
@@ -66,6 +66,8 @@ __all__ = [
     "TeamIntegrateTool",
     "TeamResumeTool",
     "TeammateCreateTool",
+    "TeammateResumeTool",
+    "TeammateStopTool",
     "TeamRunTool",
     "TaskCreateTool",
     "TaskGetTool",

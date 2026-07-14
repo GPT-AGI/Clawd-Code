@@ -128,10 +128,12 @@ class AgentLoopResult:
     response_text: str
     usage: dict[str, Any] | None = None  # {"input_tokens": int, "output_tokens": int}
     num_turns: int = 0
+    cancelled: bool = False
 
 
 ToolEventHandler = Callable[[ToolEvent], None]
 TextChunkHandler = Callable[[str], None]
+StopPredicate = Callable[[], bool]
 
 
 def _safe_call_handler(handler: ToolEventHandler | None, event: ToolEvent) -> None:
@@ -141,6 +143,15 @@ def _safe_call_handler(handler: ToolEventHandler | None, event: ToolEvent) -> No
         handler(event)
     except Exception:
         return
+
+
+def _safe_should_stop(predicate: StopPredicate | None) -> bool:
+    if predicate is None:
+        return False
+    try:
+        return bool(predicate())
+    except Exception:
+        return False
 
 
 def _emit_text_chunks(handler: TextChunkHandler | None, text: str, *, chunk_size: int = 12) -> None:
@@ -272,6 +283,7 @@ def run_agent_loop(
     verbose: bool = False,
     on_event: ToolEventHandler | None = None,
     on_text_chunk: TextChunkHandler | None = None,
+    should_stop: StopPredicate | None = None,
 ) -> AgentLoopResult:
     """Run agent loop: LLM -> tools -> LLM until no more tools or max turns.
 
@@ -285,6 +297,7 @@ def run_agent_loop(
         verbose: Whether to print tool calls/results
         on_event: Optional callback for tool events
         on_text_chunk: Optional callback for incremental user-visible text chunks
+        should_stop: Optional cooperative cancellation check at model/tool boundaries
 
     Returns:
         AgentLoopResult with final text response, usage info, and turn count
@@ -323,10 +336,15 @@ def run_agent_loop(
         _safe_call_handler(on_event, event)
         trace_recorder.record(event)
 
-    def finish(response_text: str, *, failed: bool = False) -> AgentLoopResult:
+    def finish(
+        response_text: str,
+        *,
+        failed: bool = False,
+        cancelled: bool = False,
+    ) -> AgentLoopResult:
         usage = total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None
         emit(ToolEvent(
-            kind="run_failed" if failed else "run_completed",
+            kind="run_cancelled" if cancelled else ("run_failed" if failed else "run_completed"),
             content=response_text,
             model=tool_context.model_override or getattr(provider, "model", None),
             usage=usage,
@@ -334,7 +352,12 @@ def run_agent_loop(
             is_error=failed,
             error=response_text if failed else None,
         ))
-        return AgentLoopResult(response_text=response_text, usage=usage, num_turns=turn_count)
+        return AgentLoopResult(
+            response_text=response_text,
+            usage=usage,
+            num_turns=turn_count,
+            cancelled=cancelled,
+        )
 
     emit(ToolEvent(
         kind="run_started",
@@ -343,6 +366,8 @@ def run_agent_loop(
     ))
 
     for turn in range(max_turns):
+        if _safe_should_stop(should_stop):
+            return finish("[Run stopped]", cancelled=True)
         if _is_anthropic_provider(provider):
             api_messages = conversation.get_messages()
         else:
@@ -399,6 +424,8 @@ def run_agent_loop(
             turn=turn_count,
             duration_ms=round((time.monotonic() - model_started_at) * 1000),
         ))
+        if _safe_should_stop(should_stop):
+            return finish("[Run stopped]", cancelled=True)
 
         if _is_anthropic_provider(provider):
             assistant_blocks: list = []
@@ -449,6 +476,8 @@ def run_agent_loop(
 
         # Call each tool
         for tool_use in tool_uses:
+            if _safe_should_stop(should_stop):
+                return finish("[Run stopped]", cancelled=True)
             tool_id = tool_use["id"]
             tool_name = tool_use["name"]
             tool_input = tool_use["input"]
@@ -528,6 +557,9 @@ def run_agent_loop(
                         "tool_call_id": tool_id,
                         "content": error_str
                     })
+
+            if _safe_should_stop(should_stop):
+                return finish("[Run stopped]", cancelled=True)
 
     # Reached max turns
     return finish("[Max tool turns reached]", failed=True)

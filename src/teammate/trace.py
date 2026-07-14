@@ -9,6 +9,7 @@ _EVENT_TYPES = {
     "run_started": "run.started",
     "run_completed": "run.completed",
     "run_failed": "run.failed",
+    "run_cancelled": "run.cancelled",
     "model_started": "model.started",
     "model_response": "model.response",
     "model_error": "model.failed",

@@ -3,7 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from ...teammate.models import AgentRecord, utc_now
+from ...teammate.control import cancel_team, resume_teammate, stop_teammate
+from ...teammate.models import AgentRecord
 from ...teammate.worktree import TeammateWorktreeManager
 from ..context import ToolContext
 from ..errors import ToolInputError
@@ -277,28 +278,93 @@ class TeamCancelTool:
         )
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
-        team = context.team_store.load_active_team()
-        if team is None:
-            raise ToolInputError("no active team")
-        if team.status == "completed":
-            raise ToolInputError("completed teams cannot be cancelled")
         reason = tool_input.get("reason")
         if reason is not None and not isinstance(reason, str):
             raise ToolInputError("reason must be a string when provided")
-        team.cancel_requested_at = utc_now()
-        if team.status != "cancelled":
-            team.transition_to("cancelled")
-        context.team_store.save_team(team)
-        context.team_store.append_event(
-            team.team_id,
-            "team.cancel_requested",
-            {"reason": reason or "cancelled by user"},
-        )
+        try:
+            output = cancel_team(context.team_store, reason)
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
         context.reload_team_state()
-        return ToolResult(
-            name="TeamCancel",
-            output={"status": "cancelled", "team_id": team.team_id},
+        return ToolResult(name="TeamCancel", output=output)
+
+
+class TeammateStopTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TeammateStop",
+            description="Stop one teammate without cancelling the team; unfinished tasks may be requeued or cancelled.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "teammate": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "task_policy": {
+                        "type": "string",
+                        "enum": ["requeue", "cancel"],
+                    },
+                },
+                "required": ["teammate"],
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
         )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may stop teammates")
+        identity = tool_input.get("teammate")
+        reason = tool_input.get("reason")
+        policy = tool_input.get("task_policy", "requeue")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ToolInputError("teammate must be a non-empty name or ID")
+        if reason is not None and not isinstance(reason, str):
+            raise ToolInputError("reason must be a string when provided")
+        if not isinstance(policy, str):
+            raise ToolInputError("task_policy must be requeue or cancel")
+        try:
+            output = stop_teammate(
+                context.team_store,
+                identity.strip(),
+                task_policy=policy,
+                reason=reason,
+            )
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
+        context.reload_team_state()
+        return ToolResult(name="TeammateStop", output=output)
+
+
+class TeammateResumeTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TeammateResume",
+            description="Resume a fully stopped teammate so the lead may assign new work.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"teammate": {"type": "string"}},
+                "required": ["teammate"],
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may resume teammates")
+        identity = tool_input.get("teammate")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ToolInputError("teammate must be a non-empty name or ID")
+        try:
+            output = resume_teammate(context.team_store, identity.strip())
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
+        context.reload_team_state()
+        return ToolResult(name="TeammateResume", output=output)
 
 
 class TeamIntegrateTool:

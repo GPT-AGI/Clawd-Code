@@ -6,7 +6,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 try:
     import fcntl
@@ -115,6 +115,26 @@ class TeamStore:
         serialized = {task_id: TeamTask.from_dict(task).to_dict() for task_id, task in tasks.items()}
         self._write_json(self.team_dir(team_id) / "tasks.json", serialized)
 
+    def mutate_tasks(
+        self,
+        team_id: str,
+        mutator: Callable[[dict[str, TeamTask]], Any],
+    ) -> Any:
+        """Apply one atomic mutation across the team's task collection."""
+        path = self.team_dir(team_id) / "tasks.json"
+        with _locked_path(path):
+            data = self._read_json(path) if path.exists() else {}
+            tasks = {
+                task_id: TeamTask.from_dict(task)
+                for task_id, task in data.items()
+            }
+            result = mutator(tasks)
+            self._write_json_unlocked(
+                path,
+                {task_id: task.to_dict() for task_id, task in tasks.items()},
+            )
+        return result
+
     def update_task(self, team_id: str, task: TeamTask) -> dict[str, dict[str, Any]]:
         path = self.team_dir(team_id) / "tasks.json"
         with _locked_path(path):
@@ -165,6 +185,22 @@ class TeamStore:
         path = self.team_dir(agent.team_id) / "agents" / f"{agent.agent_id}.json"
         self._write_json(path, agent.to_dict())
         return path
+
+    def mutate_agent(
+        self,
+        team_id: str,
+        agent_id: str,
+        mutator: Callable[[AgentRecord], Any],
+    ) -> AgentRecord | None:
+        """Atomically load, mutate, and persist one agent record."""
+        path = self.team_dir(team_id) / "agents" / f"{agent_id}.json"
+        with _locked_path(path):
+            if not path.exists():
+                return None
+            agent = AgentRecord.from_dict(self._read_json(path))
+            mutator(agent)
+            self._write_json_unlocked(path, agent.to_dict())
+        return agent
 
     def load_agent(self, team_id: str, agent_id: str) -> AgentRecord | None:
         path = self.team_dir(team_id) / "agents" / f"{agent_id}.json"

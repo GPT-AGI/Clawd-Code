@@ -28,6 +28,10 @@ SCENARIOS = {
         "tests.test_teammate_resilience.TestTeammateResilience."
         "test_cooperative_cancel_is_observed_after_active_model_call"
     ),
+    "worker-stop": (
+        "tests.test_teammate_resilience.TestTeammateResilience."
+        "test_lead_stops_one_worker_without_cancelling_team"
+    ),
     "budgets": (
         "tests.test_teammate_resilience.TestTeammateResilience."
         "test_turn_budget_limits_model_round_trips"

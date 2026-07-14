@@ -68,23 +68,13 @@ def _provider_settings(
     return api_key, base_url, selected_model
 
 
-def run_prompt(
-    prompt: str,
+def _build_runtime_context(
+    workspace: str | Path,
+    provider_name: str | None,
+    model: str | None,
     *,
-    workspace: str | Path = ".",
-    provider_name: str | None = None,
-    model: str | None = None,
-    max_turns: int = 100,
-    stream: bool = False,
-    on_event: ToolEventHandler | None = None,
-    on_text_chunk: TextChunkHandler | None = None,
-) -> AgentLoopResult:
-    """Run one prompt to completion without starting the interactive REPL."""
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("prompt must be non-empty")
-    if max_turns < 1:
-        raise ValueError("max_turns must be at least 1")
-
+    teammate_max_turns: int = 30,
+) -> tuple[Any, Any, ToolContext, TeammateRuntime]:
     workspace_root = Path(workspace).expanduser().resolve()
     if not workspace_root.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace_root}")
@@ -108,9 +98,35 @@ def run_prompt(
     )
     registry = build_default_registry()
     context = ToolContext(workspace_root=workspace_root)
-    context.teammate_runtime = TeammateRuntime(provider, registry)
+    runtime = TeammateRuntime(provider, registry, max_turns=teammate_max_turns)
+    context.teammate_runtime = runtime
     if model:
         context.model_override = model
+    return provider, registry, context, runtime
+
+
+def run_prompt(
+    prompt: str,
+    *,
+    workspace: str | Path = ".",
+    provider_name: str | None = None,
+    model: str | None = None,
+    max_turns: int = 100,
+    stream: bool = False,
+    on_event: ToolEventHandler | None = None,
+    on_text_chunk: TextChunkHandler | None = None,
+) -> AgentLoopResult:
+    """Run one prompt to completion without starting the interactive REPL."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt must be non-empty")
+    if max_turns < 1:
+        raise ValueError("max_turns must be at least 1")
+
+    provider, registry, context, _ = _build_runtime_context(
+        workspace,
+        provider_name,
+        model,
+    )
 
     conversation = Conversation()
     conversation.add_user_message(prompt.strip())
@@ -124,4 +140,42 @@ def run_prompt(
         verbose=False,
         on_event=on_event,
         on_text_chunk=on_text_chunk,
+    )
+
+
+def resume_team(
+    *,
+    workspace: str | Path = ".",
+    provider_name: str | None = None,
+    model: str | None = None,
+    max_turns: int = 30,
+    max_workers: int | None = None,
+    timeout_s: float | None = None,
+    token_budget: int | None = None,
+    turn_budget: int | None = None,
+    max_retries: int | None = None,
+    lease_timeout_s: int | None = None,
+    retry_failed: bool = True,
+    retry_cancelled: bool = True,
+) -> dict[str, Any]:
+    """Resume the active persisted team without a lead model round trip."""
+    _, _, context, runtime = _build_runtime_context(
+        workspace,
+        provider_name,
+        model,
+        teammate_max_turns=max_turns,
+    )
+    if context.team is None:
+        raise ValueError("no active team")
+    return runtime.run_team(
+        context,
+        resume=True,
+        retry_failed=retry_failed,
+        retry_cancelled=retry_cancelled,
+        max_workers=max_workers,
+        timeout_s=timeout_s,
+        token_budget=token_budget,
+        turn_budget=turn_budget,
+        max_retries=max_retries,
+        lease_timeout_s=lease_timeout_s,
     )

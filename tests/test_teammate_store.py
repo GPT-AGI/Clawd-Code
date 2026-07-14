@@ -18,6 +18,8 @@ from src.tool_system.tools import (
     TeamDeleteTool,
     TeamIntegrateTool,
     TeammateCreateTool,
+    TeammateResumeTool,
+    TeammateStopTool,
     TeamRunTool,
     TeamResumeTool,
 )
@@ -42,6 +44,18 @@ class TestTeammateModels(unittest.TestCase):
                 session_id="session-1",
                 status="unknown",
             )
+
+        agent = AgentRecord(
+            agent_id="agent-2",
+            team_id="team-1",
+            name="coder",
+            role="implementation",
+            session_id="session-2",
+        )
+        agent.transition_to("running")
+        agent.transition_to("stopping")
+        agent.transition_to("cancelled")
+        self.assertEqual(agent.status, "cancelled")
         with self.assertRaises(ValueError):
             Message(
                 message_id="message-1",
@@ -188,6 +202,8 @@ class TestTeamPersistence(unittest.TestCase):
         self.assertFalse(TaskRetryTool().spec().is_read_only)
         self.assertFalse(SendMessageTool().spec().is_read_only)
         self.assertFalse(TeammateCreateTool().spec().is_read_only)
+        self.assertFalse(TeammateStopTool().spec().is_read_only)
+        self.assertFalse(TeammateResumeTool().spec().is_read_only)
         self.assertFalse(TeamRunTool().spec().is_read_only)
         self.assertFalse(TeamResumeTool().spec().is_read_only)
 
