@@ -81,6 +81,7 @@ sessions/
 .port_sessions/
 .clawd/team.json
 .clawd/teams/
+teammate-evals/solo-vs-team/runs/
 
 # Claude Code personal settings
 CLAUDE.local.md

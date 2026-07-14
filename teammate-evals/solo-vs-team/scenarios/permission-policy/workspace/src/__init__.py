@@ -1,0 +1,1 @@
+"""Permission policy fixture."""

@@ -307,6 +307,11 @@ worktree and cherry-picked into the lead repository. Downstream reviewers that
 must inspect newly integrated changes should use the shared workspace. The
 resilience evaluator is in `teammate-evals/runtime-resilience/`.
 
+The five-scenario real-model benchmark in `teammate-evals/solo-vs-team/`
+compares solo and teammate execution on identical business tasks. It records
+acceptance quality, elapsed time, token use, model/tool calls, and collaboration
+evidence in isolated workspaces.
+
 ### Skills (Slash Commands)
 
 Skills are markdown-based slash commands stored under `.clawd/skills`. Each skill lives in its own directory and must be named `SKILL.md`.
@@ -782,6 +787,10 @@ clawd team resume --provider anthropic --model glm-5.2 -C ./project
 `auto_integrate: true`，成功改动会在隔离 worktree 中提交并 cherry-pick 回 lead 仓库。
 需要检查新整合改动的下游 reviewer 应使用 shared workspace。稳定性评测位于
 `teammate-evals/runtime-resilience/`。
+
+`teammate-evals/solo-vs-team/` 还提供五场景真实模型 benchmark，在保持业务任务
+一致的前提下比较单 agent 与 teammate 工作流，并记录验收质量、耗时、token、
+模型/工具调用次数和协作证据。
 
 ### Skills（技能 / 斜杠命令）教程
 
