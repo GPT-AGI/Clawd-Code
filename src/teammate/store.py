@@ -240,6 +240,22 @@ class TeamStore:
         messages.sort(key=lambda message: (message.created_at, message.message_id))
         return messages
 
+    def consume_messages(self, team_id: str, recipient_id: str) -> list[Message]:
+        incoming = [
+            message
+            for message in self.list_messages(team_id)
+            if message.recipient_id == recipient_id and message.status == "delivered"
+        ]
+        for message in incoming:
+            message.transition_to("consumed")
+            self.save_message(message)
+            self.append_event(
+                team_id,
+                "message.consumed",
+                {"message_id": message.message_id, "agent_id": recipient_id},
+            )
+        return incoming
+
     def save_session(self, team_id: str, session_id: str, data: dict[str, Any]) -> Path:
         path = self.team_dir(team_id) / "sessions" / f"{session_id}.json"
         self._write_json(path, data)

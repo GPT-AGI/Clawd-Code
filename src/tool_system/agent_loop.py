@@ -26,6 +26,15 @@ _LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
 - Use web tools only for HTTP or HTTPS resources. Never send local paths or `file://` URLs to `webReader`, `WebFetch`, or other web tools.
 - These local tools are registered even if a provider also offers built-in web tools. If unsure, call `ToolSearch` with focused keywords or query `*`; do not conclude that a tool is unavailable after one empty search."""
 
+_LEADER_TEAM_GUIDANCE = """## Adaptive Team Orchestration
+- You are the lead and remain responsible for the final result. First decide whether delegation is likely to improve quality, latency, or context coverage enough to justify its cost. It is valid to complete the task without creating a team.
+- When a team is useful, choose the number of teammates, their roles, models, tool allowlists, workspace modes, tasks, dependencies, and concurrency from the task itself. Do not default to a fixed planner/coder/reviewer pipeline.
+- Teammates may communicate directly with one another through `SendMessage` and receive new peer messages through `ReadMessages`; useful peer coordination does not need to be routed through the lead.
+- Use stable task keys and explicit ownership. Prefer dependencies only when work truly must be sequential, and allow independent tasks to run in parallel.
+- Observe persisted task, message, and agent state. You may run a bounded number of scheduling batches, then add or reassign tasks, adjust dependencies, stop or resume workers, recover failures, and continue.
+- Treat teammate output as evidence, not authority. Integrate the work, run final verification yourself, and stop unnecessary work when the expected value of more collaboration is low.
+- The resulting communication topology is an execution outcome, not a prescribed shape."""
+
 
 def _is_anthropic_provider(provider: BaseProvider) -> bool:
     return isinstance(provider, (AnthropicProvider, MinimaxProvider))
@@ -208,6 +217,8 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
     except Exception:
         context_prompt = ""
     sections = [style_prompt, _LOCAL_TOOL_GUIDANCE]
+    if tool_context.actor_id is None:
+        sections.append(_LEADER_TEAM_GUIDANCE)
     if tool_context.system_prompt_extra and tool_context.system_prompt_extra.strip():
         sections.append(tool_context.system_prompt_extra.strip())
     if context_prompt.strip():

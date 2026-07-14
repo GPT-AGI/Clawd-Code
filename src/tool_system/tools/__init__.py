@@ -12,7 +12,7 @@ from .grep import GrepTool
 from .lsp import LSPTool
 from .mcp import MCPTool
 from .mcp_resources import ListMcpResourcesTool, ReadMcpResourceTool
-from .misc import NotebookEditTool, PowerShellTool, REPLTool, RemoteTriggerTool, SendMessageTool, TestingPermissionTool
+from .misc import NotebookEditTool, PowerShellTool, ReadMessagesTool, REPLTool, RemoteTriggerTool, SendMessageTool, TestingPermissionTool
 from .plan_mode import EnterPlanModeTool, ExitPlanModeTool
 from .read import FileReadTool
 from .send_user_message import SendUserMessageTool
@@ -55,6 +55,7 @@ __all__ = [
     "PowerShellTool",
     "REPLTool",
     "RemoteTriggerTool",
+    "ReadMessagesTool",
     "SendMessageTool",
     "SendUserMessageTool",
     "SkillTool",

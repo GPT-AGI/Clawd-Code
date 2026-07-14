@@ -86,26 +86,29 @@ Execution protocol: work directly as one agent. Do not create a teammate team
 or call any Team*/Teammate* tool. Inspect, implement, test, and review your own
 change, then summarize the result.
 """
-    if mode != "team":
-        raise ValueError(f"unknown mode: {mode}")
-    return common + """
+    if mode == "adaptive":
+        return common + """
 
-Execution protocol: this must be completed through a teammate workflow. The
-lead must create exactly these three teammates and must not edit implementation
-files itself:
-
-- analyst: read-only requirements and defect analysis; tools Read, Glob, Grep.
-- implementer: implement the repair and run tests; tools Read, Glob, Grep,
-  Write, Edit, Bash.
-- reviewer: independently inspect the implementation and run the full tests;
-  tools Read, Glob, Grep, Bash.
-
-Create tasks with stable keys analysis, implementation, and review. Make
-implementation depend on analysis and review depend on implementation. Require
-analyst -> implementer, implementer -> reviewer, and reviewer -> lead message
-handoffs. Call TeamRun and wait until every task is complete. If review finds a
-problem, send it back to the implementer and repair it before approval.
+Execution protocol: act as the lead and decide whether this task benefits from a
+team. It is valid to solve it directly without creating any teammate. If you do
+delegate, choose the number of teammates, their task-specific roles, models,
+tool allowlists, workspace modes, task graph, and concurrency yourself. Do not
+default to a fixed role pipeline. Teammates may communicate directly through
+SendMessage and ReadMessages when useful. Observe their state, intervene or
+stop work when needed, and personally perform final integration and validation.
+The communication topology should emerge from the work rather than be imposed.
 """
+    if mode in {"team", "forced-team"}:
+        return common + """
+
+Diagnostic execution protocol: use at least one teammate, but choose the team
+size, roles, models, tool allowlists, workspace modes, task graph, concurrency,
+and communication topology from the task itself. Do not use a predefined role
+pipeline. Teammates may communicate directly through SendMessage and
+ReadMessages. Observe the team, adapt it when needed, and personally perform
+final integration and validation.
+"""
+    raise ValueError(f"unknown mode: {mode}")
 
 
 def _parse_unittest_output(output: str, returncode: int) -> dict[str, Any]:
@@ -204,13 +207,14 @@ def _load_team_metrics(workspace: Path) -> dict[str, Any]:
 def _protocol_ok(mode: str, team: dict[str, Any]) -> bool:
     if mode == "solo":
         return not team["present"]
+    if mode == "adaptive" and not team["present"]:
+        return True
     return bool(
         team["present"]
         and team["status"] == "completed"
-        and team["agents"] == 3
-        and team["tasks"] >= 3
+        and team["agents"] >= 1
+        and team["tasks"] >= 1
         and team["completed_tasks"] == team["tasks"]
-        and team["messages"] >= 3
     )
 
 
@@ -401,6 +405,7 @@ def _score_case(
         "integrity_ok": integrity_ok,
         "changed_protected": changed_protected,
         "protocol_ok": protocol_ok,
+        "used_team": bool(team["present"]),
         "quality_score": round(quality, 2),
         "success": bool(
             agent.get("ok")
@@ -433,7 +438,7 @@ def rescore_output(output_root: Path) -> tuple[list[dict[str, Any]], str]:
         scenario_id = str(previous.get("scenario") or "")
         mode = str(previous.get("mode") or "")
         scenario = scenarios.get(scenario_id)
-        if scenario is None or mode not in {"solo", "team"}:
+        if scenario is None or mode not in {"solo", "adaptive", "team", "forced-team"}:
             raise ValueError(f"cannot rescore unknown case: {scenario_id}/{mode}")
         case_root = output_root / scenario_id / mode
         workspace = case_root / "workspace"
@@ -481,18 +486,28 @@ def render_report(results: list[dict[str, Any]], run_id: str) -> str:
     by_scenario: dict[str, dict[str, dict[str, Any]]] = {}
     for result in results:
         by_scenario.setdefault(result["scenario"], {})[result["mode"]] = result
+    available_modes = {result["mode"] for result in results}
+    if "adaptive" in available_modes:
+        comparison_mode = "adaptive"
+        comparison_label = "Adaptive"
+    elif "forced-team" in available_modes:
+        comparison_mode = "forced-team"
+        comparison_label = "Forced team"
+    else:
+        comparison_mode = "team"
+        comparison_label = "Team"
     lines = [
         "# Solo vs Team Benchmark",
         "",
         f"Run: `{run_id}`",
         "",
-        "| Scenario | Solo quality | Team quality | Delta | Solo sec | Team sec | Solo tokens | Team tokens | Team protocol |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        f"| Scenario | Solo quality | {comparison_label} quality | Delta | Solo sec | {comparison_label} sec | Solo tokens | {comparison_label} tokens | Used team | Protocol |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|",
     ]
     deltas: list[float] = []
     for scenario, modes in sorted(by_scenario.items()):
         solo = modes.get("solo")
-        team = modes.get("team")
+        team = modes.get(comparison_mode)
         delta = None
         if solo and team:
             delta = float(team["quality_score"]) - float(solo["quality_score"])
@@ -509,6 +524,7 @@ def render_report(results: list[dict[str, Any]], run_id: str) -> str:
                     _format_cell(team, lambda item: item["elapsed_s"]),
                     _format_cell(solo, lambda item: item["usage"]["total_tokens"]),
                     _format_cell(team, lambda item: item["usage"]["total_tokens"]),
+                    _format_cell(team, lambda item: "yes" if item.get("used_team") else "no"),
                     _format_cell(team, lambda item: "yes" if item["protocol_ok"] else "no"),
                 ]
             )
@@ -520,13 +536,13 @@ def render_report(results: list[dict[str, Any]], run_id: str) -> str:
             "",
             f"Successful runs: **{success}/{len(results)}**",
             (
-                f"Mean team quality delta: **{sum(deltas) / len(deltas):+.2f} points**"
+                f"Mean {comparison_label.lower()} quality delta: **{sum(deltas) / len(deltas):+.2f} points**"
                 if deltas
-                else "Mean team quality delta: unavailable"
+                else f"Mean {comparison_label.lower()} quality delta: unavailable"
             ),
             "",
             "Quality is the percentage of deterministic acceptance tests passed. A run is only",
-            "successful when protected files are unchanged and its solo/team protocol is respected.",
+            "successful when protected files are unchanged and its execution protocol is respected.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -576,11 +592,16 @@ def main() -> int:
             args.max_turns,
         )
 
-    parser = argparse.ArgumentParser(description="Compare solo and teammate execution on five tasks.")
+    parser = argparse.ArgumentParser(description="Compare solo and adaptive teammate execution.")
     parser.add_argument("--list", action="store_true", help="List benchmark scenarios")
     parser.add_argument("--validate-fixtures", action="store_true")
     parser.add_argument("--scenario", action="append", help="Scenario ID; repeat to select several")
-    parser.add_argument("--mode", choices=("solo", "team", "both"), default="both")
+    parser.add_argument(
+        "--mode",
+        choices=("solo", "adaptive", "forced-team", "team", "both", "all"),
+        default="both",
+        help="both runs solo+adaptive; team is a legacy alias for forced-team",
+    )
     parser.add_argument("--provider", default="anthropic")
     parser.add_argument("--model", default="glm-5.2")
     parser.add_argument("--max-turns", type=int, default=100)
@@ -618,7 +639,14 @@ def main() -> int:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_root = (args.output or ROOT / "runs" / run_id).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    modes = ("solo", "team") if args.mode == "both" else (args.mode,)
+    if args.mode == "both":
+        modes = ("solo", "adaptive")
+    elif args.mode == "all":
+        modes = ("solo", "adaptive", "forced-team")
+    elif args.mode == "team":
+        modes = ("forced-team",)
+    else:
+        modes = (args.mode,)
     results: list[dict[str, Any]] = []
     for scenario in scenarios:
         for mode in modes:

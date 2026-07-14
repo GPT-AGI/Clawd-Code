@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import time
 import uuid
 from typing import Any
 
@@ -15,7 +16,10 @@ class SendMessageTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="SendMessage",
-            description="Send and persist a message to a teammate or to the lead.",
+            description=(
+                "Send and persist a direct message to any teammate or to the lead. "
+                "Peer-to-peer messages do not need to pass through the lead."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -85,6 +89,67 @@ class SendMessageTool:
                 "recipient_id": recipient_id,
                 "status": persisted.status,
                 "message_file_path": str(path),
+            },
+        )
+
+
+class ReadMessagesTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="ReadMessages",
+            description=(
+                "Read and consume newly delivered team messages for the current agent. "
+                "Use wait_s to wait briefly for a peer response during parallel work."
+            ),
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"wait_s": {"type": "number"}},
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.team is None:
+            raise ToolInputError("ReadMessages requires an active team")
+        wait_s = tool_input.get("wait_s", 0)
+        if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)):
+            raise ToolInputError("wait_s must be numeric")
+        if wait_s < 0 or wait_s > 60:
+            raise ToolInputError("wait_s must be between 0 and 60")
+
+        team_id = str(context.team["team_id"])
+        lead_id = str(context.team["lead_agent_id"])
+        recipient_id = context.actor_id or lead_id
+        if recipient_id != lead_id and context.team_store.load_agent(team_id, recipient_id) is None:
+            raise ToolInputError(f"unknown message recipient: {recipient_id}")
+
+        deadline = time.monotonic() + float(wait_s)
+        incoming = context.team_store.consume_messages(team_id, recipient_id)
+        while not incoming and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            incoming = context.team_store.consume_messages(team_id, recipient_id)
+
+        names = {
+            agent.agent_id: agent.name for agent in context.team_store.list_agents(team_id)
+        }
+        names[lead_id] = "lead"
+        return ToolResult(
+            name="ReadMessages",
+            output={
+                "messages": [
+                    {
+                        "message_id": message.message_id,
+                        "from": names.get(message.sender_id, message.sender_id),
+                        "sender_id": message.sender_id,
+                        "summary": message.summary,
+                        "message": message.content,
+                        "status": message.status,
+                    }
+                    for message in incoming
+                ]
             },
         )
 

@@ -9,8 +9,11 @@ from src.teammate.models import AgentRecord, Message, Team, TeamTask
 from src.tool_system.context import ToolContext
 from src.tool_system.errors import ToolInputError
 from src.tool_system.tools import (
+    ReadMessagesTool,
     SendMessageTool,
     TaskCreateTool,
+    TaskGetTool,
+    TaskOutputTool,
     TaskRetryTool,
     TaskUpdateTool,
     TeamCancelTool,
@@ -177,6 +180,74 @@ class TestTeamPersistence(unittest.TestCase):
         session = context.team_store.load_session(created["team_id"], teammate["session_id"])
         self.assertEqual(session["agent_id"], teammate["agent_id"])
 
+    def test_teammates_can_exchange_and_poll_direct_messages(self) -> None:
+        lead_context = ToolContext(workspace_root=self.root)
+        created = TeamCreateTool().run({"team_name": "dynamic"}, lead_context).output
+        first = TeammateCreateTool().run(
+            {
+                "name": "frontend",
+                "role": "frontend contract",
+                "instructions": "Coordinate the API contract",
+                "tools": ["Read"],
+            },
+            lead_context,
+        ).output
+        second = TeammateCreateTool().run(
+            {
+                "name": "backend",
+                "role": "backend contract",
+                "instructions": "Coordinate the API contract",
+                "tools": ["Read"],
+            },
+            lead_context,
+        ).output
+        sender = ToolContext(workspace_root=self.root, actor_id=first["agent_id"])
+        receiver = ToolContext(workspace_root=self.root, actor_id=second["agent_id"])
+
+        SendMessageTool().run(
+            {
+                "to": "backend",
+                "summary": "interface",
+                "message": {"path": "/orders", "method": "POST"},
+            },
+            sender,
+        )
+        inbox = ReadMessagesTool().run({"wait_s": 0}, receiver).output["messages"]
+
+        self.assertEqual(len(inbox), 1)
+        self.assertEqual(inbox[0]["from"], "frontend")
+        self.assertEqual(inbox[0]["message"]["path"], "/orders")
+        self.assertEqual(ReadMessagesTool().run({}, receiver).output["messages"], [])
+        events = lead_context.team_store.list_events(created["team_id"])
+        self.assertTrue(any(event["type"] == "message.consumed" for event in events))
+
+    def test_task_tools_accept_stable_keys_and_done_alias(self) -> None:
+        context = ToolContext(workspace_root=self.root)
+        TeamCreateTool().run({"team_name": "dynamic"}, context)
+        task = TaskCreateTool().run(
+            {
+                "key": "backend-contract",
+                "subject": "Backend contract",
+                "description": "Implement the agreed contract",
+            },
+            context,
+        ).output["task"]
+
+        updated = TaskUpdateTool().run(
+            {"taskId": "backend-contract", "status": "done", "output": "ready"}, context
+        ).output
+
+        self.assertEqual(updated["taskId"], task["id"])
+        self.assertEqual(updated["statusChange"]["to"], "completed")
+        self.assertEqual(
+            TaskGetTool().run({"taskId": "backend-contract"}, context).output["task"]["status"],
+            "completed",
+        )
+        self.assertEqual(
+            TaskOutputTool().run({"task_id": "backend-contract"}, context).output["task"]["output"],
+            "ready",
+        )
+
     def test_task_tool_enforces_state_transitions_without_partial_update(self) -> None:
         context = ToolContext(workspace_root=self.root)
         TeamCreateTool().run({"team_name": "demo"}, context)
@@ -200,6 +271,7 @@ class TestTeamPersistence(unittest.TestCase):
         self.assertFalse(TaskCreateTool().spec().is_read_only)
         self.assertFalse(TaskUpdateTool().spec().is_read_only)
         self.assertFalse(TaskRetryTool().spec().is_read_only)
+        self.assertFalse(ReadMessagesTool().spec().is_read_only)
         self.assertFalse(SendMessageTool().spec().is_read_only)
         self.assertFalse(TeammateCreateTool().spec().is_read_only)
         self.assertFalse(TeammateStopTool().spec().is_read_only)

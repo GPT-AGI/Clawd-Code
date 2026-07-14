@@ -120,12 +120,23 @@ class TestTeammateRuntime(unittest.TestCase):
             self.context,
         ).output["task"]
 
+        first_batch = TeamRunTool().run({"max_batches": 1}, self.context)
+        self.assertEqual(first_batch.output["status"], "running")
+        self.assertEqual(first_batch.output["executed_task_ids"], [analysis["id"]])
+        self.assertNotIn("max_batches", self.context.team["settings"])
+
+        second_batch = TeamRunTool().run({"max_batches": 1}, self.context)
+        self.assertEqual(second_batch.output["status"], "running")
+        self.assertEqual(second_batch.output["executed_task_ids"], [implementation["id"]])
+
         result = TeamRunTool().run({}, self.context)
 
         self.assertFalse(result.is_error)
         self.assertEqual(result.output["status"], "completed")
         self.assertEqual(
-            result.output["executed_task_ids"],
+            first_batch.output["executed_task_ids"]
+            + second_batch.output["executed_task_ids"]
+            + result.output["executed_task_ids"],
             [analysis["id"], implementation["id"], review["id"]],
         )
         self.assertEqual({task["status"] for task in self.context.tasks.values()}, {"completed"})
@@ -154,6 +165,9 @@ class TestTeammateRuntime(unittest.TestCase):
             "tool.completed",
             "run.completed",
         }.issubset(trace_types))
+        self.assertEqual(
+            sum(event["type"] == "team.batch_paused" for event in trace_events), 2
+        )
         send_message_events = [
             event for event in trace_events
             if event["type"] == "tool.started"

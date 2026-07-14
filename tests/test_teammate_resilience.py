@@ -339,28 +339,32 @@ class TestTeammateResilience(unittest.TestCase):
         self.assertFalse(resumed.is_error)
         self.assertEqual(resumed.output["status"], "completed")
 
-    def test_token_budget_failure_is_persisted(self) -> None:
+    def test_token_budget_overrun_after_completion_is_reported(self) -> None:
         self._agent("worker")
         self._task("budget", "worker")
         self._runtime(FinalProvider(tokens=10))
 
         result = TeamRunTool().run({"token_budget": 5}, self.context)
 
-        self.assertTrue(result.is_error)
-        self.assertIn("token budget", result.output["error"])
+        self.assertFalse(result.is_error)
+        self.assertIn("token budget", result.output["budget_warning"])
         team = self.context.team_store.load_team(self.team["team_id"])
-        self.assertEqual(team.status, "failed")
+        self.assertEqual(team.status, "completed")
         self.assertEqual(team.usage["total_tokens"], 10)
+        events = self.context.team_store.list_events(self.team["team_id"])
+        self.assertTrue(
+            any(event["type"] == "team.budget_exceeded_after_completion" for event in events)
+        )
 
-    def test_timeout_failure_is_checked_after_cooperative_task_boundary(self) -> None:
+    def test_timeout_overrun_preserves_completed_result_with_warning(self) -> None:
         self._agent("worker")
         self._task("timeout", "worker")
         self._runtime(FinalProvider(delay=0.04))
 
         result = self.context.teammate_runtime.run_team(self.context, timeout_s=0.01)
 
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("timeout", result["error"])
+        self.assertEqual(result["status"], "completed")
+        self.assertIn("timeout", result["budget_warning"])
 
     def test_turn_budget_limits_model_round_trips(self) -> None:
         (self.root / "input.txt").write_text("input\n", encoding="utf-8")

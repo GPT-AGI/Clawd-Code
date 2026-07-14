@@ -1,7 +1,7 @@
 # Solo vs Team Benchmark
 
-This benchmark compares one-agent execution with a persistent teammate workflow
-on the same five repository repair tasks:
+This benchmark compares one-agent execution with adaptive lead-controlled
+teammate execution on the same five repository repair tasks:
 
 The first real `glm-5.2` run and its conclusions are recorded in
 [`BASELINE_GLM52.md`](BASELINE_GLM52.md).
@@ -13,10 +13,12 @@ The first real `glm-5.2` run and its conclusions are recorded in
 5. `csv-reconciliation`: parsing, deterministic matching, ambiguity, and malformed data.
 
 Each run gets a clean workspace. `TASK.md`, `requirements.md`, and acceptance
-tests are hashed before and after execution. Solo and team receive the same
-business task; only the execution protocol differs. Quality is the percentage
-of deterministic acceptance tests passed. The report also records elapsed time,
-tokens, model/tool calls, and team collaboration evidence.
+tests are hashed before and after execution. Solo and adaptive runs receive the
+same business task; only team tools are disabled for solo. In adaptive mode the
+lead decides whether to create a team and, if so, chooses its size, roles,
+models, tools, workspaces, task graph, concurrency, and communication topology.
+Quality is the percentage of deterministic acceptance tests passed. The report
+also records elapsed time, tokens, model/tool calls, and collaboration evidence.
 
 Validate the intentionally broken fixtures without using a model:
 
@@ -37,8 +39,12 @@ Run one scenario or one mode while iterating:
 ```bash
 .venv/bin/python teammate-evals/solo-vs-team/benchmark.py \
   --scenario webhook-idempotency \
-  --mode team
+  --mode adaptive
 ```
+
+Use `--mode forced-team` only to diagnose the teammate runtime while still
+letting the lead choose the team structure. `--mode all` runs solo, adaptive,
+and forced-team. No benchmark mode prescribes planner/executor/verifier roles.
 
 Artifacts are written under `runs/<UTC timestamp>/`: each isolated workspace,
 the exact generated prompt, stdout/stderr, per-run JSON, aggregate `results.json`,

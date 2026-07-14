@@ -9,7 +9,7 @@ from src.agent.conversation import Conversation
 from src.context_system import build_context_prompt
 from src.context_system.git_context import collect_git_context
 from src.providers.base import ChatResponse
-from src.tool_system.agent_loop import run_agent_loop
+from src.tool_system.agent_loop import _build_effective_system_prompt, run_agent_loop
 from src.tool_system.context import ToolContext
 from src.tool_system.defaults import build_default_registry
 
@@ -66,9 +66,19 @@ class TestContextSystem(unittest.TestCase):
             self.assertEqual(system_message["role"], "system")
             self.assertIn("## Runtime Context", system_message["content"])
             self.assertIn("## Local Engineering Tools", system_message["content"])
+            self.assertIn("## Adaptive Team Orchestration", system_message["content"])
+            self.assertIn("valid to complete the task without creating a team", system_message["content"])
             self.assertIn("Never send local paths", system_message["content"])
             self.assertIn("## Project Instructions", system_message["content"])
             self.assertIn("Follow the CLAUDE instructions.", system_message["content"])
+
+    def test_teammate_prompt_does_not_receive_leader_orchestration_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context = ToolContext(workspace_root=Path(tmp), actor_id="worker-1")
+
+            prompt = _build_effective_system_prompt("style", context)
+
+        self.assertNotIn("## Adaptive Team Orchestration", prompt)
 
 
 if __name__ == "__main__":

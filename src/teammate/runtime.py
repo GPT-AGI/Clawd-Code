@@ -21,6 +21,7 @@ from .worktree import TeammateWorktreeManager
 
 _MANDATORY_TEAMMATE_TOOLS = (
     "SendMessage",
+    "ReadMessages",
     "TaskGet",
     "TaskList",
     "TaskUpdate",
@@ -44,6 +45,7 @@ _FORBIDDEN_TEAMMATE_TOOLS = {
 @dataclass(frozen=True)
 class TeamRunOptions:
     max_workers: int = 1
+    max_batches: int | None = None
     timeout_s: float | None = None
     token_budget: int | None = None
     turn_budget: int | None = None
@@ -56,13 +58,14 @@ class TeamRunOptions:
         for name in cls.__dataclass_fields__:
             if overrides.get(name) is not None:
                 values[name] = overrides[name]
-            elif persisted.get(name) is not None:
+            elif name != "max_batches" and persisted.get(name) is not None:
                 values[name] = persisted[name]
         return cls(**values)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_workers": self.max_workers,
+            "max_batches": self.max_batches,
             "timeout_s": self.timeout_s,
             "token_budget": self.token_budget,
             "turn_budget": self.turn_budget,
@@ -113,6 +116,7 @@ class TeammateRuntime:
         retry_failed: bool = False,
         retry_cancelled: bool = False,
         max_workers: int | None = None,
+        max_batches: int | None = None,
         timeout_s: float | None = None,
         token_budget: int | None = None,
         turn_budget: int | None = None,
@@ -132,6 +136,7 @@ class TeammateRuntime:
             team.settings,
             {
                 "max_workers": max_workers,
+                "max_batches": max_batches,
                 "timeout_s": timeout_s,
                 "token_budget": token_budget,
                 "turn_budget": turn_budget,
@@ -139,7 +144,9 @@ class TeammateRuntime:
                 "lease_timeout_s": lease_timeout_s,
             },
         )
-        team.settings.update(options.to_dict())
+        persisted_options = options.to_dict()
+        persisted_options.pop("max_batches", None)
+        team.settings.update(persisted_options)
         team.usage = self._normalized_usage(team.usage)
         team.started_at = team.started_at or utc_now()
         if resume:
@@ -165,6 +172,7 @@ class TeammateRuntime:
                 retry_cancelled=retry_cancelled,
             )
             executed: list[str] = []
+            completed_batches = 0
             run_started = time.monotonic()
 
             while True:
@@ -173,17 +181,26 @@ class TeammateRuntime:
                     lead_context.reload_team_state()
                     return self._cancelled_result(lead_context, current, executed)
 
-                budget_error = self._budget_error(current, options, run_started)
-                if budget_error:
-                    return self._fail_team(lead_context, current, budget_error, executed)
-
                 lead_context.reload_team_state()
                 tasks = lead_context.tasks
                 if not tasks:
                     return self._fail_team(lead_context, current, "team has no tasks", executed)
                 if all(task.get("status") == "completed" for task in tasks.values()):
+                    budget_warning = self._budget_error(current, options, run_started)
                     completed = self._complete_team(lead_context, current)
-                    return self._result(lead_context, completed, executed)
+                    result = self._result(lead_context, completed, executed)
+                    if budget_warning:
+                        lead_context.team_store.append_event(
+                            current.team_id,
+                            "team.budget_exceeded_after_completion",
+                            {"warning": budget_warning, "usage": completed.usage},
+                        )
+                        result["budget_warning"] = budget_warning
+                    return result
+
+                budget_error = self._budget_error(current, options, run_started)
+                if budget_error:
+                    return self._fail_team(lead_context, current, budget_error, executed)
 
                 failed = [task for task in tasks.values() if task.get("status") == "failed"]
                 if failed:
@@ -264,6 +281,23 @@ class TeammateRuntime:
                         first.error or f"task failed: {first.task_id}",
                         executed,
                     )
+
+                completed_batches += 1
+                if (
+                    options.max_batches is not None
+                    and completed_batches >= options.max_batches
+                ):
+                    latest = lead_context.team_store.load_team(current.team_id) or current
+                    lead_context.reload_team_state()
+                    lead_context.team_store.append_event(
+                        current.team_id,
+                        "team.batch_paused",
+                        {
+                            "completed_batches": completed_batches,
+                            "executed_task_ids": executed,
+                        },
+                    )
+                    return self._result(lead_context, latest, executed)
         except Exception as exc:
             return self._fail_team(
                 lead_context, team, str(exc), locals().get("executed", [])
@@ -742,7 +776,10 @@ class TeammateRuntime:
                 f"You are teammate `{agent.name}` with role `{agent.role}` in team `{team.team_name}`.\n"
                 f"Role instructions: {agent.instructions}\n"
                 f"Your current task is `{task.key or task.id}`. Work only on this task. "
-                "Use SendMessage for every handoff; do not claim another teammate's work. "
+                "Use SendMessage to coordinate directly with any teammate or the lead when it helps; "
+                "use ReadMessages to receive peer replies during parallel work. Communicate useful "
+                "decisions, interfaces, blockers, and handoffs rather than sending ceremonial updates. "
+                "Do not claim another teammate's work. "
                 "If the task cannot be completed, set your current task to failed with TaskUpdate and explain why."
             ),
         )
@@ -804,20 +841,7 @@ class TeammateRuntime:
     def _consume_messages(
         store: TeamStore, team: Team, agent: AgentRecord
     ) -> list[Message]:
-        incoming = [
-            message
-            for message in store.list_messages(team.team_id)
-            if message.recipient_id == agent.agent_id and message.status == "delivered"
-        ]
-        for message in incoming:
-            message.transition_to("consumed")
-            store.save_message(message)
-            store.append_event(
-                team.team_id,
-                "message.consumed",
-                {"message_id": message.message_id, "agent_id": agent.agent_id},
-            )
-        return incoming
+        return store.consume_messages(team.team_id, agent.agent_id)
 
     @staticmethod
     def _save_task(store: TeamStore, team_id: str, task: TeamTask) -> None:

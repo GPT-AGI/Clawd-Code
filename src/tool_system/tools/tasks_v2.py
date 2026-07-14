@@ -151,7 +151,7 @@ class TaskGetTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TaskGet",
-            description="Retrieve a task by ID.",
+            description="Retrieve a task by internal ID or stable key.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -164,10 +164,11 @@ class TaskGetTool:
         )
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
-        task_id = tool_input.get("taskId")
-        if not isinstance(task_id, str) or not task_id.strip():
-            raise ToolInputError("taskId must be a non-empty string")
-        task = context.tasks.get(task_id)
+        identity = tool_input.get("taskId")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ToolInputError("taskId must be a non-empty task ID or key")
+        task_id = _resolve_task_id(context.tasks, identity)
+        task = context.tasks.get(task_id) if task_id is not None else None
         if task is None:
             return ToolResult(name="TaskGet", output={"task": None})
         return ToolResult(
@@ -220,7 +221,10 @@ class TaskUpdateTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TaskUpdate",
-            description="Update a task.",
+            description=(
+                "Update a task by internal ID or stable key. Canonical statuses are pending, "
+                "in_progress, completed, failed, and cancelled; done is accepted as completed."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -244,14 +248,15 @@ class TaskUpdateTool:
         )
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
-        task_id = tool_input.get("taskId")
-        if not isinstance(task_id, str) or not task_id.strip():
-            raise ToolInputError("taskId must be a non-empty string")
-        task = context.tasks.get(task_id)
+        identity = tool_input.get("taskId")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ToolInputError("taskId must be a non-empty task ID or key")
+        task_id = _resolve_task_id(context.tasks, identity)
+        task = context.tasks.get(task_id) if task_id is not None else None
         if task is None:
             return ToolResult(
                 name="TaskUpdate",
-                output={"success": False, "taskId": task_id, "updatedFields": [], "error": "Task not found"},
+                output={"success": False, "taskId": identity, "updatedFields": [], "error": "Task not found"},
             )
         if context.actor_id is not None and context.current_task_id is not None and task_id != context.current_task_id:
             raise ToolInputError("teammates may only update their current task")
@@ -259,6 +264,8 @@ class TaskUpdateTool:
         updated_fields: list[str] = []
         status_change: dict[str, str] | None = None
         requested_status = tool_input.get("status")
+        if requested_status == "done":
+            requested_status = "completed"
         if context.actor_id is not None:
             structural = {"owner", "addBlocks", "addBlockedBy"}
             if structural.intersection(tool_input):
@@ -357,7 +364,7 @@ class TaskOutputTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TaskOutput",
-            description="Get output for a task (best-effort).",
+            description="Get output for a task by internal ID or stable key (best-effort).",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -375,11 +382,12 @@ class TaskOutputTool:
         )
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
-        task_id = tool_input.get("task_id")
-        if not isinstance(task_id, str) or not task_id.strip():
-            raise ToolInputError("task_id must be a non-empty string")
+        identity = tool_input.get("task_id")
+        if not isinstance(identity, str) or not identity.strip():
+            raise ToolInputError("task_id must be a non-empty task ID or key")
 
-        task = context.tasks.get(task_id)
+        task_id = _resolve_task_id(context.tasks, identity)
+        task = context.tasks.get(task_id) if task_id is not None else None
         if task is None:
             return ToolResult(name="TaskOutput", output={"retrieval_status": "success", "task": None})
 

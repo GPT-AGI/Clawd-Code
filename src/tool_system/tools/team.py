@@ -16,7 +16,10 @@ class TeamCreateTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TeamCreate",
-            description="Create a lightweight team context for multi-agent workflows.",
+            description=(
+                "Create a team only when the lead decides delegation is worth its cost. "
+                "The lead chooses the team shape; no fixed roles or topology are required."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -64,7 +67,10 @@ class TeammateCreateTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TeammateCreate",
-            description="Create a persistent teammate with an independent session and an explicit tool allowlist.",
+            description=(
+                "Create one persistent teammate with a lead-defined role, model, tool allowlist, "
+                "and workspace mode. Roles are task-specific rather than predefined."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -167,6 +173,7 @@ class TeammateCreateTool:
 
 _RUN_PROPERTIES: dict[str, dict[str, Any]] = {
     "max_workers": {"type": "integer"},
+    "max_batches": {"type": "integer"},
     "timeout_s": {"type": "number"},
     "token_budget": {"type": "integer"},
     "turn_budget": {"type": "integer"},
@@ -179,6 +186,7 @@ def _run_options(tool_input: dict[str, Any]) -> dict[str, Any]:
     options = {key: tool_input[key] for key in _RUN_PROPERTIES if key in tool_input}
     bounds = {
         "max_workers": (1, 16),
+        "max_batches": (1, 10_000),
         "timeout_s": (1, 86_400),
         "token_budget": (1, 100_000_000),
         "turn_budget": (1, 100_000),
@@ -200,7 +208,10 @@ class TeamRunTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TeamRun",
-            description="Run ready teammate tasks with optional parallelism, retries, leases, timeout, and usage budgets.",
+            description=(
+                "Run ready teammate tasks with optional parallelism, retries, leases, budgets, "
+                "and a batch limit so the lead can inspect and adapt the team between batches."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,

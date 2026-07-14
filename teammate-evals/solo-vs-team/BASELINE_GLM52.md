@@ -6,6 +6,8 @@ This is the first real-model baseline for the five-scenario benchmark. Each
 scenario was run once in solo mode and once in team mode against the configured
 Anthropic-compatible endpoint with model `glm-5.2`. Team mode used a serial
 analyst -> implementer -> reviewer workflow with required handoff messages.
+This records the original forced-pipeline v1 protocol; the current benchmark's
+primary comparison is solo vs adaptive lead-controlled orchestration.
 
 ## Results
 

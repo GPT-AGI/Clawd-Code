@@ -270,17 +270,28 @@ can come from `clawd login` or standard environment variables such as
 ### Teammate Workflows
 
 The lead can create persistent teammates, assign dependency-aware tasks, and
-run them with bounded concurrency:
+run them with bounded concurrency.
+
+The lead first decides whether collaboration is worthwhile; using no team is a
+valid outcome. When delegation helps, the lead chooses any task-specific roles,
+models, tool allowlists, workspace modes, dependencies, and concurrency. There
+is no required planner/coder/reviewer pipeline. Teammates can communicate
+directly with one another using `SendMessage` and poll peer replies with
+`ReadMessages`, so the communication topology emerges from the work.
 
 ```text
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
 
-`TeamRun` accepts `max_workers`, `max_retries`, `lease_timeout_s`, `timeout_s`,
-`token_budget`, and `turn_budget`. Use `TeamResume` to recover expired leases or
+`TeamRun` accepts `max_workers`, `max_batches`, `max_retries`,
+`lease_timeout_s`, `timeout_s`, `token_budget`, and `turn_budget`. Use
+`TeamResume` to recover expired leases or
 resume a failed/cancelled team, `TaskRetry` for an explicit task retry, and
 `TeamCancel` for cooperative cancellation. Every state transition, model call,
 tool call, and message handoff is persisted for `clawd trace`.
+Set `max_batches` to return control after a bounded number of scheduling batches
+so the lead can inspect progress, add or reassign tasks, adjust dependencies,
+stop or resume workers, and then continue the team.
 
 Only the lead may call `TeammateStop` or `TeammateResume`. `TeammateStop` stops
 one worker without cancelling the team and applies `task_policy: "requeue"`
@@ -308,9 +319,9 @@ must inspect newly integrated changes should use the shared workspace. The
 resilience evaluator is in `teammate-evals/runtime-resilience/`.
 
 The five-scenario real-model benchmark in `teammate-evals/solo-vs-team/`
-compares solo and teammate execution on identical business tasks. It records
-acceptance quality, elapsed time, token use, model/tool calls, and collaboration
-evidence in isolated workspaces.
+compares solo and adaptive lead-controlled execution on identical business
+tasks. It records acceptance quality, elapsed time, token use, model/tool calls,
+and collaboration evidence in isolated workspaces.
 
 ### Skills (Slash Commands)
 
@@ -753,16 +764,23 @@ Provider 凭据既可来自 `clawd login`，也可使用 `ANTHROPIC_AUTH_TOKEN`�
 
 ### Teammate 工作流
 
-Lead 可以创建持久化 teammate、分配带依赖的任务，并限制并行度执行：
+Lead 可以创建持久化 teammate、分配带依赖的任务，并限制并行度执行。
+
+Lead 会先判断协作是否值得；完全不创建 team 也是正确结果。需要分工时，Lead 根据
+任务自行决定任意角色、模型、工具权限、workspace、依赖和并行度，不要求固定的
+planner/coder/reviewer 流水线。Teammate 可通过 `SendMessage` 直接相互通信，并用
+`ReadMessages` 获取 peer 回复，因此通信拓扑由实际工作自然产生。
 
 ```text
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
 
-`TeamRun` 支持 `max_workers`、`max_retries`、`lease_timeout_s`、`timeout_s`、
-`token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，
+`TeamRun` 支持 `max_workers`、`max_batches`、`max_retries`、`lease_timeout_s`、
+`timeout_s`、`token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，
 `TaskRetry` 显式重试单个任务，`TeamCancel` 执行协作式取消。所有状态迁移、模型调用、
 工具调用和消息交接都会持久化，可通过 `clawd trace` 查看。
+设置 `max_batches` 可在执行限定批次后把控制权交还 Lead，供其检查进度、追加或重派
+任务、调整依赖、停止或恢复 worker，然后继续运行。
 
 只有 Lead 可以调用 `TeammateStop` 和 `TeammateResume`。`TeammateStop` 只停止一个
 worker，不会取消整个团队；未完成任务可选择默认的 `task_policy: "requeue"`，或使用
@@ -789,7 +807,7 @@ clawd team resume --provider anthropic --model glm-5.2 -C ./project
 `teammate-evals/runtime-resilience/`。
 
 `teammate-evals/solo-vs-team/` 还提供五场景真实模型 benchmark，在保持业务任务
-一致的前提下比较单 agent 与 teammate 工作流，并记录验收质量、耗时、token、
+一致的前提下比较单 agent 与 Lead 自主决策的 teammate 工作流，并记录验收质量、耗时、token、
 模型/工具调用次数和协作证据。
 
 ### Skills（技能 / 斜杠命令）教程

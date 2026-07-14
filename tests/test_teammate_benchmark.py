@@ -80,6 +80,20 @@ class TestSoloVsTeamBenchmark(unittest.TestCase):
         self.assertEqual(metrics["failed_events"], 1)
         self.assertEqual(metrics["cancelled_events"], 1)
 
+    def test_adaptive_prompt_leaves_team_shape_to_the_lead(self) -> None:
+        benchmark = load_benchmark_module()
+        scenario = benchmark.load_scenarios(["config-migration"])[0]
+        workspace = Path(scenario["fixture"])
+
+        prompt = benchmark.build_prompt(workspace, "adaptive")
+        normalized = " ".join(prompt.split())
+
+        self.assertIn("decide whether this task benefits from a team", normalized)
+        self.assertIn("valid to solve it directly", normalized)
+        self.assertIn("communication topology should emerge", normalized)
+        self.assertNotIn("exactly these three teammates", prompt)
+        self.assertTrue(benchmark._protocol_ok("adaptive", {"present": False}))
+
 
 if __name__ == "__main__":
     unittest.main()

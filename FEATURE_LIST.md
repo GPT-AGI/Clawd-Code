@@ -139,7 +139,7 @@
 | 配置测试 | ✅ | `test_config.py` |
 | Teammate runtime / trace 测试 | ✅ | `test_teammate_runtime.py`、`test_teammate_viewer.py` |
 | Teammate resilience 评测 | ✅ | crash-resume、retry、review-reject、cancel、worker-stop、budget、parallel、worktree |
-| Solo vs Team benchmark | ✅ | 5 个隔离真实任务，确定性质量评分、成本指标和协作证据 |
+| Solo vs Adaptive Team benchmark | ✅ | Lead 自主决定是否组队、角色与拓扑；5 个隔离任务、确定性评分和成本指标 |
 | 非交互 runner 测试 | ✅ | `test_runner.py` |
 
 
