@@ -89,3 +89,47 @@ unavailable Python aliases, expected failing baseline tests, and one malformed
 review command. Each failure was visible in the trace and the agents recovered
 without operator intervention. The trace was recorded natively rather than
 reconstructed from teammate sessions.
+
+## Resilient runtime release gate
+
+Date: 2026-07-14
+
+The release gate was repeated in a clean fixture copy after adding recovery,
+leases, retries, cancellation, budgets, parallel scheduling, and worktree
+support. The normal user configuration selected the Anthropic-compatible z.ai
+endpoint and `glm-5.2`; no credential was copied into the fixture or repository.
+
+The clean baseline again produced the two expected business failures and no
+collaboration evidence. A subsequent real-model run created three teammates,
+persisted a three-task dependency chain, exchanged the three required handoff
+messages, changed only `src/order.py`, and completed without operator edits.
+
+Runtime settings selected by the lead:
+
+- 3 parallel workers
+- 10-minute timeout
+- 50-turn budget
+- 2 automatic retries
+- 15-minute task leases
+
+Combined evaluator result:
+
+```text
+Collaboration evidence: PASSED
+Ran 6 tests
+OK
+Business acceptance: PASSED
+```
+
+Persisted trace summary:
+
+- 201 native events
+- 49 tool calls: 47 completed and 2 failed
+- 3 teammate messages
+- 40,165 teammate tokens across 19 turns
+- 3 minutes 16 seconds elapsed inside `TeamRun`
+- every agent and task completed on its first attempt
+
+The two failed tool calls were the unavailable `python` alias and the expected
+failing baseline test command. The lead recovered by using `python3`, and the
+coder and reviewer independently obtained six passing acceptance checks.
