@@ -42,6 +42,11 @@ PACKAGE_FILES = {
     "MANIFEST.in",
 }
 TASK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+PYTEST_COMMAND_RE = re.compile(
+    r"^\s*(?:[A-Za-z_]\w*=[^\s]+\s+)*"
+    r"(?:pytest|python(?:\d+(?:\.\d+)?)?\s+-m\s+pytest|xvfb-run\b.*\bpytest)"
+    r"(?:\s|$)"
+)
 
 
 def _read_json(path: Path) -> Any:
@@ -295,12 +300,26 @@ def _run_agent_child(
             "lead_tool_calls": sum(event["kind"] == "tool_use" for event in events),
         }
     except Exception as exc:
+        terminal = next(
+            (
+                event
+                for event in reversed(events)
+                if event.get("kind") in {"run_completed", "run_failed", "run_cancelled"}
+            ),
+            {},
+        )
+        lead_turns = int(terminal.get("turn") or 0)
+        if lead_turns == 0:
+            lead_turns = max(
+                (int(event.get("turn") or 0) for event in events if event.get("kind") == "model_response"),
+                default=0,
+            )
         payload = {
             "ok": False,
             "error": str(exc),
             "traceback": traceback.format_exc(),
-            "lead_usage": {},
-            "lead_turns": 0,
+            "lead_usage": terminal.get("usage") or {},
+            "lead_turns": lead_turns,
             "lead_model_calls": sum(event["kind"] == "model_response" for event in events),
             "lead_tool_calls": sum(event["kind"] == "tool_use" for event in events),
         }
@@ -431,6 +450,14 @@ def _safe_relative_path(value: str) -> Path:
     return path
 
 
+def _split_score_commands(commands: list[str]) -> tuple[list[str], list[str]]:
+    """Split ordered setup commands from the pytest invocation."""
+    for index, command in enumerate(commands):
+        if PYTEST_COMMAND_RE.search(command):
+            return commands[:index], commands[index:]
+    return [], commands
+
+
 def stage_score_context(task: dict[str, Any], workspace: Path, destination: Path) -> dict[str, Any]:
     if destination.exists():
         shutil.rmtree(destination)
@@ -459,24 +486,25 @@ def stage_score_context(task: dict[str, Any], workspace: Path, destination: Path
             shutil.rmtree(target)
         elif target.exists():
             target.unlink()
-    dockerfile = destination / "Dockerfile"
-    dockerfile.write_text(
-        "\n".join(
-            [
-                f"FROM --platform=linux/amd64 {task['image']}",
-                "COPY workspace /workspace",
-                "WORKDIR /workspace",
-                "ENV PYTHONPATH=/workspace:$PYTHONPATH",
-                "CMD [\"tail\", \"-f\", \"/dev/null\"]",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+    setup_commands, test_commands = _split_score_commands(list(task.get("test_commands", [])))
+    dockerfile_lines = [
+        f"FROM --platform=linux/amd64 {task['image']}",
+        "COPY workspace /workspace",
+        "WORKDIR /workspace",
+        "ENV PYTHONPATH=/workspace:$PYTHONPATH",
+    ]
+    dockerfile_lines.extend(
+        f"RUN {json.dumps(['/bin/bash', '-lc', command])}" for command in setup_commands
     )
+    dockerfile_lines.extend(["CMD [\"tail\", \"-f\", \"/dev/null\"]", ""])
+    dockerfile = destination / "Dockerfile"
+    dockerfile.write_text("\n".join(dockerfile_lines), encoding="utf-8")
     return {
         "package_files_present": package_files,
         "generated_hidden_paths": generated_hidden_paths,
         "dockerfile": str(dockerfile),
+        "setup_commands": setup_commands,
+        "test_commands": test_commands,
     }
 
 
@@ -513,7 +541,7 @@ def run_hidden_tests(
             "pytest": parse_pytest_output("", int(task["expected_tests"]), 1),
         }
     test_started = time.monotonic()
-    test_command = " && ".join(f"({command})" for command in task["test_commands"])
+    test_command = " && ".join(f"({command})" for command in metadata["test_commands"])
     try:
         completed = subprocess.run(
             [

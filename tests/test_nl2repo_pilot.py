@@ -79,6 +79,7 @@ class TestNL2RepoPilot(unittest.TestCase):
         task = {
             "image": "example.invalid/sample:1.0",
             "hidden_paths": ["tests"],
+            "test_commands": ["pip install -e .", "pytest tests"],
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -97,6 +98,10 @@ class TestNL2RepoPilot(unittest.TestCase):
             self.assertFalse((staged / "pyproject.toml").exists())
             self.assertFalse((staged / "tests").exists())
             self.assertTrue((staged / "package.py").exists())
+            dockerfile = (root / "score" / "Dockerfile").read_text(encoding="utf-8")
+            self.assertIn('RUN ["/bin/bash", "-lc", "pip install -e ."]', dockerfile)
+            self.assertEqual(metadata["setup_commands"], ["pip install -e ."])
+            self.assertEqual(metadata["test_commands"], ["pytest tests"])
 
     def test_parse_pytest_output_uses_hidden_expected_total(self) -> None:
         result = benchmark.parse_pytest_output(
@@ -110,6 +115,16 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(result["quality_score"], 75.0)
         self.assertFalse(result["all_passed"])
+
+    def test_score_command_split_keeps_pytest_install_in_build_phase(self) -> None:
+        setup, tests = benchmark._split_score_commands([
+            "pip install pytest",
+            "pip install -e .",
+            "python -m pytest tests",
+        ])
+
+        self.assertEqual(setup, ["pip install pytest", "pip install -e ."])
+        self.assertEqual(tests, ["python -m pytest tests"])
 
     def test_unsafe_hidden_test_paths_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsafe"):
@@ -160,6 +175,51 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertEqual([event["kind"] for event in progress], ["model_started", "text_chunk"])
         self.assertEqual(result["lead_model_calls"], 0)
         self.assertEqual(result["lead_usage"]["input_tokens"], 3)
+
+    def test_agent_child_preserves_terminal_usage_when_provider_raises(self) -> None:
+        def fake_run_prompt(prompt: str, **kwargs: object) -> AgentLoopResult:
+            on_event = kwargs["on_event"]
+            assert callable(on_event)
+            on_event(ToolEvent(
+                kind="model_response",
+                model="test-model",
+                usage={"input_tokens": 7, "output_tokens": 5},
+                turn=4,
+            ))
+            on_event(ToolEvent(
+                kind="run_failed",
+                model="test-model",
+                usage={"input_tokens": 31, "output_tokens": 19},
+                turn=4,
+                is_error=True,
+                error="provider rejected history",
+            ))
+            raise RuntimeError("provider rejected history")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt_path = root / "PROMPT.md"
+            result_path = root / "agent-result.json"
+            progress_path = root / "progress.jsonl"
+            prompt_path.write_text("Build it.", encoding="utf-8")
+            with patch("src.runner.run_prompt", side_effect=fake_run_prompt):
+                returncode = benchmark._run_agent_child(
+                    root,
+                    prompt_path,
+                    result_path,
+                    "anthropic",
+                    "test-model",
+                    5,
+                    3,
+                    8192,
+                    False,
+                    progress_path,
+                )
+            result = json.loads(result_path.read_text())
+
+        self.assertEqual(returncode, 1)
+        self.assertEqual(result["lead_turns"], 4)
+        self.assertEqual(result["lead_usage"], {"input_tokens": 31, "output_tokens": 19})
 
 
 if __name__ == "__main__":

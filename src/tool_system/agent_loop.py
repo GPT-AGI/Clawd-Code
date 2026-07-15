@@ -10,7 +10,12 @@ from typing import Any, Callable
 
 from .registry import ToolRegistry
 from .context import ToolContext
-from ..agent.conversation import Conversation, TextContentBlock, ToolUseContentBlock
+from ..agent.conversation import (
+    Conversation,
+    TextContentBlock,
+    ToolResultContentBlock,
+    ToolUseContentBlock,
+)
 from ..context_system import build_context_prompt
 from ..outputStyles import resolve_output_style
 from ..providers.base import BaseProvider, ChatResponse
@@ -40,8 +45,34 @@ def _is_anthropic_provider(provider: BaseProvider) -> bool:
     return isinstance(provider, (AnthropicProvider, MinimaxProvider))
 
 
-def _build_tool_result_content(result_output: Any) -> str:
-    """Serialize structured tool output into provider-safe text."""
+def _truncate_provider_text(value: Any, limit: int = 8_000) -> Any:
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    half = limit // 2
+    return f"{value[:half]}\n\n... [truncated for model context] ...\n\n{value[-half:]}"
+
+
+def _build_tool_result_content(tool_name: str, result_output: Any) -> str:
+    """Serialize structured tool output without echoing large redundant payloads."""
+    lowered = tool_name.lower()
+    if (
+        isinstance(result_output, dict)
+        and lowered in {"write", "edit"}
+        and ("filePath" in result_output or "file_path" in result_output)
+    ):
+        keys = (
+            ("type", "filePath")
+            if lowered == "write"
+            else ("filePath", "replaceAll", "userModified")
+        )
+        compact = {key: result_output[key] for key in keys if key in result_output}
+        compact["success"] = True
+        return json.dumps(compact, ensure_ascii=False)
+    if isinstance(result_output, dict) and lowered == "bash":
+        compact = dict(result_output)
+        compact["stdout"] = _truncate_provider_text(compact.get("stdout"))
+        compact["stderr"] = _truncate_provider_text(compact.get("stderr"))
+        return json.dumps(compact, ensure_ascii=False)
     if isinstance(result_output, str):
         return result_output
     return json.dumps(result_output, ensure_ascii=False)
@@ -358,6 +389,13 @@ def run_agent_loop(
     Returns:
         AgentLoopResult with final text response, usage info, and turn count
     """
+    # A tool turn adds one assistant message and one grouped tool-result message.
+    # Do not let the generic message-count cap split Anthropic tool pairs mid-run.
+    conversation.max_history = max(
+        conversation.max_history,
+        len(conversation.messages) + (2 * max_turns) + 1,
+    )
+
     # Convert tools to schemas (Anthropic format)
     tool_schemas = []
     for spec in tool_registry.list_specs():
@@ -547,6 +585,10 @@ def run_agent_loop(
                 return finish(last_user_visible_message)
             return finish(final_assistant_content)
 
+        # Anthropic expects all results for one assistant tool-use response in a
+        # single following user message.
+        anthropic_result_blocks: list[ToolResultContentBlock] = []
+
         # Call each tool
         for tool_use in tool_uses:
             if _safe_should_stop(should_stop):
@@ -599,13 +641,18 @@ def run_agent_loop(
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, _build_tool_result_content(result_output))
+                    anthropic_result_blocks.append(ToolResultContentBlock(
+                        type="tool_result",
+                        tool_use_id=tool_id,
+                        content=_build_tool_result_content(tool_name, result_output),
+                        is_error=result.is_error,
+                    ))
                 else:
                     # Add tool result in OpenAI format
                     openai_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_id,
-                        "content": _build_tool_result_content(result_output)
+                        "content": _build_tool_result_content(tool_name, result_output)
                     })
             except Exception as e:
                 error_str = f"Error: {e}"
@@ -623,7 +670,12 @@ def run_agent_loop(
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, error_str, is_error=True)
+                    anthropic_result_blocks.append(ToolResultContentBlock(
+                        type="tool_result",
+                        tool_use_id=tool_id,
+                        content=error_str,
+                        is_error=True,
+                    ))
                 else:
                     openai_messages.append({
                         "role": "tool",
@@ -632,7 +684,12 @@ def run_agent_loop(
                     })
 
             if _safe_should_stop(should_stop):
+                if anthropic_result_blocks:
+                    conversation.add_message("user", anthropic_result_blocks)
                 return finish("[Run stopped]", cancelled=True)
+
+        if anthropic_result_blocks:
+            conversation.add_message("user", anthropic_result_blocks)
 
     # Reached max turns
     return finish("[Max tool turns reached]", failed=True)

@@ -58,10 +58,11 @@ tool arguments are not truncated; override this with `--max-output-tokens`.
 
 Each run starts from a Git repository containing only `start.md`. The scorer
 removes generated tests and packaging files exactly as the upstream harness
-does, overlays the implementation onto the official task image, disables
-network access, and runs the hidden pytest suite. Results also record token use,
-agent roles and permissions, task completion, direct peer messages, and lead
-stop/resume/reassign/retry interventions.
+does, overlays the implementation onto the official task image, and installs
+declared build dependencies while building the score image. It then disables
+network access before running the hidden pytest suite. Results also record token
+use, agent roles and permissions, task completion, direct peer messages, and
+lead stop/resume/reassign/retry interventions.
 
 Structured model streaming is enabled by default. While the lead runs,
 `progress.jsonl` records model, text-stream, and tool events incrementally, so

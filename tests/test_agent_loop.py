@@ -177,6 +177,54 @@ class TestAgentLoop(unittest.TestCase):
         self.assertIsInstance(tool_result.content, str)
         self.assertIn("First pricing rule.", tool_result.content)
 
+    def test_anthropic_groups_and_compacts_write_results(self):
+        conversation = Conversation(max_history=3)
+        conversation.add_user_message("Create two files")
+        provider = AnthropicProvider(api_key="test", model="test-model")
+        provider.chat = MagicMock(side_effect=[
+            ChatResponse(
+                content="",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="tool_use",
+                tool_uses=[
+                    {
+                        "id": "toolu_one",
+                        "name": "Write",
+                        "input": {"file_path": "one.txt", "content": "secret-one"},
+                    },
+                    {
+                        "id": "toolu_two",
+                        "name": "Write",
+                        "input": {"file_path": "two.txt", "content": "secret-two"},
+                    },
+                ],
+            ),
+            ChatResponse(
+                content="done",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+        ])
+
+        run_agent_loop(
+            conversation=conversation,
+            provider=provider,
+            tool_registry=self.registry,
+            tool_context=self.context,
+            max_turns=4,
+        )
+
+        self.assertGreaterEqual(conversation.max_history, 10)
+        self.assertEqual(conversation.messages[0].content, "Create two files")
+        result_blocks = conversation.messages[2].content
+        self.assertEqual(len(result_blocks), 2)
+        self.assertNotIn("secret-one", result_blocks[0].content)
+        self.assertNotIn("structuredPatch", result_blocks[0].content)
+        self.assertIn('"success": true', result_blocks[0].content)
+
     def test_agent_loop_stream_emits_final_text_chunks(self):
         """Streaming mode emits final response chunks without changing the result."""
         conversation = Conversation()
