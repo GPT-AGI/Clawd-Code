@@ -54,3 +54,6 @@ include = ["src*"]
 
 [tool.setuptools.package-data]
 "src.teammate" = ["trace_viewer.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

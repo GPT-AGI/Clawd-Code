@@ -82,6 +82,7 @@ sessions/
 .clawd/team.json
 .clawd/teams/
 teammate-evals/solo-vs-team/runs/
+teammate-evals/nl2repo-pilot/runs/
 
 # Claude Code personal settings
 CLAUDE.local.md

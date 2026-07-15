@@ -4,6 +4,7 @@ import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 import unittest
@@ -202,6 +203,35 @@ class TestBashTool(ToolSystemTests):
     def test_bash_blocks_sudo(self) -> None:
         with self.assertRaises(Exception):
             BashTool().run({"command": "sudo echo nope"}, self.ctx)
+
+    def test_bash_runs_a_trailing_command_after_cd(self) -> None:
+        nested = self.root / "nested"
+        nested.mkdir()
+
+        out = BashTool().run(
+            {"command": f"cd {nested} && printf 'ran-here:%s' \"$PWD\""},
+            self.ctx,
+        ).output
+
+        self.assertEqual(out["exit_code"], 0)
+        self.assertEqual(out["stdout"], f"ran-here:{nested}")
+        self.assertEqual(self.ctx.cwd, self.root)
+
+    def test_bash_exposes_the_active_python_interpreter(self) -> None:
+        out = BashTool().run(
+            {
+                "command": (
+                    '"$CLAWD_PYTHON" -c "import sys; print(sys.executable)"'
+                )
+            },
+            self.ctx,
+        ).output
+
+        self.assertEqual(out["exit_code"], 0)
+        self.assertEqual(
+            Path(out["stdout"].strip()).resolve(),
+            Path(sys.executable).resolve(),
+        )
 
 
 class TestWebFetchTool(ToolSystemTests):

@@ -99,7 +99,8 @@ class ReadMessagesTool:
             name="ReadMessages",
             description=(
                 "Read and consume newly delivered team messages for the current agent. "
-                "Use wait_s to wait briefly for a peer response during parallel work."
+                "Teammates may use wait_s during parallel work. Leads should call TeamRun before "
+                "expecting an idle or newly created teammate to send messages."
             ),
             input_schema={
                 "type": "object",
@@ -128,6 +129,32 @@ class ReadMessagesTool:
 
         deadline = time.monotonic() + float(wait_s)
         incoming = context.team_store.consume_messages(team_id, recipient_id)
+        if not incoming and wait_s > 0 and context.actor_id is None:
+            context.reload_team_state()
+            agents = context.team_store.list_agents(team_id)
+            running = any(agent.status == "running" for agent in agents)
+            in_progress = any(
+                task.get("status") == "in_progress" for task in context.tasks.values()
+            )
+            if not running and not in_progress:
+                has_tasks = bool(context.tasks)
+                next_tool = "TeamRun" if has_tasks else "TaskCreate"
+                instruction = (
+                    "Call TeamRun to execute the pending tasks before waiting for worker messages."
+                    if has_tasks
+                    else "Create a teammate-owned task with TaskCreate, then call TeamRun."
+                )
+                return ToolResult(
+                    name="ReadMessages",
+                    output={
+                        "messages": [],
+                        "wait_skipped": True,
+                        "warning": "No teammate is currently running; waiting cannot produce a new message.",
+                        "next_required_actions": [
+                            {"tool": next_tool, "instruction": instruction}
+                        ],
+                    },
+                )
         while not incoming and time.monotonic() < deadline:
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             incoming = context.team_store.consume_messages(team_id, recipient_id)

@@ -74,6 +74,7 @@ def _build_runtime_context(
     model: str | None,
     *,
     teammate_max_turns: int = 30,
+    max_output_tokens: int = 4096,
 ) -> tuple[Any, Any, ToolContext, TeammateRuntime]:
     workspace_root = Path(workspace).expanduser().resolve()
     if not workspace_root.is_dir():
@@ -98,7 +99,12 @@ def _build_runtime_context(
     )
     registry = build_default_registry()
     context = ToolContext(workspace_root=workspace_root)
-    runtime = TeammateRuntime(provider, registry, max_turns=teammate_max_turns)
+    runtime = TeammateRuntime(
+        provider,
+        registry,
+        max_turns=teammate_max_turns,
+        max_output_tokens=max_output_tokens,
+    )
     context.teammate_runtime = runtime
     if model:
         context.model_override = model
@@ -112,6 +118,8 @@ def run_prompt(
     provider_name: str | None = None,
     model: str | None = None,
     max_turns: int = 100,
+    teammate_max_turns: int = 30,
+    max_output_tokens: int = 4096,
     stream: bool = False,
     on_event: ToolEventHandler | None = None,
     on_text_chunk: TextChunkHandler | None = None,
@@ -121,11 +129,17 @@ def run_prompt(
         raise ValueError("prompt must be non-empty")
     if max_turns < 1:
         raise ValueError("max_turns must be at least 1")
+    if teammate_max_turns < 1:
+        raise ValueError("teammate_max_turns must be at least 1")
+    if max_output_tokens < 1:
+        raise ValueError("max_output_tokens must be at least 1")
 
     provider, registry, context, _ = _build_runtime_context(
         workspace,
         provider_name,
         model,
+        teammate_max_turns=teammate_max_turns,
+        max_output_tokens=max_output_tokens,
     )
 
     conversation = Conversation()
@@ -136,6 +150,7 @@ def run_prompt(
         tool_registry=registry,
         tool_context=context,
         max_turns=max_turns,
+        max_output_tokens=max_output_tokens,
         stream=stream,
         verbose=False,
         on_event=on_event,

@@ -283,6 +283,12 @@ directly with one another using `SendMessage` and poll peer replies with
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
 
+Creation tools return structured `next_required_actions`; creating a teammate
+does not start it. A worker runs only after it owns a task and the lead calls
+`TeamRun`. If the lead tries to finish with an active team that has not settled,
+the agent loop returns a lifecycle warning and requires the lead to run, resume,
+or explicitly delete the team first.
+
 `TeamRun` accepts `max_workers`, `max_batches`, `max_retries`,
 `lease_timeout_s`, `timeout_s`, `token_budget`, and `turn_budget`. Use
 `TeamResume` to recover expired leases or
@@ -774,6 +780,10 @@ planner/coder/reviewer 流水线。Teammate 可通过 `SendMessage` 直接相互
 ```text
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
+
+创建类工具会返回结构化的 `next_required_actions`；创建 teammate 并不等于启动它。
+只有 worker 已拥有任务且 Lead 调用 `TeamRun` 后才会执行。如果 Lead 在 active team
+尚未收敛时尝试结束，agent loop 会返回生命周期警告，要求先运行、恢复或显式删除 team。
 
 `TeamRun` 支持 `max_workers`、`max_batches`、`max_retries`、`lease_timeout_s`、
 `timeout_s`、`token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，

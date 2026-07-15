@@ -87,10 +87,18 @@ class TaskOutcome:
 class TeammateRuntime:
     """Persistent teammate scheduler with recovery, budgets, and optional parallelism."""
 
-    def __init__(self, provider: Any, registry: ToolRegistry, *, max_turns: int = 30):
+    def __init__(
+        self,
+        provider: Any,
+        registry: ToolRegistry,
+        *,
+        max_turns: int = 30,
+        max_output_tokens: int = 4096,
+    ):
         self.provider = provider
         self.registry = registry
         self.max_turns = max_turns
+        self.max_output_tokens = max_output_tokens
 
     def validate_tools(self, names: list[str]) -> list[str]:
         canonical: list[str] = []
@@ -470,6 +478,7 @@ class TeammateRuntime:
                 tool_registry=self._child_registry(agent),
                 tool_context=child_context,
                 max_turns=task_max_turns,
+                max_output_tokens=self.max_output_tokens,
                 stream=False,
                 verbose=False,
                 on_event=heartbeat,

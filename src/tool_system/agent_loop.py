@@ -22,7 +22,7 @@ from ..teammate.trace import TeamTraceRecorder
 _LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
 - Local workspace files are accessed with `Read`, `Glob`, and `Grep`.
 - Use `Write` to create files and `Edit` for exact replacements in files you have read.
-- Use `Bash` to run local commands and tests.
+- Use `Bash` to run local commands and tests. For Python, prefer `$CLAWD_PYTHON`; it points to the interpreter running Clawd.
 - Use web tools only for HTTP or HTTPS resources. Never send local paths or `file://` URLs to `webReader`, `WebFetch`, or other web tools.
 - These local tools are registered even if a provider also offers built-in web tools. If unsure, call `ToolSearch` with focused keywords or query `*`; do not conclude that a tool is unavailable after one empty search."""
 
@@ -226,6 +226,49 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
     return "\n\n".join(sections)
 
 
+def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
+    """Return a corrective prompt when a lead tries to finish with unsettled team state."""
+    if tool_context.actor_id is not None:
+        return None
+    try:
+        tool_context.reload_team_state()
+    except Exception:
+        return None
+    team = tool_context.team
+    if team is None or team.get("status") == "completed":
+        return None
+
+    team_id = str(team.get("team_id") or "")
+    status = str(team.get("status") or "created")
+    agents = tool_context.team_store.list_agents(team_id) if team_id else []
+    tasks = list(tool_context.tasks.values())
+    task_counts = {
+        name: sum(task.get("status") == name for task in tasks)
+        for name in ("pending", "in_progress", "completed", "failed", "cancelled")
+    }
+
+    if not agents:
+        action = "Call TeammateCreate, create an owned task with TaskCreate, then call TeamRun."
+    elif not tasks:
+        action = "Call TaskCreate with a teammate owner, then call TeamRun. TeammateCreate did not start the worker."
+    elif status in {"failed", "cancelled"} or task_counts["failed"] or task_counts["cancelled"]:
+        action = "Inspect the failed task, then call TeamResume (retry_failed=true) or explicitly abandon it with TeamDelete."
+    elif task_counts["pending"] or task_counts["in_progress"]:
+        action = "Call TeamRun to execute or continue the pending teammate tasks."
+    else:
+        action = "Call TeamRun once more so the runtime records the completed team state."
+
+    counts = ", ".join(f"{name}={count}" for name, count in task_counts.items() if count)
+    summary = f"status={status}, agents={len(agents)}, tasks={len(tasks)}"
+    if counts:
+        summary += f" ({counts})"
+    return (
+        f"Team lifecycle guard: active team `{team.get('team_name') or team_id}` is not settled "
+        f"({summary}). Do not provide the final answer yet. {action} If the team is no longer "
+        "needed, call TeamDelete before finishing."
+    )
+
+
 def summarize_tool_use(name: str, tool_input: dict[str, Any]) -> str:
     lowered = name.lower()
     if lowered == "bash":
@@ -290,6 +333,7 @@ def run_agent_loop(
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
     max_turns: int = 20,
+    max_output_tokens: int = 4096,
     stream: bool = False,
     verbose: bool = False,
     on_event: ToolEventHandler | None = None,
@@ -304,6 +348,7 @@ def run_agent_loop(
         tool_registry: Tool registry to use
         tool_context: Tool context
         max_turns: Maximum tool turns before stopping
+        max_output_tokens: Maximum output tokens requested from the model per turn
         stream: Whether to stream responses
         verbose: Whether to print tool calls/results
         on_event: Optional callback for tool events
@@ -385,7 +430,10 @@ def run_agent_loop(
             # Use OpenAI formatted messages for non-Anthropic
             api_messages = openai_messages
 
-        call_kwargs: dict[str, Any] = {"tools": tool_schemas}
+        call_kwargs: dict[str, Any] = {
+            "tools": tool_schemas,
+            "max_tokens": max_output_tokens,
+        }
         if tool_context.model_override:
             call_kwargs["model"] = tool_context.model_override
         if _is_anthropic_provider(provider):
@@ -478,6 +526,20 @@ def run_agent_loop(
         tool_uses = response.tool_uses or []
 
         if not tool_uses:
+            lifecycle_warning = _team_lifecycle_warning(tool_context)
+            if lifecycle_warning is not None:
+                emit(
+                    ToolEvent(
+                        kind="team_lifecycle_warning",
+                        content=lifecycle_warning,
+                        model=response.model or model_name,
+                        turn=turn_count,
+                    )
+                )
+                conversation.add_user_message(lifecycle_warning)
+                if not _is_anthropic_provider(provider):
+                    openai_messages.append({"role": "user", "content": lifecycle_warning})
+                continue
             # No more tools, done
             if stream and final_assistant_content and not streamed_live_text:
                 _emit_text_chunks(on_text_chunk, final_assistant_content)

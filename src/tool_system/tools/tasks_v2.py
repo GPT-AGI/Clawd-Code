@@ -133,6 +133,24 @@ class TaskCreateTool:
             context.team_store.append_event(
                 str(context.team["team_id"]), "task.created", {"task": context.tasks[task_id]}
             )
+        next_required_actions: list[dict[str, str]] = []
+        resolved_owner = context.tasks[task_id].get("owner")
+        if context.team is not None:
+            lead_id = str(context.team["lead_agent_id"])
+            if resolved_owner is None or resolved_owner == lead_id:
+                next_required_actions.append(
+                    {
+                        "tool": "TaskUpdate",
+                        "instruction": "Assign this teammate task to a created worker before running the team.",
+                    }
+                )
+            else:
+                next_required_actions.append(
+                    {
+                        "tool": "TeamRun",
+                        "instruction": "Run pending teammate-owned tasks; TaskCreate does not start the worker.",
+                    }
+                )
         return ToolResult(
             name="TaskCreate",
             output={
@@ -140,9 +158,17 @@ class TaskCreateTool:
                     "id": task_id,
                     "key": key,
                     "subject": subject,
-                    "owner": context.tasks[task_id].get("owner"),
+                    "owner": resolved_owner,
                     "blockedBy": dependencies,
-                }
+                },
+                **(
+                    {
+                        "task_started": False,
+                        "next_required_actions": next_required_actions,
+                    }
+                    if next_required_actions
+                    else {}
+                ),
             },
         )
 

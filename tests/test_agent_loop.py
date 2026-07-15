@@ -11,6 +11,7 @@ from src.providers.base import ChatResponse
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.context import ToolContext
 from src.tool_system.agent_loop import run_agent_loop, AgentLoopResult
+from src.tool_system.tools import TeamCreateTool, TeammateCreateTool
 
 
 class TestAgentLoop(unittest.TestCase):
@@ -69,6 +70,7 @@ class TestAgentLoop(unittest.TestCase):
             provider=mock_provider,
             tool_registry=self.registry,
             tool_context=self.context,
+            max_output_tokens=8192,
             verbose=False,
         )
 
@@ -78,6 +80,9 @@ class TestAgentLoop(unittest.TestCase):
 
         # Verify provider was called twice
         self.assertEqual(mock_provider.chat.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["max_tokens"] == 8192 for call in mock_provider.chat.call_args_list)
+        )
 
         # Verify file was created
         hello_py = self.workspace / "hello.py"
@@ -337,6 +342,71 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual("".join(chunks), "Hello from fallback!")
         self.assertEqual(result.response_text, "Hello from fallback!")
         provider.chat.assert_called_once()
+
+    def test_incomplete_team_blocks_final_answer_until_lead_cleans_up(self):
+        conversation = Conversation()
+        conversation.add_user_message("Review the implementation")
+        TeamCreateTool().run({"team_name": "unfinished"}, self.context)
+        TeammateCreateTool().run(
+            {
+                "name": "reviewer",
+                "role": "review",
+                "instructions": "Review the implementation",
+                "tools": ["Read"],
+            },
+            self.context,
+        )
+
+        provider = MagicMock()
+        provider.chat_stream_response.side_effect = NotImplementedError()
+        provider.chat.side_effect = [
+            ChatResponse(
+                content="The task is complete.",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+            ChatResponse(
+                content="I need to settle the team first.",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="tool_use",
+                tool_uses=[{
+                    "id": "toolu_delete",
+                    "name": "TeamDelete",
+                    "input": {},
+                }],
+            ),
+            ChatResponse(
+                content="The task is complete after team cleanup.",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+        ]
+
+        result = run_agent_loop(
+            conversation=conversation,
+            provider=provider,
+            tool_registry=self.registry,
+            tool_context=self.context,
+            max_turns=5,
+        )
+
+        self.assertEqual(result.response_text, "The task is complete after team cleanup.")
+        self.assertEqual(provider.chat.call_count, 3)
+        self.assertIsNone(self.context.team)
+        warnings = [
+            message.content
+            for message in conversation.messages
+            if message.role == "user"
+            and isinstance(message.content, str)
+            and message.content.startswith("Team lifecycle guard:")
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("TaskCreate", warnings[0])
 
 
 if __name__ == "__main__":

@@ -33,7 +33,12 @@ class TestRunner(unittest.TestCase):
                 patch("src.runner.get_provider_class", return_value=provider_class),
                 patch("src.runner.run_agent_loop", return_value=expected) as agent_loop,
             ):
-                actual = run_prompt("  inspect this workspace  ", workspace=root)
+                actual = run_prompt(
+                    "  inspect this workspace  ",
+                    workspace=root,
+                    teammate_max_turns=77,
+                    max_output_tokens=8192,
+                )
 
         self.assertIs(actual, expected)
         provider_class.assert_called_once_with(
@@ -45,13 +50,20 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(call["conversation"].messages[0].content, "inspect this workspace")
         self.assertEqual(call["tool_context"].workspace_root, root)
         self.assertIsNotNone(call["tool_context"].teammate_runtime)
+        self.assertEqual(call["tool_context"].teammate_runtime.max_turns, 77)
+        self.assertEqual(call["tool_context"].teammate_runtime.max_output_tokens, 8192)
         self.assertEqual(call["max_turns"], 100)
+        self.assertEqual(call["max_output_tokens"], 8192)
 
     def test_run_prompt_validates_inputs_before_provider_creation(self) -> None:
         with self.assertRaisesRegex(ValueError, "prompt must be non-empty"):
             run_prompt("  ")
         with self.assertRaisesRegex(ValueError, "max_turns"):
             run_prompt("task", max_turns=0)
+        with self.assertRaisesRegex(ValueError, "teammate_max_turns"):
+            run_prompt("task", teammate_max_turns=0)
+        with self.assertRaisesRegex(ValueError, "max_output_tokens"):
+            run_prompt("task", max_output_tokens=0)
         with self.assertRaisesRegex(ValueError, "workspace is not a directory"):
             run_prompt("task", workspace="/path/that/does/not/exist")
 

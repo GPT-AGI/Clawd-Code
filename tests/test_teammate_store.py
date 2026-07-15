@@ -180,6 +180,62 @@ class TestTeamPersistence(unittest.TestCase):
         session = context.team_store.load_session(created["team_id"], teammate["session_id"])
         self.assertEqual(session["agent_id"], teammate["agent_id"])
 
+    def test_creation_tools_explain_how_to_start_worker_execution(self) -> None:
+        context = ToolContext(workspace_root=self.root)
+
+        created = TeamCreateTool().run({"team_name": "guided"}, context).output
+        self.assertFalse(created["team_started"])
+        self.assertEqual(
+            [item["tool"] for item in created["next_required_actions"]],
+            ["TeammateCreate", "TaskCreate", "TeamRun"],
+        )
+
+        teammate = TeammateCreateTool().run(
+            {
+                "name": "reviewer",
+                "role": "review",
+                "instructions": "Review the implementation",
+                "tools": ["Read"],
+            },
+            context,
+        ).output
+        self.assertFalse(teammate["worker_started"])
+        self.assertEqual(
+            [item["tool"] for item in teammate["next_required_actions"]],
+            ["TaskCreate", "TeamRun"],
+        )
+
+        task = TaskCreateTool().run(
+            {
+                "key": "review",
+                "subject": "Review",
+                "description": "Review the implementation",
+                "owner": "reviewer",
+            },
+            context,
+        ).output
+        self.assertFalse(task["task_started"])
+        self.assertEqual(task["next_required_actions"][0]["tool"], "TeamRun")
+
+    def test_lead_does_not_wait_for_a_worker_that_has_not_started(self) -> None:
+        context = ToolContext(workspace_root=self.root)
+        TeamCreateTool().run({"team_name": "idle"}, context)
+        TeammateCreateTool().run(
+            {
+                "name": "reviewer",
+                "role": "review",
+                "instructions": "Review the implementation",
+                "tools": ["Read", "SendMessage"],
+            },
+            context,
+        )
+
+        output = ReadMessagesTool().run({"wait_s": 1}, context).output
+
+        self.assertEqual(output["messages"], [])
+        self.assertTrue(output["wait_skipped"])
+        self.assertEqual(output["next_required_actions"][0]["tool"], "TaskCreate")
+
     def test_teammates_can_exchange_and_poll_direct_messages(self) -> None:
         lead_context = ToolContext(workspace_root=self.root)
         created = TeamCreateTool().run({"team_name": "dynamic"}, lead_context).output

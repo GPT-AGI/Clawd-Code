@@ -18,7 +18,9 @@ class TeamCreateTool:
             name="TeamCreate",
             description=(
                 "Create a team only when the lead decides delegation is worth its cost. "
-                "The lead chooses the team shape; no fixed roles or topology are required."
+                "The lead chooses the team shape; no fixed roles or topology are required. "
+                "After creation, add teammates and owned tasks, then call TeamRun; creating "
+                "a team does not start any worker."
             ),
             input_schema={
                 "type": "object",
@@ -59,6 +61,21 @@ class TeamCreateTool:
                 "team_name": team.team_name,
                 "team_file_path": str(context.team_store.team_dir(team.team_id) / "team.json"),
                 "lead_agent_id": team.lead_agent_id,
+                "team_started": False,
+                "next_required_actions": [
+                    {
+                        "tool": "TeammateCreate",
+                        "instruction": "Create each task-specific worker with its role and tool allowlist.",
+                    },
+                    {
+                        "tool": "TaskCreate",
+                        "instruction": "Create at least one task owned by a teammate.",
+                    },
+                    {
+                        "tool": "TeamRun",
+                        "instruction": "Run the owned tasks; team and teammate creation alone do not start workers.",
+                    },
+                ],
             },
         )
 
@@ -69,7 +86,8 @@ class TeammateCreateTool:
             name="TeammateCreate",
             description=(
                 "Create one persistent teammate with a lead-defined role, model, tool allowlist, "
-                "and workspace mode. Roles are task-specific rather than predefined."
+                "and workspace mode. Roles are task-specific rather than predefined. The new "
+                "teammate remains idle until it owns a TaskCreate task and the lead calls TeamRun."
             ),
             input_schema={
                 "type": "object",
@@ -92,7 +110,10 @@ class TeammateCreateTool:
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
         if context.team is None:
-            raise ToolInputError("create a team before creating teammates")
+            raise ToolInputError(
+                "no active team: call TeamCreate first, then retry TeammateCreate; "
+                "afterward create an owned task and call TeamRun"
+            )
         name = tool_input.get("name")
         role = tool_input.get("role")
         instructions = tool_input.get("instructions")
@@ -167,6 +188,17 @@ class TeammateCreateTool:
                 "workspace_path": agent.workspace_path,
                 "auto_integrate": agent.auto_integrate,
                 "agent_file_path": str(path),
+                "worker_started": False,
+                "next_required_actions": [
+                    {
+                        "tool": "TaskCreate",
+                        "instruction": f"Create a task with owner={agent.name!r}.",
+                    },
+                    {
+                        "tool": "TeamRun",
+                        "instruction": "Call TeamRun after owned tasks exist; TeammateCreate does not execute the worker.",
+                    },
+                ],
             },
         )
 
