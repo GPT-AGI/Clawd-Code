@@ -173,7 +173,7 @@ class TeammateCreateTool:
                 "team_id": team_id,
                 "agent_id": agent.agent_id,
                 "model": agent.model,
-                "conversation": {"messages": [], "max_history": 100},
+                "conversation": {"messages": [], "max_history": 300},
             },
         )
         context.team_store.append_event(team_id, "agent.created", {"agent": agent.to_dict()})

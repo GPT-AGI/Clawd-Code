@@ -32,7 +32,7 @@ def _get_default_config_from_providers() -> dict[str, Any]:
         },
         "session": {
             "auto_save": True,
-            "max_history": 100
+            "max_history": 300
         }
     }
 
