@@ -275,19 +275,34 @@ budget for integration and tests; inspect teammate output before relying on it, 
 not repeatedly resume an unproductive task. The topology and Team decision must follow
 from this repository rather than a predefined role pipeline. It is valid to complete
 the rollout without creating a Team when the routing criteria are not met.
+
+If you use a Team, create it with quality_gates=true. Then call TeamConfigure with a
+written architecture contract plus clean-install, import-smoke, and integration
+commands. Create at least two initially runnable tasks owned by distinct teammates.
+Every task must declare concrete non-overlapping ownedFiles and acceptanceChecks;
+declare providesInterfaces/dependsOnInterfaces and blockedBy whenever work crosses a
+module boundary. After TeamRun completes worker tasks, call TeamVerify. Do not finish
+the rollout while the Team status is verification_required or validation has failed.
 """
     if mode == "forced-team":
         return common + """
-Diagnostic execution protocol: the harness has already created the active Team. Do not
-call TeamCreate. After reading start.md and choosing a task-specific decomposition, you
-must call TeammateCreate and use at least one teammate, create at least one owned task
-with TaskCreate, and execute it with TeamRun before implementing the rest yourself.
+Diagnostic execution protocol: the harness has already created the active strict Team.
+Do not call TeamCreate. After reading start.md, call TeamConfigure with a concrete
+architecture contract and clean-install, import-smoke, and integration commands. You
+must call TeammateCreate at least twice to create at least two teammates, then create
+at least two initially runnable tasks owned by
+distinct teammates. Every TaskCreate must declare concrete non-overlapping ownedFiles
+and acceptanceChecks. Declare providesInterfaces/dependsOnInterfaces plus blockedBy
+for cross-module dependencies; owners on an interface edge must exchange at least one
+substantive peer message. Execute the plan with TeamRun and then call TeamVerify. The
+Team is not complete while verification is pending or failed.
 Choose the number of agents,
 task-specific roles, tool permissions, workspaces, dependencies, concurrency,
 and communication topology from the repository itself. Do not use a predefined role
 pipeline. All teammates must inherit the configured endpoint model; omit the model
 override in TeammateCreate. Observe progress, intervene when needed, integrate the work, and personally
-perform final validation. A rollout without a completed teammate task is invalid.
+perform final validation. A rollout without two completed teammate tasks and passed
+TeamVerify validation is invalid.
 """
     raise ValueError(f"unknown mode: {mode}")
 
@@ -420,6 +435,16 @@ def _run_agent_child(
                     ),
                     agent_type="adaptive",
                 )
+            quality = dict(team.settings.get("quality_gates") or {})
+            quality.update(
+                {
+                    "strict": True,
+                    "configured": bool(quality.get("configured", False)),
+                    "validation": quality.get("validation") or {"status": "pending"},
+                }
+            )
+            team.settings["quality_gates"] = quality
+            store.save_team(team)
             _append_jsonl(
                 progress_path,
                 {
@@ -583,6 +608,7 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
             "trace_model_calls": 0,
             "trace_tool_calls": 0,
             "interventions": {},
+            "quality_gates": {},
         }
     team = _read_json(team_path)
     team_id = str(team.get("team_id") or team_path.parent.name)
@@ -619,6 +645,8 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
         "task.retry_requested",
         "team.resumed",
     )
+    quality_gates = dict((team.get("settings") or {}).get("quality_gates") or {})
+    validation = dict(quality_gates.get("validation") or {})
     return {
         "present": True,
         "active": active,
@@ -639,6 +667,12 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
         "trace_model_calls": event_types.count("model.response"),
         "trace_tool_calls": event_types.count("tool.started"),
         "interventions": {name: event_types.count(name) for name in intervention_types},
+        "quality_gates": {
+            "strict": bool(quality_gates.get("strict")),
+            "configured": bool(quality_gates.get("configured")),
+            "plan_accepted": bool(quality_gates.get("plan_accepted")),
+            "validation_status": validation.get("status"),
+        },
     }
 
 
@@ -647,12 +681,20 @@ def _protocol_ok(mode: str, team: dict[str, Any]) -> bool:
         return not team["present"]
     if mode in {"adaptive", "adaptive-team-v2"} and not team["present"]:
         return True
+    quality = team.get("quality_gates") or {}
+    strict_ok = not quality.get("strict") or (
+        quality.get("configured")
+        and quality.get("plan_accepted")
+        and quality.get("validation_status") == "passed"
+    )
+    minimum = 2 if quality.get("strict") else 1
     return bool(
         team["present"]
         and team["status"] == "completed"
-        and len(team["agents"]) >= 1
-        and team["tasks"] >= 1
+        and len(team["agents"]) >= minimum
+        and team["tasks"] >= minimum
         and team["completed_tasks"] == team["tasks"]
+        and strict_ok
     )
 
 
@@ -684,6 +726,63 @@ def _combined_usage(
         "worker_recorded": worker_recorded,
         "complete": lead_recorded and worker_recorded,
     }
+
+
+def classify_failure(
+    *,
+    agent_ok: bool,
+    integrity_ok: bool,
+    protocol_ok: bool,
+    team: dict[str, Any],
+    hidden: dict[str, Any],
+    hidden_log: str,
+) -> str | None:
+    """Assign a stable, dashboard-friendly failure class without changing reward."""
+    pytest_result = hidden.get("pytest") if isinstance(hidden.get("pytest"), dict) else {}
+    if hidden.get("error"):
+        return "scorer_infrastructure"
+    if hidden.get("timed_out") or pytest_result.get("returncode") == 124:
+        return "reward_timeout"
+    if not agent_ok:
+        return "rollout_failure"
+    if not integrity_ok:
+        return "spec_integrity"
+    if not protocol_ok:
+        quality = team.get("quality_gates") or {}
+        if quality.get("strict") and quality.get("validation_status") != "passed":
+            return "team_validation"
+        return "team_protocol"
+    if bool(pytest_result.get("all_passed")):
+        return None
+
+    lowered = hidden_log.casefold()
+    if any(
+        marker in lowered
+        for marker in (
+            "modulenotfounderror",
+            "no module named",
+            "could not install packages",
+            "distributionnotfound",
+        )
+    ):
+        return "dependency_environment"
+    if int(pytest_result.get("errors", 0) or 0) > 0:
+        return "collection_error"
+    if any(
+        marker in lowered
+        for marker in (
+            "unexpected keyword argument",
+            "has no attribute",
+            "missing 1 required positional argument",
+            "got an unexpected keyword",
+        )
+    ):
+        if len(team.get("agents") or []) > 1 and int(team.get("peer_messages", 0) or 0) == 0:
+            return "cross_module_contract"
+        return "api_contract"
+    if int(pytest_result.get("failed", 0) or 0) > 0:
+        return "functional_test_failure"
+    return "unknown_failure"
 
 
 def parse_pytest_output(output: str, expected_tests: int, returncode: int) -> dict[str, Any]:
@@ -1172,7 +1271,31 @@ def score_rollout(
     case_root = rollout.case_root
     workspace = rollout.workspace
     agent = rollout.agent
-    if score_backend == "ags":
+    team = _team_metrics(workspace)
+    protocol_ok = _protocol_ok(mode, team)
+    integrity_ok = (
+        (workspace / "start.md").is_file()
+        and _hash_file(workspace / "start.md") == rollout.start_hash
+    )
+    rollout_gate_errors: list[str] = []
+    if not bool(agent.get("ok")):
+        rollout_gate_errors.append("agent rollout did not finish successfully")
+    if not integrity_ok:
+        rollout_gate_errors.append("start.md integrity check failed")
+    if not protocol_ok:
+        rollout_gate_errors.append("team protocol or strict validation is incomplete")
+
+    if rollout_gate_errors:
+        reason = "; ".join(rollout_gate_errors)
+        (case_root / "hidden-tests.log").write_text(
+            "Reward skipped: " + reason + "\n", encoding="utf-8"
+        )
+        hidden = {
+            "skipped": True,
+            "skip_reason": reason,
+            "pytest": parse_pytest_output("", int(task["expected_tests"]), 1),
+        }
+    elif score_backend == "ags":
         if not ags_image:
             raise ValueError("AGS scoring requires an image")
         hidden = run_hidden_tests_ags(
@@ -1195,12 +1318,6 @@ def score_rollout(
             timeout_s=score_timeout_s,
             keep_image=keep_image,
         )
-    team = _team_metrics(workspace)
-    protocol_ok = _protocol_ok(mode, team)
-    integrity_ok = (
-        (workspace / "start.md").is_file()
-        and _hash_file(workspace / "start.md") == rollout.start_hash
-    )
     lead_usage = agent.get("lead_usage") or {}
     worker_usage = team.get("worker_usage") or {}
     usage = _combined_usage(
@@ -1210,6 +1327,20 @@ def score_rollout(
         lead_turns=int(agent.get("lead_turns", 0) or 0),
     )
     pytest_result = hidden["pytest"]
+    try:
+        hidden_log = (case_root / "hidden-tests.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        hidden_log = ""
+    failure_class = classify_failure(
+        agent_ok=bool(agent.get("ok")),
+        integrity_ok=integrity_ok,
+        protocol_ok=protocol_ok,
+        team=team,
+        hidden=hidden,
+        hidden_log=hidden_log,
+    )
     result = {
         "task": task["id"],
         "difficulty": task["difficulty"],
@@ -1228,6 +1359,7 @@ def score_rollout(
         "used_team": team["present"],
         "quality_score": pytest_result["quality_score"] if integrity_ok else 0.0,
         "success": bool(agent.get("ok") and integrity_ok and protocol_ok and pytest_result["all_passed"]),
+        "failure_class": failure_class,
         "usage": usage,
         "calls": {
             "model": team["trace_model_calls"] if team["present"] else agent.get("lead_model_calls", 0),
@@ -1235,6 +1367,7 @@ def score_rollout(
         },
         "team": team,
         "hidden_tests": hidden,
+        "reward_skipped": bool(hidden.get("skipped")),
         "workspace": str(workspace),
     }
     _write_json(case_root / "result.json", result)
@@ -1305,6 +1438,22 @@ def rescore_existing_case(
         and result.get("protocol_ok")
         and pytest_result["all_passed"]
     )
+    team = _team_metrics(workspace)
+    try:
+        hidden_log = (case_root / "hidden-tests.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        hidden_log = ""
+    result["failure_class"] = classify_failure(
+        agent_ok=bool(result.get("agent_ok")),
+        integrity_ok=bool(result.get("integrity_ok")),
+        protocol_ok=bool(result.get("protocol_ok")),
+        team=team,
+        hidden=hidden,
+        hidden_log=hidden_log,
+    )
+    result["reward_skipped"] = False
     result["rescored_at"] = datetime.now(timezone.utc).isoformat()
     _write_json(result_path, result)
     return result

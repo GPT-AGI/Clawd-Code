@@ -302,6 +302,19 @@ directly with one another using `SendMessage` and poll peer replies with
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
 
+For repository-generation work, enable `quality_gates` on `TeamCreate` and use:
+
+```text
+TeamCreate -> TeamConfigure -> 2+ TeammateCreate/TaskCreate -> TeamRun -> TeamVerify
+```
+
+Strict plans require two independently runnable owners, concrete non-overlapping
+`ownedFiles`, per-task `acceptanceChecks`, and explicit provided/consumed interfaces.
+An interface dependency must be represented in `blockedBy` and acknowledged by a
+direct peer message. Finished workers leave the team in `verification_required`;
+`TeamVerify` creates a fresh virtual environment and runs configured install, import,
+and integration checks before the team can transition to `completed`.
+
 Creation tools return structured `next_required_actions`; creating a teammate
 does not start it. A worker runs only after it owns a task and the lead calls
 `TeamRun`. If the lead tries to finish with an active team that has not settled,
@@ -816,6 +829,18 @@ planner/coder/reviewer 流水线。Teammate 可通过 `SendMessage` 直接相互
 ```text
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
+
+仓库生成任务建议在 `TeamCreate` 开启 `quality_gates`，使用严格链路：
+
+```text
+TeamCreate -> TeamConfigure -> 至少两个 TeammateCreate/TaskCreate -> TeamRun -> TeamVerify
+```
+
+严格模式要求至少两个可立即并行的 owner、明确且不重叠的 `ownedFiles`、每个任务的
+`acceptanceChecks`，以及显式的接口提供/依赖关系。跨任务接口必须加入 `blockedBy`，
+相关 owner 之间至少有一次直接消息确认。Worker 全部结束后 Team 会停在
+`verification_required`；只有 `TeamVerify` 在新虚拟环境中完成安装、import smoke 和
+integration 三段验证，Team 才能进入 `completed`。
 
 创建类工具会返回结构化的 `next_required_actions`；创建 teammate 并不等于启动它。
 只有 worker 已拥有任务且 Lead 调用 `TeamRun` 后才会执行。如果 Lead 在 active team

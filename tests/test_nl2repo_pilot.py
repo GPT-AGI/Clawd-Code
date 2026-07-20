@@ -73,11 +73,52 @@ class TestNL2RepoPilot(unittest.TestCase):
     def test_forced_team_prompt_uses_the_harness_precreated_team(self) -> None:
         prompt = benchmark.build_prompt("forced-team")
 
-        self.assertIn("harness has already created the active Team", prompt)
-        self.assertIn("Do not\ncall TeamCreate", prompt)
+        self.assertIn("harness has already created the active strict Team", prompt)
+        self.assertIn("Do not call TeamCreate", prompt)
         self.assertIn("must call TeammateCreate", prompt)
         self.assertIn("TaskCreate", prompt)
         self.assertIn("TeamRun", prompt)
+        self.assertIn("TeamConfigure", prompt)
+        self.assertIn("TeamVerify", prompt)
+        self.assertIn("at least two teammates", prompt)
+
+    def test_failure_classifier_distinguishes_dependency_and_team_contract_failures(self) -> None:
+        base = {
+            "agent_ok": True,
+            "integrity_ok": True,
+            "protocol_ok": True,
+            "hidden": {
+                "pytest": {
+                    "returncode": 1,
+                    "errors": 1,
+                    "failed": 0,
+                    "all_passed": False,
+                }
+            },
+        }
+        dependency = benchmark.classify_failure(
+            **base,
+            team={"agents": [{}], "peer_messages": 0},
+            hidden_log="ModuleNotFoundError: No module named 'ujson'",
+        )
+        contract = benchmark.classify_failure(
+            **{
+                **base,
+                "hidden": {
+                    "pytest": {
+                        "returncode": 1,
+                        "errors": 0,
+                        "failed": 3,
+                        "all_passed": False,
+                    }
+                },
+            },
+            team={"agents": [{}, {}], "peer_messages": 0},
+            hidden_log="AttributeError: public key has no attribute 'BASE'",
+        )
+
+        self.assertEqual(dependency, "dependency_environment")
+        self.assertEqual(contract, "cross_module_contract")
 
     def test_rollout32_selection_matches_fixed_bounded_subset(self) -> None:
         metadata = [
@@ -204,7 +245,7 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertIn("at least two substantially independent", adaptive_v2)
         self.assertIn("at most two teammates", adaptive_v2)
         self.assertIn("valid to complete", adaptive_v2)
-        self.assertIn("use at least one teammate", forced)
+        self.assertIn("at least two teammates", forced)
         self.assertIn("must be your runtime decision", adaptive)
         self.assertNotIn("planner", adaptive.lower())
 
@@ -297,6 +338,38 @@ class TestNL2RepoPilot(unittest.TestCase):
 
         self.assertEqual(command, "(pip install -e .); (pytest tests)")
         self.assertNotIn("&&", command)
+
+    def test_reward_is_skipped_when_forced_team_protocol_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case_root = Path(tmp) / "sample" / "forced-team"
+            workspace = case_root / "workspace"
+            workspace.mkdir(parents=True)
+            start = workspace / "start.md"
+            start.write_text("spec\n", encoding="utf-8")
+            rollout = benchmark.RolloutArtifact(
+                task={"id": "sample", "difficulty": "Easy", "expected_tests": 3},
+                mode="forced-team",
+                case_root=case_root,
+                workspace=workspace,
+                start_hash=benchmark._hash_file(start),
+                agent={"ok": True, "lead_usage": {}, "lead_turns": 1},
+                agent_elapsed_s=1.0,
+                agent_timed_out=False,
+                agent_returncode=0,
+            )
+            with patch.object(benchmark, "run_hidden_tests") as scorer:
+                result = benchmark.score_rollout(
+                    rollout,
+                    provider="qwen",
+                    model="test",
+                    score_timeout_s=60,
+                    keep_image=False,
+                )
+
+        scorer.assert_not_called()
+        self.assertTrue(result["reward_skipped"])
+        self.assertEqual(result["failure_class"], "team_protocol")
+        self.assertFalse(result["protocol_ok"])
 
     def test_rescore_reuses_workspace_and_preserves_reward_history(self) -> None:
         task = {"id": "sample-task", "expected_tests": 2}
@@ -483,6 +556,7 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertEqual(returncode, 0)
         self.assertIsNotNone(observed["team"])
         self.assertEqual(observed["team"].team_name, "nl2repo-forced-team")
+        self.assertTrue(observed["team"].settings["quality_gates"]["strict"])
         self.assertEqual(progress[0]["kind"], "forced_team_precreated")
 
     def test_agent_child_preserves_terminal_usage_when_provider_raises(self) -> None:

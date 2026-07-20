@@ -63,11 +63,25 @@ def _resolve_dependencies(context: ToolContext, identities: Any, field_name: str
     return resolved
 
 
+def _string_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ToolInputError(f"{field_name} must be an array of non-empty strings")
+    return list(dict.fromkeys(item.strip() for item in value))
+
+
 class TaskCreateTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TaskCreate",
-            description="Create a task. For teammate work, provide a stable key, owner name, and blockedBy task keys.",
+            description=(
+                "Create a task. For strict teammate work, declare concrete ownedFiles, "
+                "provided/consumed interfaces, and acceptanceChecks so TeamRun can reject "
+                "overlapping or unverifiable plans before workers start."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -78,6 +92,10 @@ class TaskCreateTool:
                     "activeForm": {"type": "string"},
                     "owner": {"type": "string"},
                     "blockedBy": {"type": "array", "items": {"type": "string"}},
+                    "ownedFiles": {"type": "array", "items": {"type": "string"}},
+                    "providesInterfaces": {"type": "array", "items": {"type": "string"}},
+                    "dependsOnInterfaces": {"type": "array", "items": {"type": "string"}},
+                    "acceptanceChecks": {"type": "array", "items": {"type": "string"}},
                     "metadata": {"type": "object"},
                 },
                 "required": ["subject", "description"],
@@ -111,6 +129,16 @@ class TaskCreateTool:
         if any(str(task.get("key") or "").lower() == key.lower() for task in context.tasks.values()):
             raise ToolInputError(f"task key already exists: {key}")
         dependencies = _resolve_dependencies(context, tool_input.get("blockedBy"), "blockedBy")
+        owned_files = _string_list(tool_input.get("ownedFiles"), "ownedFiles")
+        provides_interfaces = _string_list(
+            tool_input.get("providesInterfaces"), "providesInterfaces"
+        )
+        depends_on_interfaces = _string_list(
+            tool_input.get("dependsOnInterfaces"), "dependsOnInterfaces"
+        )
+        acceptance_checks = _string_list(
+            tool_input.get("acceptanceChecks"), "acceptanceChecks"
+        )
         task_id = _new_task_id()
         context.tasks[task_id] = TeamTask(
             id=task_id,
@@ -121,6 +149,10 @@ class TaskCreateTool:
             owner=_resolve_owner(context, owner.strip()) if isinstance(owner, str) else None,
             blockedBy=dependencies,
             metadata=dict(metadata),
+            owned_files=owned_files,
+            provides_interfaces=provides_interfaces,
+            depends_on_interfaces=depends_on_interfaces,
+            acceptance_checks=acceptance_checks,
         ).to_dict()
         for dependency_id in dependencies:
             blocks = list(context.tasks[dependency_id].get("blocks") or [])
@@ -160,6 +192,10 @@ class TaskCreateTool:
                     "subject": subject,
                     "owner": resolved_owner,
                     "blockedBy": dependencies,
+                    "ownedFiles": owned_files,
+                    "providesInterfaces": provides_interfaces,
+                    "dependsOnInterfaces": depends_on_interfaces,
+                    "acceptanceChecks": acceptance_checks,
                 },
                 **(
                     {
@@ -210,6 +246,10 @@ class TaskGetTool:
                     "blockedBy": list(task.get("blockedBy") or []),
                     "owner": task.get("owner"),
                     "output": task.get("output") or "",
+                    "ownedFiles": list(task.get("owned_files") or []),
+                    "providesInterfaces": list(task.get("provides_interfaces") or []),
+                    "dependsOnInterfaces": list(task.get("depends_on_interfaces") or []),
+                    "acceptanceChecks": list(task.get("acceptance_checks") or []),
                 }
             },
         )
@@ -237,6 +277,9 @@ class TaskListTool:
                     "status": t["status"],
                     **({"owner": t["owner"]} if t.get("owner") else {}),
                     "blockedBy": list(t.get("blockedBy") or []),
+                    "ownedFiles": list(t.get("owned_files") or []),
+                    "providesInterfaces": list(t.get("provides_interfaces") or []),
+                    "dependsOnInterfaces": list(t.get("depends_on_interfaces") or []),
                 }
             )
         tasks.sort(key=lambda x: x["id"])

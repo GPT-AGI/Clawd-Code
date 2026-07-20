@@ -582,6 +582,40 @@ class TestAgentLoop(unittest.TestCase):
         self.assertIn("TeamRun", warning)
         self.assertIn("pending=1", warning)
 
+    def test_strict_team_with_finished_tasks_requests_team_verify(self):
+        created = TeamCreateTool().run(
+            {"team_name": "strict", "quality_gates": True}, self.context
+        ).output
+        TeammateCreateTool().run(
+            {
+                "name": "worker",
+                "role": "implementation",
+                "instructions": "Implement the assigned task.",
+                "tools": ["Read"],
+            },
+            self.context,
+        )
+        task_id = TaskCreateTool().run(
+            {
+                "key": "done",
+                "subject": "Done",
+                "description": "Already completed",
+                "owner": "worker",
+            },
+            self.context,
+        ).output["task"]["id"]
+        self.context.tasks[task_id]["status"] = "completed"
+        self.context.persist_tasks()
+        team = self.context.team_store.load_team(created["team_id"])
+        team.transition_to("running")
+        self.context.team_store.save_team(team)
+
+        warning = _team_lifecycle_warning(self.context)
+
+        self.assertIsNotNone(warning)
+        self.assertIn("TeamVerify", warning)
+        self.assertIn("validation", warning)
+
 
 if __name__ == "__main__":
     unittest.main()

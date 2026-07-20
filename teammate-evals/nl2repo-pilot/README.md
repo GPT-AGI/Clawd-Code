@@ -6,9 +6,17 @@ The upstream task documents and hidden tests are not copied into this repository
 The default pinned commit is `781a1da1ee41fb8edb0bed22f586d69111610edf`.
 
 The pilot compares solo execution with adaptive lead-controlled collaboration.
-`forced-team` remains a runtime diagnostic: it requires delegation but does not
-prescribe agent count, roles, models, permissions, workspaces, task graph, or
-communication topology.
+`forced-team` remains a runtime diagnostic, but now enables strict quality gates:
+at least two independently runnable teammate tasks, non-overlapping file ownership,
+explicit interface contracts, peer acknowledgement on dependency edges, and a fresh
+environment install/import/integration verification before the Team can complete.
+Role names, permissions, workspaces, and the concrete task graph remain task-specific.
+
+Reward is skipped when the rollout, specification-integrity check, or Team protocol is
+incomplete. This prevents an unfinished strict Team from entering the AGS/Docker reward
+pool merely because the lead model stopped. Results and the dashboard expose a stable
+`failure_class` such as `dependency_environment`, `collection_error`,
+`cross_module_contract`, `team_validation`, or `functional_test_failure`.
 
 ## Docker environment
 

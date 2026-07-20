@@ -29,6 +29,7 @@ class TeamCreateTool:
                     "team_name": {"type": "string"},
                     "description": {"type": "string"},
                     "agent_type": {"type": "string"},
+                    "quality_gates": {"type": "boolean"},
                 },
                 "required": ["team_name"],
             },
@@ -52,6 +53,13 @@ class TeamCreateTool:
             team = context.team_store.create_team(team_name.strip(), description, agent_type)
         except ValueError as exc:
             raise ToolInputError(str(exc)) from exc
+        if bool(tool_input.get("quality_gates", False)):
+            team.settings["quality_gates"] = {
+                "strict": True,
+                "configured": False,
+                "validation": {"status": "pending"},
+            }
+            context.team_store.save_team(team)
         context.team = team.to_dict()
         context.tasks = {}
         return ToolResult(
@@ -62,18 +70,134 @@ class TeamCreateTool:
                 "team_file_path": str(context.team_store.team_dir(team.team_id) / "team.json"),
                 "lead_agent_id": team.lead_agent_id,
                 "team_started": False,
+                "quality_gates": bool(tool_input.get("quality_gates", False)),
                 "next_required_actions": [
+                    *(
+                        [
+                            {
+                                "tool": "TeamConfigure",
+                                "instruction": (
+                                    "Define the architecture contract and install/import/"
+                                    "integration validation commands before TeamRun."
+                                ),
+                            }
+                        ]
+                        if bool(tool_input.get("quality_gates", False))
+                        else []
+                    ),
                     {
                         "tool": "TeammateCreate",
-                        "instruction": "Create each task-specific worker with its role and tool allowlist.",
+                        "instruction": (
+                            "Create at least two task-specific workers with distinct owned work."
+                            if bool(tool_input.get("quality_gates", False))
+                            else "Create each task-specific worker with its role and tool allowlist."
+                        ),
                     },
                     {
                         "tool": "TaskCreate",
-                        "instruction": "Create at least one task owned by a teammate.",
+                        "instruction": (
+                            "Create at least two initially runnable tasks with ownedFiles and acceptanceChecks."
+                            if bool(tool_input.get("quality_gates", False))
+                            else "Create at least one task owned by a teammate."
+                        ),
                     },
                     {
                         "tool": "TeamRun",
                         "instruction": "Run the owned tasks; team and teammate creation alone do not start workers.",
+                    },
+                ],
+            },
+        )
+
+
+class TeamConfigureTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TeamConfigure",
+            description=(
+                "Configure strict team architecture and final validation gates before TeamRun. "
+                "The install and import checks run in a fresh system-site-packages virtual "
+                "environment; the integration check runs only after every teammate task finishes."
+            ),
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "architecture_contract": {"type": "string"},
+                    "install_command": {"type": "string"},
+                    "import_command": {"type": "string"},
+                    "integration_command": {"type": "string"},
+                },
+                "required": [
+                    "architecture_contract",
+                    "install_command",
+                    "import_command",
+                    "integration_command",
+                ],
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may configure team quality gates")
+        if context.team is None:
+            raise ToolInputError("no active team")
+        values: dict[str, str] = {}
+        for name in (
+            "architecture_contract",
+            "install_command",
+            "import_command",
+            "integration_command",
+        ):
+            value = tool_input.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ToolInputError(f"{name} must be a non-empty string")
+            values[name] = value.strip()
+        team_id = str(context.team["team_id"])
+        team = context.team_store.load_team(team_id)
+        if team is None:
+            raise ToolInputError("active team state is unavailable")
+        quality = dict(team.settings.get("quality_gates") or {})
+        quality.update(
+            {
+                "strict": True,
+                "configured": True,
+                **values,
+                "validation": {"status": "pending"},
+            }
+        )
+        team.settings["quality_gates"] = quality
+        context.team_store.save_team(team)
+        context.team_store.append_event(
+            team_id,
+            "team.quality_configured",
+            {
+                "architecture_contract": values["architecture_contract"],
+                "validation_stages": ["install", "import", "integration"],
+            },
+        )
+        context.reload_team_state()
+        return ToolResult(
+            name="TeamConfigure",
+            output={
+                "team_id": team_id,
+                "strict": True,
+                "configured": True,
+                "validation_stages": ["install", "import", "integration"],
+                "next_required_actions": [
+                    {
+                        "tool": "TaskCreate",
+                        "instruction": (
+                            "Create at least two independently ready teammate tasks with "
+                            "non-overlapping ownedFiles and acceptanceChecks."
+                        ),
+                    },
+                    {
+                        "tool": "TeamRun",
+                        "instruction": "Run the validated plan, then call TeamVerify.",
                     },
                 ],
             },
@@ -277,6 +401,43 @@ class TeamRunTool:
             is_error=output.get("status") in {"failed", "blocked", "cancelled"},
         )
 
+
+class TeamVerifyTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TeamVerify",
+            description=(
+                "Run the configured clean-install, import-smoke, and integration checks. "
+                "A strict team cannot become completed until all three checks pass."
+            ),
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"timeout_s": {"type": "integer"}},
+            },
+            is_read_only=False,
+            max_result_size_chars=200_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may verify a team")
+        if context.team is None:
+            raise ToolInputError("no active team")
+        if context.teammate_runtime is None:
+            raise ToolInputError("teammate runtime is not configured")
+        timeout_s = tool_input.get("timeout_s", 300)
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int):
+            raise ToolInputError("timeout_s must be an integer")
+        if timeout_s < 1 or timeout_s > 900:
+            raise ToolInputError("timeout_s must be between 1 and 900")
+        output = context.teammate_runtime.verify_team(context, timeout_s=timeout_s)
+        return ToolResult(
+            name="TeamVerify",
+            output=output,
+            is_error=output.get("status") != "completed",
+        )
 
 class TeamResumeTool:
     def spec(self) -> ToolSpec:

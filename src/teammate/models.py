@@ -149,6 +149,10 @@ class TeamTask:
     blocks: list[str] = field(default_factory=list)
     blockedBy: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    owned_files: list[str] = field(default_factory=list)
+    provides_interfaces: list[str] = field(default_factory=list)
+    depends_on_interfaces: list[str] = field(default_factory=list)
+    acceptance_checks: list[str] = field(default_factory=list)
     output: str = ""
     attempt: int = 0
     max_retries: int = 0
@@ -159,7 +163,7 @@ class TeamTask:
     last_error: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 2
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "task")
@@ -176,7 +180,9 @@ class TeamTask:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TeamTask":
-        return cls(**{key: data[key] for key in cls.__dataclass_fields__ if key in data})
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        values["schema_version"] = 3
+        return cls(**values)
 
 
 @dataclass

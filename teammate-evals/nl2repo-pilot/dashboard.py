@@ -957,6 +957,7 @@ class DashboardStore:
                     "errors": pytest.get("errors"),
                     "expected": pytest.get("expected"),
                     "infrastructure_error": infrastructure_error or None,
+                    "failure_class": result.get("failure_class") if result else None,
                     "agent_ok": result.get("agent_ok") if result else None,
                     "rescored": bool(result.get("rescored_at")),
                     "queue_id": queued_case.get("id") if queued_case else None,

@@ -428,14 +428,14 @@
     function signed(value,digits=1) { if(value==null||!Number.isFinite(Number(value)))return '—'; const n=Number(value); return `${n>0?'+':''}${n.toFixed(digits)}`; }
     function tokens(value) { const n=Number(value); if(!Number.isFinite(n))return '—'; return n>=1e6?`${(n/1e6).toFixed(2)}M`:n>=1e3?`${(n/1e3).toFixed(1)}K`:String(Math.round(n)); }
     function statusGroup(status) { if(['rewarding','reward_waiting'].includes(status))return 'reward'; if(['scored','success'].includes(status))return 'done'; return status; }
-    function signal(t) { if(t.infrastructure_error)return t.infrastructure_error; if(t.status==='running')return t.last_tool||t.last_kind||'agent active'; if(t.status==='queued')return 'waiting for slot'; if(t.status==='rewarding')return 'hidden tests running'; if(t.rescored)return 'corrected reward'; return t.agent_ok===false?'agent failed':'reward recorded'; }
+    function signal(t) { if(t.infrastructure_error)return t.infrastructure_error; if(t.failure_class)return t.failure_class.replaceAll('_',' '); if(t.status==='running')return t.last_tool||t.last_kind||'agent active'; if(t.status==='queued')return 'waiting for slot'; if(t.status==='rewarding')return 'hidden tests running'; if(t.rescored)return 'corrected reward'; return t.agent_ok===false?'agent failed':'reward recorded'; }
     function filteredTasks() {
       if(!state.data)return [];
       const q=$('search').value.trim().toLowerCase(), filter=$('statusFilter').value;
       return state.data.tasks.filter(t => {
         const matchesFilter=filter==='all'||statusGroup(t.status)===filter;
         const matchesIssue=!state.issues||(t.status==='infra_error'||t.tool_errors>0||t.agent_ok===false);
-        const hay=`${t.task} ${t.mode} ${t.last_tool} ${t.last_kind} ${t.infrastructure_error||''}`.toLowerCase();
+        const hay=`${t.task} ${t.mode} ${t.last_tool} ${t.last_kind} ${t.infrastructure_error||''} ${t.failure_class||''}`.toLowerCase();
         return matchesFilter&&matchesIssue&&(!q||hay.includes(q));
       });
     }
@@ -470,7 +470,7 @@
         const turnPct=Math.min(100,Math.round((t.turns/(t.max_turns||300))*100));
         const testText=t.expected!=null?`${t.passed||0}/${t.expected} hidden tests`:t.status==='infra_error'?'not scored':'pending';
         const sig=signal(t);
-        return `<tr data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><td class="index">${t.index}</td><td><div class="task-name">${esc(t.task)}</div><div class="task-mode">${esc(t.mode)}</div></td><td><span class="badge status-${esc(t.status)}">${esc(STATUS_LABEL[t.status]||t.status)}</span>${t.rescored?'<span class="tiny-tag">rescored</span>':''}</td><td class="turn-cell"><div class="turn-top"><b>${t.turns}</b><span class="muted">/ ${t.max_turns}</span></div><div class="micro-track"><div class="micro-fill" style="width:${turnPct}%"></div></div></td><td class="mono">${duration(t.runtime_s)}</td><td><div class="last-action">${esc(t.last_tool||t.last_kind||'—')}</div><div class="task-mode">${age(t.activity_age_s)}</div></td><td class="mono">${t.model_calls}m / ${t.tool_calls}t<br><span class="${t.tool_errors?'status-infra_error':'muted'}">${t.tool_errors} err</span></td><td><div class="score ${t.quality_score==null?'empty':''}">${score(t.quality_score)}</div><div class="tests">${esc(testText)}</div></td><td><div class="${t.infrastructure_error?'error-note':'last-action muted'}" title="${esc(sig)}">${esc(sig)}</div></td></tr>`;
+        return `<tr data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><td class="index">${t.index}</td><td><div class="task-name">${esc(t.task)}</div><div class="task-mode">${esc(t.mode)}</div></td><td><span class="badge status-${esc(t.status)}">${esc(STATUS_LABEL[t.status]||t.status)}</span>${t.rescored?'<span class="tiny-tag">rescored</span>':''}${t.failure_class?`<span class="tiny-tag">${esc(t.failure_class)}</span>`:''}</td><td class="turn-cell"><div class="turn-top"><b>${t.turns}</b><span class="muted">/ ${t.max_turns}</span></div><div class="micro-track"><div class="micro-fill" style="width:${turnPct}%"></div></div></td><td class="mono">${duration(t.runtime_s)}</td><td><div class="last-action">${esc(t.last_tool||t.last_kind||'—')}</div><div class="task-mode">${age(t.activity_age_s)}</div></td><td class="mono">${t.model_calls}m / ${t.tool_calls}t<br><span class="${t.tool_errors?'status-infra_error':'muted'}">${t.tool_errors} err</span></td><td><div class="score ${t.quality_score==null?'empty':''}">${score(t.quality_score)}</div><div class="tests">${esc(testText)}</div></td><td><div class="${t.infrastructure_error?'error-note':'last-action muted'}" title="${esc(sig)}">${esc(sig)}</div></td></tr>`;
       }).join('');
       $('taskRows').querySelectorAll('tr').forEach(row=>row.addEventListener('click',()=>openTask(row.dataset.task,row.dataset.mode)));
     }

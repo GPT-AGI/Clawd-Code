@@ -296,11 +296,15 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
         name: sum(task.get("status") == name for task in tasks)
         for name in ("pending", "in_progress", "completed", "failed", "cancelled")
     }
+    quality = dict((team.get("settings") or {}).get("quality_gates") or {})
+    strict = bool(quality.get("strict"))
+    validation_status = (quality.get("validation") or {}).get("status")
 
     if (
         team.get("status") == "completed"
         and tasks
         and task_counts["completed"] == len(tasks)
+        and (not strict or validation_status == "passed")
     ):
         return None
 
@@ -312,6 +316,11 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
         action = "Inspect the failed task, then call TeamResume (retry_failed=true) or explicitly abandon it with TeamDelete."
     elif task_counts["pending"] or task_counts["in_progress"]:
         action = "Call TeamRun to execute or continue the pending teammate tasks."
+    elif strict and task_counts["completed"] == len(tasks) and validation_status != "passed":
+        action = (
+            "Call TeamVerify now. Strict clean-install, import, and integration validation "
+            "must pass before the team can complete."
+        )
     else:
         action = "Call TeamRun once more so the runtime records the completed team state."
 

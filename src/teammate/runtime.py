@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -30,8 +36,10 @@ _MANDATORY_TEAMMATE_TOOLS = (
 _FORBIDDEN_TEAMMATE_TOOLS = {
     "Agent",
     "TeamCreate",
+    "TeamConfigure",
     "TeammateCreate",
     "TeamRun",
+    "TeamVerify",
     "TeamResume",
     "TeamCancel",
     "TeamIntegrate",
@@ -155,10 +163,15 @@ class TeammateRuntime:
             return {"status": "failed", "error": "no active team"}
         if team.status == "completed":
             lead_context.reload_team_state()
-            if all(
+            all_tasks_completed = all(
                 task.get("status") == "completed"
                 for task in lead_context.tasks.values()
-            ):
+            )
+            validation_passed = (
+                (self._quality_policy(team).get("validation") or {}).get("status")
+                == "passed"
+            )
+            if all_tasks_completed and (not self._is_strict(team) or validation_passed):
                 return self._result(lead_context, team, [])
             team.transition_to("running")
             team.completed_at = None
@@ -167,7 +180,11 @@ class TeammateRuntime:
                 team.team_id,
                 "team.reopened",
                 {
-                    "reason": "unfinished tasks were added after completion",
+                    "reason": (
+                        "strict validation is pending"
+                        if all_tasks_completed
+                        else "unfinished tasks were added after completion"
+                    ),
                     "unfinished_task_ids": [
                         task_id
                         for task_id, task in lead_context.tasks.items()
@@ -178,6 +195,50 @@ class TeammateRuntime:
             lead_context.reload_team_state()
         if team.status == "cancelled" and not resume:
             return {"status": "cancelled", "error": "team is cancelled", "team_id": team.team_id}
+
+        lead_context.reload_team_state()
+        strict_errors = self._strict_plan_errors(
+            lead_context,
+            team,
+            require_parallel_start=not self._quality_policy(team).get("plan_accepted", False),
+        )
+        if strict_errors:
+            lead_context.team_store.append_event(
+                team.team_id,
+                "team.plan_rejected",
+                {"errors": strict_errors},
+            )
+            return self._blocked_result(
+                lead_context,
+                team,
+                "strict team plan rejected: " + "; ".join(strict_errors),
+                [],
+            )
+        if self._is_strict(team):
+            team = lead_context.team_store.load_team(team.team_id) or team
+            quality = self._quality_policy(team)
+            if not quality.get("plan_accepted"):
+                quality["plan_accepted"] = True
+                quality["plan_accepted_at"] = utc_now()
+                team.settings["quality_gates"] = quality
+                lead_context.team_store.save_team(team)
+                lead_context.team_store.append_event(
+                    team.team_id,
+                    "team.plan_accepted",
+                    {"task_count": len(lead_context.tasks)},
+                )
+            if any(
+                task.get("status") != "completed"
+                for task in lead_context.tasks.values()
+            ):
+                validation = dict(quality.get("validation") or {})
+                if validation.get("status") == "passed":
+                    quality["validation"] = {
+                        "status": "pending",
+                        "reason": "team tasks changed after validation",
+                    }
+                    team.settings["quality_gates"] = quality
+                    lead_context.team_store.save_team(team)
 
         options = TeamRunOptions.build(
             team.settings,
@@ -249,6 +310,28 @@ class TeammateRuntime:
                 if not tasks:
                     return self._fail_team(lead_context, current, "team has no tasks", executed)
                 if all(task.get("status") == "completed" for task in tasks.values()):
+                    if self._is_strict(current):
+                        coordination_errors = self._coordination_errors(
+                            lead_context, current
+                        )
+                        if coordination_errors:
+                            lead_context.team_store.append_event(
+                                current.team_id,
+                                "team.coordination_rejected",
+                                {"errors": coordination_errors},
+                            )
+                            return self._blocked_result(
+                                lead_context,
+                                current,
+                                "strict coordination gate failed: "
+                                + "; ".join(coordination_errors),
+                                executed,
+                            )
+                        quality = self._quality_policy(current)
+                        if (quality.get("validation") or {}).get("status") != "passed":
+                            return self._verification_required(
+                                lead_context, current, executed
+                            )
                     budget_warning = self._budget_error(current, options, run_started)
                     completed = self._complete_team(lead_context, current)
                     result = self._result(lead_context, completed, executed)
@@ -365,6 +448,351 @@ class TeammateRuntime:
             return self._fail_team(
                 lead_context, team, str(exc), locals().get("executed", [])
             )
+
+    @staticmethod
+    def _quality_policy(team: Team) -> dict[str, Any]:
+        value = team.settings.get("quality_gates")
+        return dict(value) if isinstance(value, dict) else {}
+
+    @classmethod
+    def _is_strict(cls, team: Team) -> bool:
+        return bool(cls._quality_policy(team).get("strict"))
+
+    @staticmethod
+    def _normalize_owned_path(value: str) -> str:
+        normalized = value.strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.rstrip("/")
+
+    @classmethod
+    def _owned_paths_overlap(cls, left: str, right: str) -> bool:
+        first = cls._normalize_owned_path(left)
+        second = cls._normalize_owned_path(right)
+        return bool(
+            first == second
+            or first.startswith(second + "/")
+            or second.startswith(first + "/")
+        )
+
+    def _strict_plan_errors(
+        self,
+        lead_context: ToolContext,
+        team: Team,
+        *,
+        require_parallel_start: bool,
+    ) -> list[str]:
+        if not self._is_strict(team):
+            return []
+        quality = self._quality_policy(team)
+        errors: list[str] = []
+        if not quality.get("configured"):
+            errors.append("call TeamConfigure before TeamRun")
+        if not require_parallel_start and not quality.get("plan_accepted"):
+            errors.append("strict plan has not been accepted by TeamRun")
+        for field in (
+            "architecture_contract",
+            "install_command",
+            "import_command",
+            "integration_command",
+        ):
+            if not str(quality.get(field) or "").strip():
+                errors.append(f"quality gate is missing {field}")
+
+        lead_context.reload_team_state()
+        agents = {
+            agent.agent_id: agent
+            for agent in lead_context.team_store.list_agents(team.team_id)
+        }
+        tasks = list(lead_context.tasks.values())
+        teammate_tasks = [task for task in tasks if task.get("owner") in agents]
+        assigned_owners = {str(task.get("owner")) for task in teammate_tasks}
+        if len(assigned_owners) < 2:
+            errors.append("strict teams require at least two assigned teammates")
+        if len(teammate_tasks) < 2:
+            errors.append("strict teams require at least two teammate-owned tasks")
+
+        paths: list[tuple[str, str, str]] = []
+        providers: dict[str, list[dict[str, Any]]] = {}
+        for task in teammate_tasks:
+            key = str(task.get("key") or task.get("id"))
+            owned_files = list(task.get("owned_files") or [])
+            acceptance_checks = list(task.get("acceptance_checks") or [])
+            if not owned_files:
+                errors.append(f"task {key} must declare ownedFiles")
+            if not acceptance_checks:
+                errors.append(f"task {key} must declare acceptanceChecks")
+            for path in owned_files:
+                normalized = self._normalize_owned_path(str(path))
+                if (
+                    not normalized
+                    or normalized.startswith("/")
+                    or ".." in normalized.split("/")
+                    or any(mark in normalized for mark in "*?[]")
+                ):
+                    errors.append(
+                        f"task {key} ownedFiles must use concrete workspace paths: {path!r}"
+                    )
+                if require_parallel_start or task.get("status") != "completed":
+                    paths.append((key, str(task.get("owner")), normalized))
+            for interface in task.get("provides_interfaces") or []:
+                providers.setdefault(str(interface), []).append(task)
+
+        for index, (left_key, left_owner, left_path) in enumerate(paths):
+            for right_key, right_owner, right_path in paths[index + 1 :]:
+                if left_key == right_key:
+                    continue
+                if self._owned_paths_overlap(left_path, right_path):
+                    errors.append(
+                        "ownedFiles overlap between "
+                        f"{left_key} ({left_owner}) and {right_key} ({right_owner}): "
+                        f"{left_path!r} vs {right_path!r}"
+                    )
+
+        for task in teammate_tasks:
+            key = str(task.get("key") or task.get("id"))
+            dependencies = set(task.get("blockedBy") or [])
+            for interface in task.get("depends_on_interfaces") or []:
+                matches = providers.get(str(interface), [])
+                if len(matches) != 1:
+                    errors.append(
+                        f"task {key} interface {interface!r} must have exactly one provider"
+                    )
+                    continue
+                provider_task = matches[0]
+                provider_id = str(provider_task.get("id"))
+                if provider_id == str(task.get("id")):
+                    errors.append(f"task {key} cannot depend on its own interface {interface!r}")
+                elif provider_id not in dependencies:
+                    provider_key = str(provider_task.get("key") or provider_id)
+                    errors.append(
+                        f"task {key} must include provider task {provider_key} in blockedBy "
+                        f"for interface {interface!r}"
+                    )
+
+        if require_parallel_start:
+            ready_owners = {
+                str(task.get("owner"))
+                for task in teammate_tasks
+                if not task.get("blockedBy") and task.get("status") == "pending"
+            }
+            if len(ready_owners) < 2:
+                errors.append(
+                    "strict teams require at least two initially ready tasks with distinct owners"
+                )
+        return list(dict.fromkeys(errors))
+
+    def _coordination_errors(
+        self, lead_context: ToolContext, team: Team
+    ) -> list[str]:
+        if not self._is_strict(team):
+            return []
+        tasks = list(lead_context.team_store.load_tasks(team.team_id).values())
+        providers: dict[str, dict[str, Any]] = {}
+        for task in tasks:
+            for interface in task.get("provides_interfaces") or []:
+                providers[str(interface)] = task
+        message_edges = {
+            frozenset((message.sender_id, message.recipient_id))
+            for message in lead_context.team_store.list_messages(team.team_id)
+        }
+        errors: list[str] = []
+        for task in tasks:
+            for interface in task.get("depends_on_interfaces") or []:
+                provider = providers.get(str(interface))
+                if provider is None:
+                    continue
+                owner = str(task.get("owner") or "")
+                provider_owner = str(provider.get("owner") or "")
+                if owner and provider_owner and owner != provider_owner:
+                    if frozenset((owner, provider_owner)) not in message_edges:
+                        errors.append(
+                            f"owners of interface {interface!r} must exchange at least one "
+                            "peer message before completion"
+                        )
+        return list(dict.fromkeys(errors))
+
+    def verify_team(
+        self, lead_context: ToolContext, *, timeout_s: int = 300
+    ) -> dict[str, Any]:
+        team = lead_context.team_store.load_active_team()
+        if team is None:
+            return {"status": "failed", "error": "no active team"}
+        if not self._is_strict(team):
+            return {
+                "status": "failed",
+                "team_id": team.team_id,
+                "error": "TeamVerify requires strict quality gates",
+            }
+        lead_context.reload_team_state()
+        unfinished = [
+            str(task.get("key") or task_id)
+            for task_id, task in lead_context.tasks.items()
+            if task.get("status") != "completed"
+        ]
+        if unfinished:
+            return {
+                "status": "failed",
+                "team_id": team.team_id,
+                "error": "unfinished teammate tasks: " + ", ".join(unfinished),
+            }
+        plan_errors = self._strict_plan_errors(
+            lead_context, team, require_parallel_start=False
+        )
+        coordination_errors = self._coordination_errors(lead_context, team)
+        errors = plan_errors + coordination_errors
+        if errors:
+            return {
+                "status": "failed",
+                "team_id": team.team_id,
+                "error": "; ".join(errors),
+            }
+
+        quality = self._quality_policy(team)
+        commands = [
+            ("install", str(quality["install_command"])),
+            ("import", str(quality["import_command"])),
+            ("integration", str(quality["integration_command"])),
+        ]
+        validation_root = (
+            f"/tmp/clawd-team-verify-{team.team_id}"
+            if lead_context.workspace_backend is not None
+            else tempfile.mkdtemp(prefix=f"clawd-team-verify-{team.team_id}-")
+        )
+        venv_bin = f"{validation_root}/bin"
+        validation_workspace = (
+            lead_context.execution_workspace_root or "/workspace"
+            if lead_context.workspace_backend is not None
+            else str(lead_context.workspace_root)
+        )
+        bootstrap_python = "python3" if lead_context.workspace_backend is not None else shlex.quote(sys.executable)
+        bootstrap = (
+            f"{bootstrap_python} -m venv --system-site-packages "
+            f"{shlex.quote(validation_root)}"
+        )
+        stages: list[dict[str, Any]] = []
+        bootstrap_result = self._run_validation_command(
+            lead_context, bootstrap, timeout_s=timeout_s
+        )
+        stages.append({"stage": "bootstrap", "command": bootstrap, **bootstrap_result})
+        if bootstrap_result["exit_code"] == 0:
+            prefix = (
+                f"export VIRTUAL_ENV={shlex.quote(validation_root)}; "
+                f"export PATH={shlex.quote(venv_bin)}:$PATH; "
+                f"export PYTHONPATH={shlex.quote(validation_workspace)}; "
+            )
+            for stage, command in commands:
+                result = self._run_validation_command(
+                    lead_context, prefix + command, timeout_s=timeout_s
+                )
+                stages.append({"stage": stage, "command": command, **result})
+                if result["exit_code"] != 0:
+                    break
+        self._cleanup_validation_root(lead_context, validation_root)
+        passed = len(stages) == 4 and all(stage["exit_code"] == 0 for stage in stages)
+        validation = {
+            "status": "passed" if passed else "failed",
+            "verified_at": utc_now(),
+            "fresh_virtualenv": True,
+            "stages": stages,
+        }
+        team = lead_context.team_store.load_team(team.team_id) or team
+        quality = self._quality_policy(team)
+        quality["validation"] = validation
+        team.settings["quality_gates"] = quality
+        lead_context.team_store.save_team(team)
+        lead_context.team_store.append_event(
+            team.team_id,
+            "team.validation_passed" if passed else "team.validation_failed",
+            {"stages": stages},
+        )
+        if not passed:
+            failed_stage = next(
+                (stage for stage in stages if stage["exit_code"] != 0), stages[-1]
+            )
+            return {
+                "status": "failed",
+                "team_id": team.team_id,
+                "error": f"{failed_stage['stage']} validation failed",
+                "validation": validation,
+                "next_required_action": (
+                    "Create a repair task, run TeamRun, then retry TeamVerify."
+                ),
+            }
+        completed = self._complete_team(lead_context, team)
+        result = self._result(lead_context, completed, [])
+        result["validation"] = validation
+        return result
+
+    @staticmethod
+    def _run_validation_command(
+        context: ToolContext, command: str, *, timeout_s: int
+    ) -> dict[str, Any]:
+        if context.workspace_backend is not None:
+            outcome = context.workspace_backend.exec(
+                command,
+                cwd=context.execution_workspace_root or "/workspace",
+                timeout_s=timeout_s,
+            )
+            return {
+                "exit_code": int(outcome.exit_code),
+                "stdout": str(outcome.stdout or "")[-20_000:],
+                "stderr": str(outcome.stderr or "")[-20_000:],
+            }
+        try:
+            completed = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=str(context.workspace_root),
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                env=os.environ.copy(),
+            )
+            return {
+                "exit_code": completed.returncode,
+                "stdout": (completed.stdout or "")[-20_000:],
+                "stderr": (completed.stderr or "")[-20_000:],
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "exit_code": 124,
+                "stdout": str(exc.stdout or "")[-20_000:],
+                "stderr": str(exc.stderr or "")[-20_000:],
+            }
+
+    @staticmethod
+    def _cleanup_validation_root(context: ToolContext, path: str) -> None:
+        if context.workspace_backend is not None:
+            context.workspace_backend.exec(
+                f"rm -rf {shlex.quote(path)}",
+                cwd=context.execution_workspace_root or "/workspace",
+                timeout_s=60,
+            )
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _verification_required(
+        self, lead_context: ToolContext, team: Team, executed: list[str]
+    ) -> dict[str, Any]:
+        lead_context.reload_team_state()
+        quality = self._quality_policy(team)
+        lead_context.team_store.append_event(
+            team.team_id,
+            "team.verification_required",
+            {"validation_status": (quality.get("validation") or {}).get("status")},
+        )
+        return {
+            "status": "verification_required",
+            "team_id": team.team_id,
+            "executed_task_ids": executed,
+            "tasks": list(lead_context.tasks.values()),
+            "quality_gates": quality,
+            "next_required_action": (
+                "Call TeamVerify. The team remains running and protocol completion is false "
+                "until clean install, import, and integration checks pass."
+            ),
+            "usage": team.usage,
+        }
 
     @staticmethod
     def _dependencies_completed(
@@ -861,6 +1289,7 @@ class TeammateRuntime:
     def _task_prompt(
         team: Team, agent: AgentRecord, task: TeamTask, incoming: list[Message]
     ) -> str:
+        quality = TeammateRuntime._quality_policy(team)
         lines = [
             f"Team: {team.team_name}",
             f"Task ID: {task.id}",
@@ -869,6 +1298,23 @@ class TeammateRuntime:
             f"Subject: {task.subject}",
             f"Description: {task.description}",
         ]
+        if quality.get("strict"):
+            lines.extend(
+                [
+                    f"Architecture contract: {quality.get('architecture_contract') or 'not configured'}",
+                    "Owned files/directories: " + ", ".join(task.owned_files),
+                    "Interfaces provided: "
+                    + (", ".join(task.provides_interfaces) or "none"),
+                    "Interfaces consumed: "
+                    + (", ".join(task.depends_on_interfaces) or "none"),
+                    "Acceptance checks: " + "; ".join(task.acceptance_checks),
+                    (
+                        "Strict ownership is active: do not modify files owned by another task. "
+                        "If you consume another task's interface, exchange a concrete interface "
+                        "message with that owner before finishing."
+                    ),
+                ]
+            )
         if incoming:
             lines.append("Incoming teammate messages:")
             for message in incoming:
@@ -877,7 +1323,10 @@ class TeammateRuntime:
                 )
         else:
             lines.append("Incoming teammate messages: none")
-        lines.append("Complete the task using only your available tools and report a concrete result.")
+        lines.append(
+            "Complete the task using only your available tools, run every declared acceptance "
+            "check, and report concrete evidence. Team-level validation will run independently."
+        )
         return "\n".join(lines)
 
     @staticmethod
@@ -1148,5 +1597,6 @@ class TeammateRuntime:
             "executed_task_ids": executed,
             "tasks": list(lead_context.tasks.values()),
             "messages": messages,
+            "quality_gates": TeammateRuntime._quality_policy(team),
             "usage": team.usage,
         }
