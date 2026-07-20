@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ Examples:
   clawd trace .             Inspect teammate tool calls and messages
   clawd team status         Inspect the active teammate team
   clawd team stop coder     Stop one worker and requeue its work
+  clawd peer run --repo . --prompt-file TASK.md --peers 3 --communication p2p
   clawd --stream           Start REPL with live response rendering
   clawd                    Start interactive REPL
 """
@@ -56,10 +58,15 @@ Examples:
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # login subcommand
-    login_parser = subparsers.add_parser('login', help='Configure API keys')
+    subparsers.add_parser('login', help='Configure API keys')
 
     # config subcommand
-    config_parser = subparsers.add_parser('config', help='Show current configuration')
+    config_parser = subparsers.add_parser('config', help='Show or switch configuration')
+    config_parser.add_argument(
+        '--use',
+        choices=('glm', 'glm5', 'qwen', 'qwen3.5'),
+        help='Switch the default model profile',
+    )
 
     run_parser = subparsers.add_parser('run', help='Run one prompt non-interactively')
     run_parser.add_argument('prompt', nargs='?', help='Prompt text (reads stdin when omitted)')
@@ -130,6 +137,39 @@ Examples:
     team_resume_parser.add_argument('--no-retry-failed', action='store_true', help='Do not retry failed tasks')
     team_resume_parser.add_argument('--no-retry-cancelled', action='store_true', help='Do not retry cancelled tasks')
 
+    peer_parser = subparsers.add_parser('peer', help='Run peer-native collaboration')
+    peer_subparsers = peer_parser.add_subparsers(dest='peer_command', required=True)
+    peer_run_parser = peer_subparsers.add_parser(
+        'run', help='Run a fixed-size peer-native collaboration experiment'
+    )
+    peer_run_parser.add_argument('--repo', type=Path, required=True, help='Git repository root')
+    peer_run_parser.add_argument('--prompt-file', type=Path, required=True, help='Top-level mission file')
+    peer_run_parser.add_argument('--peers', type=int, required=True, help='Number of equal peers')
+    peer_run_parser.add_argument(
+        '--communication',
+        required=True,
+        choices=('solo', 'independent', 'none', 'artifact-only', 'star', 'p2p'),
+    )
+    peer_run_parser.add_argument(
+        '--workspace-mode', required=True, choices=('shared', 'worktree')
+    )
+    peer_run_parser.add_argument('--provider', help='Configured provider to use')
+    peer_run_parser.add_argument('--model', help='Model override for every peer')
+    peer_run_parser.add_argument('--timeout-seconds', type=float, default=300.0)
+    peer_run_parser.add_argument('--max-turns', type=int, default=30)
+    peer_run_parser.add_argument('--max-output-tokens', type=int, default=4096)
+    peer_run_parser.add_argument('--token-budget', type=int)
+    peer_run_parser.add_argument('--turn-budget', type=int)
+    peer_run_parser.add_argument('--output-dir', type=Path)
+    peer_run_parser.add_argument('--coordinator-peer', help='Star coordinator ID/name')
+    peer_run_parser.add_argument(
+        '--acceptance-command',
+        help='Shell-like argv string run against the accepted revision',
+    )
+    peer_run_parser.add_argument(
+        '--retain-worktrees', action='store_true', help='Do not remove peer worktrees after the run'
+    )
+
     args = parser.parse_args()
 
     # Handle --version
@@ -146,7 +186,7 @@ Examples:
     if args.command == 'login':
         return handle_login()
     elif args.command == 'config':
-        return show_config()
+        return show_config(use_provider=args.use)
     elif args.command == 'run':
         try:
             prompt = _read_run_prompt(args.prompt, args.prompt_file, args.workspace)
@@ -173,6 +213,8 @@ Examples:
         )
     elif args.command == 'team':
         return handle_team_command(args)
+    elif args.command == 'peer':
+        return handle_peer_command(args)
 
     # Default: start REPL
     return start_repl(stream=args.stream)
@@ -199,6 +241,52 @@ def _read_run_prompt(
     if not text.strip():
         raise ValueError("prompt must be non-empty")
     return text
+
+
+def handle_peer_command(args: argparse.Namespace) -> int:
+    if args.peer_command != 'run':
+        return 1
+    from src.peer.runner import run_peer_collaboration
+
+    repo = args.repo.expanduser().resolve()
+    prompt_path = args.prompt_file.expanduser()
+    if not prompt_path.is_absolute():
+        prompt_path = repo / prompt_path
+    try:
+        mission = prompt_path.read_text(encoding='utf-8')
+        acceptance = (
+            shlex.split(args.acceptance_command)
+            if args.acceptance_command
+            else None
+        )
+        result = run_peer_collaboration(
+            mission,
+            repo=repo,
+            peers=args.peers,
+            communication=args.communication,
+            workspace_mode=args.workspace_mode,
+            provider_name=args.provider,
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            max_turns=args.max_turns,
+            max_output_tokens=args.max_output_tokens,
+            token_budget=args.token_budget,
+            turn_budget=args.turn_budget,
+            output_dir=args.output_dir,
+            coordinator_peer=args.coordinator_peer,
+            acceptance_command=acceptance,
+            cleanup_worktrees=not args.retain_worktrees,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        Console(stderr=True).print(f"[red]Peer run failed:[/red] {exc}")
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get('status') != 'completed':
+        return 2
+    acceptance_result = result.get('acceptance')
+    if isinstance(acceptance_result, dict) and acceptance_result.get('exit_code') != 0:
+        return 3
+    return 0
 
 
 def run_once(
@@ -447,12 +535,19 @@ def handle_login():
     return 0
 
 
-def show_config():
-    """Show current configuration."""
+def show_config(use_provider: str | None = None):
+    """Show current configuration and optionally switch the default provider."""
     console = Console()
 
     try:
-        from src.config import load_config, get_config_path
+        from src.config import get_config_path, load_config, use_model_profile
+
+        if use_provider is not None:
+            profile = use_model_profile(use_provider)
+            console.print(
+                f"\n[green]✓ Active model profile switched to: {profile['name']} "
+                f"({profile['provider']}/{profile['default_model']})[/green]"
+            )
 
         config = load_config()
         config_path = get_config_path()
@@ -462,6 +557,7 @@ def show_config():
 
         # Show default provider
         console.print(f"[cyan]Default Provider:[/cyan] {config.get('default_provider', 'Not set')}")
+        console.print(f"[cyan]Active Profile:[/cyan] {config.get('active_profile') or 'custom'}")
 
         # Show providers (without showing full API keys)
         console.print("\n[cyan]Configured Providers:[/cyan]")

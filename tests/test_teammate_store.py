@@ -29,13 +29,14 @@ from src.tool_system.tools import (
 
 
 class TestTeammateModels(unittest.TestCase):
-    def test_team_state_machine_rejects_invalid_transition(self) -> None:
+    def test_team_state_machine_allows_reopen_but_rejects_invalid_transition(self) -> None:
         team = Team(team_id="team-1", team_name="demo", lead_agent_id="lead-1")
         team.transition_to("running")
         team.transition_to("completed")
+        team.transition_to("running")
 
         with self.assertRaises(ValueError):
-            team.transition_to("running")
+            team.transition_to("created")
 
     def test_agent_and_message_validate_status(self) -> None:
         with self.assertRaises(ValueError):

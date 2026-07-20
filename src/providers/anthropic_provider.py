@@ -64,12 +64,18 @@ class AnthropicProvider(BaseProvider):
                 })
 
         usage = getattr(response, "usage", None)
+        def usage_value(name: str) -> int:
+            value = getattr(usage, name, 0)
+            return int(value) if isinstance(value, (int, float)) else 0
+
         return ChatResponse(
             content=content_text,
             model=getattr(response, "model", self.model or ""),
             usage={
-                "input_tokens": getattr(usage, "input_tokens", 0),
-                "output_tokens": getattr(usage, "output_tokens", 0),
+                "input_tokens": usage_value("input_tokens"),
+                "output_tokens": usage_value("output_tokens"),
+                "cache_creation_input_tokens": usage_value("cache_creation_input_tokens"),
+                "cache_read_input_tokens": usage_value("cache_read_input_tokens"),
             },
             finish_reason=str(getattr(response, "stop_reason", "stop")),
             tool_uses=tool_uses if tool_uses else None,

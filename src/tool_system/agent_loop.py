@@ -22,6 +22,7 @@ from ..providers.base import BaseProvider, ChatResponse
 from ..providers.anthropic_provider import AnthropicProvider
 from ..providers.minimax_provider import MinimaxProvider
 from ..teammate.trace import TeamTraceRecorder
+from ..peer.trace import PeerTraceRecorder
 
 
 _LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
@@ -33,12 +34,20 @@ _LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
 
 _LEADER_TEAM_GUIDANCE = """## Adaptive Team Orchestration
 - You are the lead and remain responsible for the final result. First decide whether delegation is likely to improve quality, latency, or context coverage enough to justify its cost. It is valid to complete the task without creating a team.
-- When a team is useful, choose the number of teammates, their roles, models, tool allowlists, workspace modes, tasks, dependencies, and concurrency from the task itself. Do not default to a fixed planner/coder/reviewer pipeline.
+- When a team is useful, choose the number of teammates, their roles, tool allowlists, workspace modes, tasks, dependencies, and concurrency from the task itself. Omit a teammate model override unless the runtime explicitly lists it as supported; otherwise inherit the lead model. Do not default to a fixed planner/coder/reviewer pipeline.
 - Teammates may communicate directly with one another through `SendMessage` and receive new peer messages through `ReadMessages`; useful peer coordination does not need to be routed through the lead.
 - Use stable task keys and explicit ownership. Prefer dependencies only when work truly must be sequential, and allow independent tasks to run in parallel.
 - Observe persisted task, message, and agent state. You may run a bounded number of scheduling batches, then add or reassign tasks, adjust dependencies, stop or resume workers, recover failures, and continue.
 - Treat teammate output as evidence, not authority. Integrate the work, run final verification yourself, and stop unnecessary work when the expected value of more collaboration is low.
 - The resulting communication topology is an execution outcome, not a prescribed shape."""
+
+_EMPTY_RESPONSE_RETRY_LIMIT = 3
+_EMPTY_RESPONSE_CORRECTION = (
+    "Your previous response contained neither visible content nor a tool call. "
+    "Continue the task instead of stopping silently. If work remains, call the "
+    "appropriate tools now; if the task is genuinely complete, provide a non-empty "
+    "final response describing the completed work."
+)
 
 
 def _is_anthropic_provider(provider: BaseProvider) -> bool:
@@ -250,6 +259,16 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
     sections = [style_prompt, _LOCAL_TOOL_GUIDANCE]
     if tool_context.actor_id is None:
         sections.append(_LEADER_TEAM_GUIDANCE)
+    if tool_context.workspace_backend is not None:
+        execution_root = tool_context.execution_workspace_root or "/workspace"
+        execution_cwd = tool_context.execution_cwd or execution_root
+        sections.append(
+            "## Sandboxed Execution Workspace\n"
+            f"Bash and file tools execute inside a remote sandbox. Its workspace root is "
+            f"`{execution_root}` and the current directory is `{execution_cwd}`. "
+            "Use these paths for repository work. The host workspace shown in environment "
+            "context contains control metadata and maps transparently to this remote workspace."
+        )
     if tool_context.system_prompt_extra and tool_context.system_prompt_extra.strip():
         sections.append(tool_context.system_prompt_extra.strip())
     if context_prompt.strip():
@@ -266,7 +285,7 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
     except Exception:
         return None
     team = tool_context.team
-    if team is None or team.get("status") == "completed":
+    if team is None:
         return None
 
     team_id = str(team.get("team_id") or "")
@@ -277,6 +296,13 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
         name: sum(task.get("status") == name for task in tasks)
         for name in ("pending", "in_progress", "completed", "failed", "cancelled")
     }
+
+    if (
+        team.get("status") == "completed"
+        and tasks
+        and task_counts["completed"] == len(tasks)
+    ):
+        return None
 
     if not agents:
         action = "Call TeammateCreate, create an owned task with TaskCreate, then call TeamRun."
@@ -422,9 +448,19 @@ def run_agent_loop(
             pass
 
     # Track usage across all turns
-    total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    total_usage: dict[str, int] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
     turn_count = 0
-    trace_recorder = TeamTraceRecorder(tool_context)
+    consecutive_empty_responses = 0
+    trace_recorder = (
+        PeerTraceRecorder(tool_context)
+        if tool_context.peer_run_id is not None
+        else TeamTraceRecorder(tool_context)
+    )
 
     def emit(event: ToolEvent) -> None:
         _safe_call_handler(on_event, event)
@@ -436,7 +472,7 @@ def run_agent_loop(
         failed: bool = False,
         cancelled: bool = False,
     ) -> AgentLoopResult:
-        usage = total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None
+        usage = total_usage if any(total_usage.values()) else None
         emit(ToolEvent(
             kind="run_cancelled" if cancelled else ("run_failed" if failed else "run_completed"),
             content=response_text,
@@ -507,8 +543,8 @@ def run_agent_loop(
 
         # Collect usage info
         if response.usage:
-            total_usage["input_tokens"] += response.usage.get("input_tokens", 0)
-            total_usage["output_tokens"] += response.usage.get("output_tokens", 0)
+            for usage_key in total_usage:
+                total_usage[usage_key] += int(response.usage.get(usage_key, 0) or 0)
 
         # Build assistant content for Anthropic or just text for OpenAI
         final_assistant_content = response.content or ""
@@ -578,12 +614,44 @@ def run_agent_loop(
                 if not _is_anthropic_provider(provider):
                     openai_messages.append({"role": "user", "content": lifecycle_warning})
                 continue
+            if not final_assistant_content.strip() and last_user_visible_message is None:
+                consecutive_empty_responses += 1
+                if consecutive_empty_responses <= _EMPTY_RESPONSE_RETRY_LIMIT:
+                    emit(
+                        ToolEvent(
+                            kind="empty_response_retry",
+                            content=_EMPTY_RESPONSE_CORRECTION,
+                            model=response.model or model_name,
+                            finish_reason=response.finish_reason,
+                            turn=turn_count,
+                            is_error=True,
+                            error=(
+                                "model returned no content or tool calls "
+                                f"({consecutive_empty_responses}/"
+                                f"{_EMPTY_RESPONSE_RETRY_LIMIT})"
+                            ),
+                        )
+                    )
+                    conversation.add_user_message(_EMPTY_RESPONSE_CORRECTION)
+                    if not _is_anthropic_provider(provider):
+                        openai_messages.append(
+                            {"role": "user", "content": _EMPTY_RESPONSE_CORRECTION}
+                        )
+                    continue
+                error = (
+                    "model returned no content or tool calls after "
+                    f"{_EMPTY_RESPONSE_RETRY_LIMIT} corrective retries"
+                )
+                finish(error, failed=True)
+                raise RuntimeError(error)
             # No more tools, done
             if stream and final_assistant_content and not streamed_live_text:
                 _emit_text_chunks(on_text_chunk, final_assistant_content)
             if (final_assistant_content or "").strip() == "" and last_user_visible_message is not None:
                 return finish(last_user_visible_message)
             return finish(final_assistant_content)
+
+        consecutive_empty_responses = 0
 
         # Anthropic expects all results for one assistant tool-use response in a
         # single following user message.

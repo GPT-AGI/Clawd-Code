@@ -22,7 +22,9 @@ class Team:
         "created": {"running", "cancelled"},
         "running": {"completed", "failed", "cancelled"},
         "failed": {"running", "cancelled"},
-        "completed": set(),
+        # A persistent team may receive another task after a previously completed
+        # batch.  Reopening keeps the same team identity, history, and usage.
+        "completed": {"running"},
         "cancelled": {"running"},
     }
 
@@ -76,7 +78,9 @@ class AgentRecord:
         "idle": {"running", "stopping", "completed", "cancelled"},
         "stopping": {"cancelled"},
         "failed": {"running", "stopping", "cancelled"},
-        "completed": set(),
+        # Completed teammates are persistent and can be reused when their team is
+        # reopened for a later task.
+        "completed": {"running"},
         "cancelled": {"running"},
     }
 

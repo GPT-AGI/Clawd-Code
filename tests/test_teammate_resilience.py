@@ -260,6 +260,79 @@ class TestTeammateResilience(unittest.TestCase):
     def _runtime(self, provider) -> None:
         self.context.teammate_runtime = TeammateRuntime(provider, self.registry)
 
+    def test_completed_team_reopens_for_a_late_task(self) -> None:
+        self._agent("worker")
+        first_task = self._task("first", "worker")
+        provider = FinalProvider()
+        self._runtime(provider)
+
+        first = TeamRunTool().run({}, self.context)
+        self.assertEqual(first.output["status"], "completed")
+        self.assertEqual(self.context.tasks[first_task]["status"], "completed")
+
+        late_task = self._task("late", "worker")
+        second = TeamRunTool().run({}, self.context)
+
+        self.assertFalse(second.is_error)
+        self.assertEqual(second.output["status"], "completed")
+        self.assertEqual(second.output["executed_task_ids"], [late_task])
+        self.assertEqual(self.context.tasks[late_task]["status"], "completed")
+        self.assertEqual(provider.calls, 2)
+        events = self.context.team_store.list_events(self.team["team_id"])
+        reopened = [event for event in events if event["type"] == "team.reopened"]
+        self.assertEqual(len(reopened), 1)
+        self.assertEqual(reopened[0]["data"]["unfinished_task_ids"], [late_task])
+
+    def test_teammate_model_must_match_runtime_allowlist(self) -> None:
+        self.context.teammate_runtime = TeammateRuntime(
+            FinalProvider(),
+            self.registry,
+            allowed_models={"served-model"},
+        )
+
+        with self.assertRaisesRegex(ToolInputError, "unsupported teammate model"):
+            TeammateCreateTool().run(
+                {
+                    "name": "wrong-model",
+                    "role": "worker",
+                    "instructions": "Complete the task.",
+                    "tools": ["Read"],
+                    "model": "claude-3-7-sonnet-20250219",
+                },
+                self.context,
+            )
+
+        created = TeammateCreateTool().run(
+            {
+                "name": "right-model",
+                "role": "worker",
+                "instructions": "Complete the task.",
+                "tools": ["Read"],
+                "model": "served-model",
+            },
+            self.context,
+        )
+        self.assertEqual(created.output["name"], "right-model")
+
+    def test_runtime_enforces_minimum_team_timeout(self) -> None:
+        self._agent("worker")
+        self._task("bounded", "worker")
+        self.context.teammate_runtime = TeammateRuntime(
+            FinalProvider(),
+            self.registry,
+            minimum_timeout_s=900,
+        )
+
+        result = TeamRunTool().run({"timeout_s": 120}, self.context)
+
+        self.assertEqual(result.output["status"], "completed")
+        team = self.context.team_store.load_team(self.team["team_id"])
+        self.assertEqual(team.settings["timeout_s"], 900)
+        events = self.context.team_store.list_events(self.team["team_id"])
+        adjusted = [event for event in events if event["type"] == "team.options_adjusted"]
+        self.assertEqual(adjusted[0]["data"]["timeout_s"]["requested"], 120)
+        self.assertEqual(adjusted[0]["data"]["timeout_s"]["effective"], 900)
+
     def test_recovers_expired_in_progress_lease(self) -> None:
         agent = self._agent("worker")
         task_id = self._task("recover", "worker")

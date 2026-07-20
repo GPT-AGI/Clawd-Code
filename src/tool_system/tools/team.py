@@ -128,8 +128,19 @@ class TeammateCreateTool:
             raise ToolInputError("tools must be a non-empty array of tool names")
         if model is not None and (not isinstance(model, str) or not model.strip()):
             raise ToolInputError("model must be a non-empty string when provided")
+        validate_model = getattr(context.teammate_runtime, "validate_model", None)
+        if callable(validate_model):
+            try:
+                model = validate_model(model)
+            except ValueError as exc:
+                raise ToolInputError(str(exc)) from exc
         if workspace_mode not in {"shared", "worktree"}:
             raise ToolInputError("workspace_mode must be shared or worktree")
+        if workspace_mode == "worktree" and context.workspace_backend is not None:
+            raise ToolInputError(
+                "worktree teammates are not supported by the remote sandbox backend; "
+                "use workspace_mode=shared"
+            )
         if auto_integrate and workspace_mode != "worktree":
             raise ToolInputError("auto_integrate requires workspace_mode=worktree")
 
@@ -149,7 +160,7 @@ class TeammateCreateTool:
             name=name.strip(),
             role=role.strip(),
             session_id=uuid.uuid4().hex,
-            model=model.strip() if isinstance(model, str) else None,
+            model=model,
             instructions=instructions.strip(),
             tools=normalized_tools,
             workspace_mode=workspace_mode,

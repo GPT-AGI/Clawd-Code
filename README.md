@@ -126,6 +126,8 @@ clawd              # Start REPL
 clawd login        # Configure API
 clawd --version    # Check version
 clawd config       # View settings
+clawd config --use glm5      # Switch to Z.ai GLM-5.2 profile
+clawd config --use qwen3.5   # Switch to Tencent TI-ONE Qwen 3.5 profile
 ```
 
 ***
@@ -145,7 +147,7 @@ clawd config       # View settings
 |--------|--------|-------------|
 | CLI Entry | ✅ | `clawd`, `login`, `config`, `--version` |
 | Interactive REPL | ✅ | Rich interactive output, history, tab completion, multiline |
-| Multi-Provider | ✅ | Anthropic, OpenAI, GLM support |
+| Multi-Provider | ✅ | Anthropic, OpenAI, GLM, Qwen/TI-ONE support |
 | Session Persistence | ✅ | Save/load sessions locally |
 | Agent Loop | ✅ | Tool calling loop implementation |
 | Skill System | ✅ | SKILL.md-based slash-command skills with args + tool limits |
@@ -209,6 +211,19 @@ This flow will:
 4. optionally save a default model
 5. set the selected provider as default
 
+For the preconfigured benchmark model profiles, switching does not require
+re-entering keys:
+
+```bash
+clawd config --use glm5
+clawd config --use qwen3.5
+```
+
+The Qwen profile uses the TI-ONE service group ID `ms-mnhdj86z` as its model
+and the service URL ending in `/ms-mnhdj86z/v1`. Store the service AuthToken
+through `clawd login` or `QWEN_API_KEY`; it is sent as the Authorization header
+value and is never committed to the repository.
+
 The configuration file is saved in in `~/.clawd/config.json`. Example structure:
 
 ```json
@@ -241,6 +256,7 @@ python -m src.cli          # Start REPL
 python -m src.cli --help   # Show help
 clawd run -C ./project --prompt-file TASK.md  # Run one task non-interactively
 clawd trace ./project      # Inspect teammate traces locally
+clawd peer run --repo ./project --prompt-file TASK.md --peers 2 --communication p2p --workspace-mode worktree
 ```
 
 `clawd run` also accepts a quoted prompt or piped stdin. Local file operations
@@ -248,6 +264,9 @@ are scoped to the selected workspace, progress is written to stderr, and the
 final answer is written to stdout for scripting and CI use. Provider credentials
 can come from `clawd login` or standard environment variables such as
 `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and `OPENAI_API_KEY`.
+Peer-native runs create equal persistent sessions without a lead or owned task
+graph. See `teammate-evals/peer-collaboration/README.md` for conditions,
+scripted smoke tests, output schemas, and real-model pilot commands.
 
 **That's it!** Start chatting with AI in 3 steps.
 
@@ -628,6 +647,8 @@ clawd              # 启动 REPL
 clawd login        # 配置 API
 clawd --version    # 检查版本
 clawd config       # 查看设置
+clawd config --use glm5      # 切换到 Z.ai GLM-5.2
+clawd config --use qwen3.5   # 切换到腾讯 TI-ONE Qwen 3.5
 ```
 
 ***
@@ -647,7 +668,7 @@ clawd config       # 查看设置
 |------|------|------|
 | CLI 入口 | ✅ | `clawd`、`login`、`config`、`--version` |
 | 交互式 REPL | ✅ | 丰富的交互输出、历史记录、Tab 补全、多行输入 |
-| 多提供商支持 | ✅ | 支持 Anthropic、OpenAI、GLM |
+| 多提供商支持 | ✅ | 支持 Anthropic、OpenAI、GLM、Qwen/TI-ONE |
 | 会话持久化 | ✅ | 本地保存/加载会话 |
 | Agent Loop | ✅ | 工具调用循环实现 |
 | Skill 系统 | ✅ | 基于 SKILL.md 的 /skill 技能：参数替换 + 工具限制 |
@@ -711,6 +732,17 @@ python -m src.cli login
 4. 可选：保存默认 model
 5. 将该 provider 设为默认
 
+两个评测模型可以直接切换，不需要重复录入已有密钥：
+
+```bash
+clawd config --use glm5
+clawd config --use qwen3.5
+```
+
+Qwen profile 使用 TI-ONE 服务组 ID `ms-mnhdj86z` 作为模型 ID，Base URL
+以 `/ms-mnhdj86z/v1` 结尾。请通过 `clawd login` 或 `QWEN_API_KEY` 配置服务
+AuthToken；密钥只保存在用户配置中，不会写入仓库。
+
 配置文件会保存在 `~/.clawd/config.json`。示例结构：
 
 ```json
@@ -743,12 +775,16 @@ python -m src.cli          # 启动 REPL
 python -m src.cli --help   # 显示帮助
 clawd run -C ./project --prompt-file TASK.md  # 非交互执行单次任务
 clawd trace ./project      # 在本地查看 teammate 运行轨迹
+clawd peer run --repo ./project --prompt-file TASK.md --peers 2 --communication p2p --workspace-mode worktree
 ```
 
 `clawd run` 也支持直接传入 prompt 或从 stdin 读取。本地文件操作范围限制在指定
 workspace 内，执行进度输出到 stderr，最终回答输出到 stdout，便于脚本和 CI 使用。
 Provider 凭据既可来自 `clawd login`，也可使用 `ANTHROPIC_AUTH_TOKEN`、
 `ANTHROPIC_BASE_URL`、`OPENAI_API_KEY` 等标准环境变量。
+Peer-native 模式会创建没有 lead 和 owned task graph 的平等持久 session。五种实验
+condition、scripted smoke、输出 schema 与真实模型命令见
+`teammate-evals/peer-collaboration/README.md`。
 
 **就这样！** 3 步开始与 AI 对话。
 

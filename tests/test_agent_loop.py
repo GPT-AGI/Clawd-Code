@@ -10,8 +10,12 @@ from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.base import ChatResponse
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.context import ToolContext
-from src.tool_system.agent_loop import run_agent_loop, AgentLoopResult
-from src.tool_system.tools import TeamCreateTool, TeammateCreateTool
+from src.tool_system.agent_loop import (
+    AgentLoopResult,
+    _team_lifecycle_warning,
+    run_agent_loop,
+)
+from src.tool_system.tools import TaskCreateTool, TeamCreateTool, TeammateCreateTool
 
 
 class TestAgentLoop(unittest.TestCase):
@@ -391,6 +395,96 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(result.response_text, "Hello from fallback!")
         provider.chat.assert_called_once()
 
+    def test_empty_response_without_tools_is_corrected_and_retried(self):
+        conversation = Conversation()
+        conversation.add_user_message("Create done.txt")
+        provider = MagicMock()
+        output_path = self.workspace / "done.txt"
+        provider.chat_stream_response.side_effect = NotImplementedError()
+        provider.chat.side_effect = [
+            ChatResponse(
+                content="",
+                reasoning_content="I should create the file.",
+                model="test-model",
+                usage={},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+            ChatResponse(
+                content="Continuing with the implementation.",
+                model="test-model",
+                usage={},
+                finish_reason="tool_calls",
+                tool_uses=[{
+                    "id": "write-after-empty",
+                    "name": "Write",
+                    "input": {"file_path": str(output_path), "content": "done"},
+                }],
+            ),
+            ChatResponse(
+                content="Implementation complete.",
+                model="test-model",
+                usage={},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+        ]
+        events = []
+
+        result = run_agent_loop(
+            conversation=conversation,
+            provider=provider,
+            tool_registry=self.registry,
+            tool_context=self.context,
+            max_turns=6,
+            on_event=events.append,
+        )
+
+        self.assertEqual(result.response_text, "Implementation complete.")
+        self.assertEqual(provider.chat.call_count, 3)
+        self.assertEqual(output_path.read_text(encoding="utf-8"), "done")
+        retries = [event for event in events if event.kind == "empty_response_retry"]
+        self.assertEqual(len(retries), 1)
+        corrective_messages = [
+            message.content
+            for message in conversation.messages
+            if message.role == "user"
+            and isinstance(message.content, str)
+            and message.content.startswith("Your previous response contained neither")
+        ]
+        self.assertEqual(len(corrective_messages), 1)
+
+    def test_repeated_empty_responses_fail_instead_of_scoring_as_success(self):
+        conversation = Conversation()
+        conversation.add_user_message("Do the task")
+        provider = MagicMock()
+        provider.chat_stream_response.side_effect = NotImplementedError()
+        provider.chat.return_value = ChatResponse(
+            content="",
+            reasoning_content="thinking only",
+            model="test-model",
+            usage={},
+            finish_reason="stop",
+            tool_uses=None,
+        )
+        events = []
+
+        with self.assertRaisesRegex(RuntimeError, "corrective retries"):
+            run_agent_loop(
+                conversation=conversation,
+                provider=provider,
+                tool_registry=self.registry,
+                tool_context=self.context,
+                max_turns=6,
+                on_event=events.append,
+            )
+
+        self.assertEqual(provider.chat.call_count, 4)
+        self.assertEqual(
+            [event.kind for event in events].count("empty_response_retry"), 3
+        )
+        self.assertEqual([event.kind for event in events].count("run_failed"), 1)
+
     def test_incomplete_team_blocks_final_answer_until_lead_cleans_up(self):
         conversation = Conversation()
         conversation.add_user_message("Review the implementation")
@@ -455,6 +549,38 @@ class TestAgentLoop(unittest.TestCase):
         ]
         self.assertEqual(len(warnings), 1)
         self.assertIn("TaskCreate", warnings[0])
+
+    def test_completed_team_with_late_pending_task_is_not_settled(self):
+        created = TeamCreateTool().run({"team_name": "reopen"}, self.context).output
+        TeammateCreateTool().run(
+            {
+                "name": "worker",
+                "role": "implementation",
+                "instructions": "Implement the assigned task.",
+                "tools": ["Read"],
+            },
+            self.context,
+        )
+        team = self.context.team_store.load_team(created["team_id"])
+        team.transition_to("running")
+        team.transition_to("completed")
+        self.context.team_store.save_team(team)
+        self.context.reload_team_state()
+        TaskCreateTool().run(
+            {
+                "key": "late",
+                "subject": "Late work",
+                "description": "Complete work discovered after the first batch.",
+                "owner": "worker",
+            },
+            self.context,
+        )
+
+        warning = _team_lifecycle_warning(self.context)
+
+        self.assertIsNotNone(warning)
+        self.assertIn("TeamRun", warning)
+        self.assertIn("pending=1", warning)
 
 
 if __name__ == "__main__":

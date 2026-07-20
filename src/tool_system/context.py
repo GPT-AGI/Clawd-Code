@@ -35,6 +35,14 @@ class ToolContext:
     teammate_runtime: Any | None = None
     output_style_name: str | None = None
     output_style_dir: Path | None = None
+    workspace_backend: Any | None = None
+    execution_workspace_root: str | None = None
+    execution_cwd: str | None = None
+    remote_file_fingerprints: dict[str, tuple[int, int]] = field(default_factory=dict)
+    peer_store: Any | None = None
+    peer_run_id: str | None = None
+    peer_id: str | None = None
+    peer_control: Any | None = None
     team_store: TeamStore = field(init=False, repr=False)
 
     # Permission handler callback: called when a tool needs user consent.
@@ -50,6 +58,12 @@ class ToolContext:
             self.cwd = self.workspace_root
         else:
             self.cwd = Path(self.cwd).resolve()
+        if self.workspace_backend is not None:
+            self.execution_workspace_root = (
+                self.execution_workspace_root
+                or str(getattr(self.workspace_backend, "workspace_root", "/workspace"))
+            )
+            self.execution_cwd = self.execution_cwd or self.execution_workspace_root
         if self.permission_context.workspace_root is None:
             self.permission_context = ToolPermissionContext.from_iterables(
                 self.permission_context.deny_names,
@@ -94,6 +108,28 @@ class ToolContext:
             return False
         stat = resolved.stat()
         return fingerprint == (int(stat.st_mtime), int(stat.st_size))
+
+    def mark_remote_file_read(self, path: str) -> None:
+        if self.workspace_backend is None:
+            return
+        self.remote_file_fingerprints[path] = self.workspace_backend.stat(path).fingerprint
+
+    def was_remote_file_read_and_unchanged(self, path: str) -> bool:
+        if self.workspace_backend is None:
+            return False
+        fingerprint = self.remote_file_fingerprints.get(path)
+        if fingerprint is None:
+            return False
+        return fingerprint == self.workspace_backend.stat(path).fingerprint
+
+    def resolve_execution_path(self, path: str) -> str:
+        if self.workspace_backend is None:
+            return str(self.ensure_allowed_path(path))
+        return self.workspace_backend.resolve_path(
+            path,
+            cwd=self.execution_cwd or self.execution_workspace_root or "/workspace",
+            local_root=self.workspace_root,
+        )
 
     def ensure_allowed_path(self, path: str | Path) -> Path:
         p = Path(path).expanduser() if isinstance(path, str) else path.expanduser()

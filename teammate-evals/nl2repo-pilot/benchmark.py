@@ -6,13 +6,18 @@ import dataclasses
 import hashlib
 import json
 import os
+import random
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -23,7 +28,15 @@ REPO_ROOT = ROOT.parents[1]
 UPSTREAM_URL = "https://github.com/multimodal-art-projection/NL2RepoBench.git"
 UPSTREAM_REF = "781a1da1ee41fb8edb0bed22f586d69111610edf"
 IMAGE_ROOT = "ghcr.io/multimodal-art-projection/nl2repobench"
+AGS_IMAGE_TEMPLATE = "swebenchdocker.tencentcloudcr.com/swebench/nl2repo:{task}-1.0"
+AGS_SCORE_SETUP_CONCURRENCY = max(
+    1, int(os.environ.get("AGS_SCORE_SETUP_CONCURRENCY", "8"))
+)
+AGS_SCORE_SETUP_SLOTS = threading.BoundedSemaphore(AGS_SCORE_SETUP_CONCURRENCY)
 PILOT_TASKS = ("jsonlines", "tinydb", "aiofiles", "flask-restful", "fastapi-users")
+ROLLOUT32_SEED = 20260715
+ROLLOUT32_SIZE = 32
+ROLLOUT32_MAX_PROMPT_BYTES = 64 * 1024
 PACKAGE_FILES = {
     "setup.py",
     "pyproject.toml",
@@ -64,6 +77,11 @@ def _append_jsonl(path: Path, value: Any) -> None:
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def format_ags_image(template: str, task_name: str) -> str:
+    """Format a registry-safe image reference without changing the task ID."""
+    return template.format(task=task_name.casefold())
 
 
 def _run_checked(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -165,6 +183,31 @@ def list_tasks(upstream_root: Path) -> list[dict[str, Any]]:
     return tasks
 
 
+def select_task_subset(
+    task_metadata: list[dict[str, Any]],
+    *,
+    count: int = ROLLOUT32_SIZE,
+    seed: int = ROLLOUT32_SEED,
+    max_prompt_bytes: int = ROLLOUT32_MAX_PROMPT_BYTES,
+) -> list[str]:
+    """Select the same deterministic, bounded-context subset as the latency probe."""
+    eligible = sorted(
+        (
+            task
+            for task in task_metadata
+            if int(task.get("prompt_bytes", 0)) <= max_prompt_bytes
+        ),
+        key=lambda task: str(task["id"]),
+    )
+    if len(eligible) < count:
+        raise ValueError(
+            f"only {len(eligible)} tasks are <= {max_prompt_bytes} bytes; "
+            f"cannot select {count}"
+        )
+    selected = random.Random(seed).sample(eligible, count)
+    return sorted(str(task["id"]) for task in selected)
+
+
 def load_task(upstream_root: Path, task_name: str) -> dict[str, Any]:
     if not TASK_NAME_RE.fullmatch(task_name):
         raise ValueError(f"invalid task name: {task_name!r}")
@@ -189,7 +232,7 @@ def load_task(upstream_root: Path, task_name: str) -> dict[str, Any]:
         "expected_tests": int((task_dir / "test_case_count.txt").read_text(encoding="utf-8").strip()),
         "test_commands": commands,
         "hidden_paths": hidden_paths,
-        "image": f"{IMAGE_ROOT}/{task_name}:1.0",
+        "image": f"{IMAGE_ROOT}/{task_name.casefold()}:1.0",
     }
 
 
@@ -216,13 +259,35 @@ repository itself. Agents may communicate directly when useful. Observe progress
 intervene when needed, integrate the work, and personally perform final validation.
 The team topology must be your runtime decision, not a predefined role pipeline.
 """
+    if mode == "adaptive-team-v2":
+        return common + """
+Adaptive Team v2 protocol: act as the lead and make an explicit collaboration routing
+decision after reading the complete specification. Create a Team when the work contains
+at least two substantially independent implementation, investigation, or validation
+streams whose parallel progress is likely to exceed coordination cost. Remain solo for
+small, tightly coupled work where delegation would only duplicate context.
+
+When using a Team, start with at most two teammates. Give each teammate a concrete,
+non-overlapping, independently verifiable task and omit the model override so every
+teammate inherits the configured endpoint model. Keep ownership of architecture,
+integration, and final end-to-end validation as the lead. Reserve substantial lead
+budget for integration and tests; inspect teammate output before relying on it, and do
+not repeatedly resume an unproductive task. The topology and Team decision must follow
+from this repository rather than a predefined role pipeline. It is valid to complete
+the rollout without creating a Team when the routing criteria are not met.
+"""
     if mode == "forced-team":
         return common + """
-Diagnostic execution protocol: use at least one teammate, but choose the number of
-agents, task-specific roles, models, tool permissions, workspaces, dependencies,
-concurrency, and communication topology from the repository itself. Do not use a
-predefined role pipeline. Observe progress, intervene when needed, integrate the work,
-and personally perform final validation.
+Diagnostic execution protocol: the harness has already created the active Team. Do not
+call TeamCreate. After reading start.md and choosing a task-specific decomposition, you
+must call TeammateCreate and use at least one teammate, create at least one owned task
+with TaskCreate, and execute it with TeamRun before implementing the rest yourself.
+Choose the number of agents,
+task-specific roles, tool permissions, workspaces, dependencies, concurrency,
+and communication topology from the repository itself. Do not use a predefined role
+pipeline. All teammates must inherit the configured endpoint model; omit the model
+override in TeammateCreate. Observe progress, intervene when needed, integrate the work, and personally
+perform final validation. A rollout without a completed teammate task is invalid.
 """
     raise ValueError(f"unknown mode: {mode}")
 
@@ -245,6 +310,57 @@ def prepare_workspace(task: dict[str, Any], workspace: Path) -> str:
     return _hash_file(task_path)
 
 
+def _install_remote_workspace(downloaded: Path, workspace: Path) -> None:
+    """Mirror agent-visible files locally while retaining local orchestration state."""
+    for item in workspace.iterdir():
+        if item.name == ".clawd":
+            continue
+        if item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
+    for item in downloaded.iterdir():
+        target = workspace / item.name
+        if target.name == ".clawd":
+            continue
+        shutil.move(str(item), target)
+
+
+def _is_ags_image_preparing_error(error: Exception) -> bool:
+    message = str(error).casefold()
+    return "resourceunavailable" in message and "image is still preparing" in message
+
+
+def start_ags_backend_with_retry(
+    factory: Callable[[], Any],
+    *,
+    attempts: int | None = None,
+    delay_s: float | None = None,
+    on_retry: Callable[[int, Exception], None] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> Any:
+    """Wait for lazily prepared AGS task images without failing the rollout."""
+    retry_attempts = attempts or int(os.environ.get("AGS_IMAGE_PREPARE_ATTEMPTS", "20"))
+    retry_delay = (
+        delay_s
+        if delay_s is not None
+        else float(os.environ.get("AGS_IMAGE_PREPARE_RETRY_SEC", "30"))
+    )
+    if retry_attempts < 1 or retry_delay < 0:
+        raise ValueError("AGS image retry attempts must be positive and delay non-negative")
+    sleeper = sleep_fn or time.sleep
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            return factory().start()
+        except Exception as exc:
+            if not _is_ags_image_preparing_error(exc) or attempt == retry_attempts:
+                raise
+            if on_retry is not None:
+                on_retry(attempt, exc)
+            sleeper(retry_delay)
+    raise AssertionError("unreachable")
+
+
 def _run_agent_child(
     workspace: Path,
     prompt_path: Path,
@@ -256,6 +372,15 @@ def _run_agent_child(
     max_output_tokens: int,
     stream: bool,
     progress_path: Path,
+    *,
+    teammate_min_timeout_s: float | None = None,
+    mode: str = "adaptive",
+    execution_backend: str = "local",
+    ags_image: str | None = None,
+    ags_env_file: Path | None = None,
+    ags_timeout: str = "3h",
+    ags_cpu: str = "2",
+    ags_memory: str = "4Gi",
 ) -> int:
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
@@ -278,7 +403,76 @@ def _run_agent_child(
             },
         )
 
+    backend: Any | None = None
+    sandbox_id = ""
+    payload: dict[str, Any]
     try:
+        if mode == "forced-team":
+            from src.teammate.store import TeamStore
+
+            store = TeamStore(workspace)
+            team = store.load_active_team()
+            if team is None:
+                team = store.create_team(
+                    "nl2repo-forced-team",
+                    description=(
+                        "Harness-created team for the forced-team NL2Repo evaluation protocol"
+                    ),
+                    agent_type="adaptive",
+                )
+            _append_jsonl(
+                progress_path,
+                {
+                    "kind": "forced_team_precreated",
+                    "team_id": team.team_id,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        if execution_backend == "ags":
+            if not ags_image:
+                raise ValueError("AGS execution requires an image")
+            from src.execution.ags import AGSSettings, AGSWorkspaceBackend
+
+            settings = AGSSettings.from_env(
+                image=ags_image,
+                env_file=ags_env_file,
+                timeout=ags_timeout,
+                cpu=ags_cpu,
+                memory=ags_memory,
+            )
+            def record_image_retry(attempt: int, error: Exception) -> None:
+                _append_jsonl(
+                    progress_path,
+                    {
+                        "kind": "sandbox_image_waiting",
+                        "backend": "ags",
+                        "image": ags_image,
+                        "attempt": attempt,
+                        "retry_in_s": float(
+                            os.environ.get("AGS_IMAGE_PREPARE_RETRY_SEC", "30")
+                        ),
+                        "error_type": type(error).__name__,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
+            backend = start_ags_backend_with_retry(
+                lambda: AGSWorkspaceBackend(settings),
+                on_retry=record_image_retry,
+            )
+            sandbox_id = backend.sandbox_id
+            _append_jsonl(
+                progress_path,
+                {
+                    "kind": "sandbox_started",
+                    "backend": "ags",
+                    "sandbox_id": sandbox_id,
+                    "image": ags_image,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            backend.reset_workspace()
+            backend.upload_tree(workspace, backend.workspace_root)
         result = run_prompt(
             prompt_path.read_text(encoding="utf-8"),
             workspace=workspace,
@@ -286,10 +480,12 @@ def _run_agent_child(
             model=model,
             max_turns=max_turns,
             teammate_max_turns=teammate_max_turns,
+            teammate_min_timeout_s=teammate_min_timeout_s,
             max_output_tokens=max_output_tokens,
             stream=stream,
             on_event=capture,
             on_text_chunk=capture_text,
+            workspace_backend=backend,
         )
         payload = {
             "ok": result.response_text != "[Max tool turns reached]",
@@ -298,8 +494,10 @@ def _run_agent_child(
             "lead_turns": result.num_turns,
             "lead_model_calls": sum(event["kind"] == "model_response" for event in events),
             "lead_tool_calls": sum(event["kind"] == "tool_use" for event in events),
+            "execution_backend": execution_backend,
+            "sandbox_id": sandbox_id or None,
         }
-    except Exception as exc:
+    except BaseException as exc:
         terminal = next(
             (
                 event
@@ -322,7 +520,44 @@ def _run_agent_child(
             "lead_turns": lead_turns,
             "lead_model_calls": sum(event["kind"] == "model_response" for event in events),
             "lead_tool_calls": sum(event["kind"] == "tool_use" for event in events),
+            "execution_backend": execution_backend,
+            "sandbox_id": sandbox_id or None,
         }
+    finally:
+        if backend is not None:
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="clawd-ags-download-", dir=workspace.parent
+                ) as temporary:
+                    downloaded = Path(temporary)
+                    backend.download_tree(backend.workspace_root, downloaded)
+                    _install_remote_workspace(downloaded, workspace)
+                _append_jsonl(
+                    progress_path,
+                    {
+                        "kind": "sandbox_workspace_downloaded",
+                        "backend": "ags",
+                        "sandbox_id": sandbox_id,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except BaseException as exc:
+                payload["ok"] = False
+                payload["workspace_download_error"] = str(exc)
+            finally:
+                try:
+                    backend.close()
+                except BaseException as exc:
+                    payload["sandbox_close_error"] = str(exc)
+                _append_jsonl(
+                    progress_path,
+                    {
+                        "kind": "sandbox_stopped",
+                        "backend": "ags",
+                        "sandbox_id": sandbox_id,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
     _write_json(result_path, payload)
     return 0 if payload["ok"] else 1
 
@@ -410,7 +645,7 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
 def _protocol_ok(mode: str, team: dict[str, Any]) -> bool:
     if mode == "solo":
         return not team["present"]
-    if mode == "adaptive" and not team["present"]:
+    if mode in {"adaptive", "adaptive-team-v2"} and not team["present"]:
         return True
     return bool(
         team["present"]
@@ -419,6 +654,36 @@ def _protocol_ok(mode: str, team: dict[str, Any]) -> bool:
         and team["tasks"] >= 1
         and team["completed_tasks"] == team["tasks"]
     )
+
+
+def _combined_usage(
+    lead_usage: dict[str, Any],
+    worker_usage: dict[str, Any],
+    *,
+    used_team: bool,
+    lead_turns: int,
+) -> dict[str, Any]:
+    """Combine auditable lead/worker token counts and expose coverage explicitly."""
+    lead_input = int(lead_usage.get("input_tokens", 0) or 0)
+    lead_output = int(lead_usage.get("output_tokens", 0) or 0)
+    worker_input = int(worker_usage.get("input_tokens", 0) or 0)
+    worker_output = int(worker_usage.get("output_tokens", 0) or 0)
+    lead_recorded = lead_input > 0 or lead_output > 0
+    worker_recorded = not used_team or worker_input > 0 or worker_output > 0
+    return {
+        "input_tokens": lead_input + worker_input,
+        "output_tokens": lead_output + worker_output,
+        "total_tokens": lead_input + lead_output + worker_input + worker_output,
+        "lead_input_tokens": lead_input,
+        "lead_output_tokens": lead_output,
+        "worker_input_tokens": worker_input,
+        "worker_output_tokens": worker_output,
+        "lead_turns": lead_turns,
+        "worker_turns": int(worker_usage.get("turns", 0) or 0),
+        "lead_recorded": lead_recorded,
+        "worker_recorded": worker_recorded,
+        "complete": lead_recorded and worker_recorded,
+    }
 
 
 def parse_pytest_output(output: str, expected_tests: int, returncode: int) -> dict[str, Any]:
@@ -458,6 +723,12 @@ def _split_score_commands(commands: list[str]) -> tuple[list[str], list[str]]:
     return [], commands
 
 
+def _score_shell_command(setup_commands: list[str], test_commands: list[str]) -> str:
+    """Match upstream: run every command and use the final command's exit status."""
+    commands = [*setup_commands, *test_commands]
+    return "; ".join(f"({command})" for command in commands) or "true"
+
+
 def stage_score_context(task: dict[str, Any], workspace: Path, destination: Path) -> dict[str, Any]:
     if destination.exists():
         shutil.rmtree(destination)
@@ -492,11 +763,9 @@ def stage_score_context(task: dict[str, Any], workspace: Path, destination: Path
         "COPY workspace /workspace",
         "WORKDIR /workspace",
         "ENV PYTHONPATH=/workspace:$PYTHONPATH",
+        "CMD [\"tail\", \"-f\", \"/dev/null\"]",
+        "",
     ]
-    dockerfile_lines.extend(
-        f"RUN {json.dumps(['/bin/bash', '-lc', command])}" for command in setup_commands
-    )
-    dockerfile_lines.extend(["CMD [\"tail\", \"-f\", \"/dev/null\"]", ""])
     dockerfile = destination / "Dockerfile"
     dockerfile.write_text("\n".join(dockerfile_lines), encoding="utf-8")
     return {
@@ -541,7 +810,9 @@ def run_hidden_tests(
             "pytest": parse_pytest_output("", int(task["expected_tests"]), 1),
         }
     test_started = time.monotonic()
-    test_command = " && ".join(f"({command})" for command in metadata["test_commands"])
+    test_command = _score_shell_command(
+        metadata["setup_commands"], metadata["test_commands"]
+    )
     try:
         completed = subprocess.run(
             [
@@ -587,7 +858,179 @@ def run_hidden_tests(
     return result
 
 
-def run_case(
+def run_hidden_tests_ags(
+    task: dict[str, Any],
+    workspace: Path,
+    case_root: Path,
+    *,
+    timeout_s: float,
+    ags_image: str,
+    ags_env_file: Path | None,
+    ags_timeout: str,
+    ags_cpu: str,
+    ags_memory: str,
+    ags_score_tool_id: str | None = None,
+) -> dict[str, Any]:
+    """Score in a fresh AGS instance so hidden tests never enter the agent sandbox."""
+    from src.execution.ags import AGSSettings, AGSWorkspaceBackend
+
+    context = case_root / "score-context"
+    metadata = stage_score_context(task, workspace, context)
+    settings = AGSSettings.from_env(
+        image=ags_image,
+        env_file=ags_env_file,
+        timeout=ags_timeout,
+        cpu=ags_cpu,
+        memory=ags_memory,
+    )
+    score_tool_id = ags_score_tool_id or os.environ.get("AGS_SCORE_TOOL_ID", "").strip()
+    if not score_tool_id:
+        raise RuntimeError(
+            "AGS scoring requires a dedicated no-egress tool; configure AGS_SCORE_TOOL_ID "
+            "or keep --score-backend docker"
+        )
+    settings.tool_id = score_tool_id
+    settings.runtime_timeout = max(settings.runtime_timeout, timeout_s + 30)
+    settings.network_mode = "SANDBOX"
+    started = time.monotonic()
+    backend: Any | None = None
+    sandbox_id = ""
+    test_output = ""
+    returncode = 1
+    timed_out = False
+    test_elapsed = 0.0
+    cleanup_error: str | None = None
+    try:
+        # Creating many sandboxes and uploading all workspaces in one burst can
+        # saturate the AGS runtime gateway even though the service can execute
+        # many tests concurrently. Throttle setup only; release the slot before
+        # the long-running hidden tests so the reward pool can still reach 64.
+        with AGS_SCORE_SETUP_SLOTS:
+            backend = start_ags_backend_with_retry(lambda: AGSWorkspaceBackend(settings))
+            sandbox_id = backend.sandbox_id
+            startup_elapsed = time.monotonic() - started
+            network_probe = backend.exec(
+                "python3 - <<'PY'\n"
+                "import urllib.request\n"
+                "try:\n"
+                " urllib.request.urlopen('https://example.com', timeout=5)\n"
+                "except Exception:\n"
+                " raise SystemExit(0)\n"
+                "raise SystemExit(86)\n"
+                "PY",
+                cwd=backend.workspace_root,
+                timeout_s=15,
+            )
+            if network_probe.exit_code != 0:
+                raise RuntimeError(
+                    "AGS score sandbox has outbound network access; use a SandboxTool whose "
+                    "NetworkConfiguration.NetworkMode is SANDBOX"
+                )
+            # Do not reset /workspace: the fresh task image owns the official package
+            # metadata and hidden tests. Uploading the stripped candidate overlays only
+            # implementation files, matching Docker COPY semantics.
+            backend.upload_tree(context / "workspace", backend.workspace_root)
+            print(
+                f"[{task['id']}] ags-score.upload.completed · sandbox={sandbox_id}",
+                flush=True,
+            )
+        test_command = "export PYTHONPATH=/workspace:${PYTHONPATH:-}; " + _score_shell_command(
+            metadata["setup_commands"], metadata["test_commands"]
+        )
+        test_started = time.monotonic()
+        print(
+            f"[{task['id']}] ags-score.tests.started · timeout={int(timeout_s)}s",
+            flush=True,
+        )
+        completed = backend.exec(
+            test_command,
+            cwd=backend.workspace_root,
+            timeout_s=max(1, int(timeout_s)),
+        )
+        test_elapsed = time.monotonic() - test_started
+        print(
+            f"[{task['id']}] ags-score.tests.completed · "
+            f"exit={completed.exit_code} elapsed={test_elapsed:.1f}s",
+            flush=True,
+        )
+        test_output = f"{completed.stdout}\n{completed.stderr}".strip()
+        returncode = completed.exit_code
+    except TimeoutError as exc:
+        startup_elapsed = time.monotonic() - started
+        test_output = str(exc)
+        returncode = 124
+        timed_out = True
+    except Exception as exc:
+        startup_elapsed = time.monotonic() - started
+        test_output = f"{exc}\n{traceback.format_exc()}"
+        returncode = 1
+    finally:
+        try:
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception as exc:
+                    # Sandbox cleanup is infrastructure housekeeping. It must
+                    # not overwrite a completed hidden-test result and cause
+                    # the whole reward to be retried or marked failed.
+                    cleanup_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            shutil.rmtree(context, ignore_errors=True)
+    (case_root / "hidden-tests.log").write_text(test_output, encoding="utf-8")
+    return {
+        **metadata,
+        "backend": "ags",
+        "image": ags_image,
+        "sandbox_id": sandbox_id or None,
+        "startup_elapsed_s": round(startup_elapsed, 3),
+        "test_elapsed_s": round(test_elapsed, 3),
+        "timed_out": timed_out,
+        "cleanup_error": cleanup_error,
+        "pytest": parse_pytest_output(test_output, int(task["expected_tests"]), returncode),
+    }
+
+
+@dataclasses.dataclass
+class RolloutArtifact:
+    task: dict[str, Any]
+    mode: str
+    case_root: Path
+    workspace: Path
+    start_hash: str
+    agent: dict[str, Any]
+    agent_elapsed_s: float
+    agent_timed_out: bool
+    agent_returncode: int
+
+
+def _require_agent_result(
+    result_path: Path,
+    *,
+    returncode: int,
+    timed_out: bool,
+    stderr: str,
+) -> dict[str, Any]:
+    """Reject harness-level child failures before they can reach reward scoring."""
+    if not result_path.is_file():
+        reason = "timed out" if timed_out else f"exited with code {returncode}"
+        stderr_tail = " ".join(str(stderr).split())[-1_200:]
+        detail = f"; stderr: {stderr_tail}" if stderr_tail else ""
+        raise RuntimeError(
+            f"agent subprocess {reason} without producing {result_path.name}{detail}"
+        )
+    try:
+        agent = _read_json(result_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"agent subprocess produced an invalid {result_path.name}: {exc}") from exc
+    if not isinstance(agent, dict):
+        raise RuntimeError(
+            f"agent subprocess produced a non-object {result_path.name}: "
+            f"{type(agent).__name__}"
+        )
+    return agent
+
+
+def run_rollout(
     task: dict[str, Any],
     mode: str,
     output_root: Path,
@@ -598,10 +1041,16 @@ def run_case(
     teammate_max_turns: int,
     max_output_tokens: int,
     agent_timeout_s: float,
-    score_timeout_s: float,
-    keep_image: bool,
     stream: bool,
-) -> dict[str, Any]:
+    teammate_min_timeout_s: float | None = None,
+    execution_backend: str = "local",
+    ags_image: str | None = None,
+    ags_env_file: Path | None = None,
+    ags_timeout: str = "3h",
+    ags_cpu: str = "2",
+    ags_memory: str = "4Gi",
+) -> RolloutArtifact:
+    """Run only the agent phase and release its rollout slot before scoring."""
     case_root = output_root / task["id"] / mode
     case_root.mkdir(parents=True, exist_ok=True)
     workspace = case_root / "workspace"
@@ -628,58 +1077,137 @@ def run_case(
         str(max_turns),
         "--teammate-max-turns",
         str(teammate_max_turns),
+        "--teammate-min-timeout",
+        str(teammate_min_timeout_s or 0),
         "--max-output-tokens",
         str(max_output_tokens),
         "--progress-file",
         str(progress_path),
+        "--mode",
+        mode,
     ]
     if stream:
         command.append("--stream")
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=agent_timeout_s,
-            env=os.environ.copy(),
+    command.extend(["--execution-backend", execution_backend])
+    if execution_backend == "ags":
+        if not ags_image:
+            raise ValueError("AGS execution requires an image")
+        command.extend(
+            [
+                "--ags-image",
+                ags_image,
+                "--ags-timeout",
+                ags_timeout,
+                "--ags-cpu",
+                ags_cpu,
+                "--ags-memory",
+                ags_memory,
+            ]
         )
-        agent_returncode = completed.returncode
-        stdout, stderr = completed.stdout, completed.stderr
+        if ags_env_file is not None:
+            command.extend(["--ags-env-file", str(ags_env_file)])
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=agent_timeout_s)
+        agent_returncode = process.returncode
         agent_timed_out = False
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=90)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
         agent_returncode = 124
-        stdout, stderr = exc.stdout or "", exc.stderr or ""
         agent_timed_out = True
     agent_elapsed = time.monotonic() - started
     (case_root / "stdout.log").write_text(str(stdout), encoding="utf-8")
     (case_root / "stderr.log").write_text(str(stderr), encoding="utf-8")
-    agent = _read_json(result_path) if result_path.exists() else {
-        "ok": False,
-        "error": "agent timed out" if agent_timed_out else "missing agent result",
-        "lead_usage": {},
-        "lead_turns": 0,
-        "lead_model_calls": 0,
-        "lead_tool_calls": 0,
-    }
-    hidden = run_hidden_tests(
-        task,
-        workspace,
-        case_root,
-        timeout_s=score_timeout_s,
-        keep_image=keep_image,
+    agent = _require_agent_result(
+        result_path,
+        returncode=agent_returncode,
+        timed_out=agent_timed_out,
+        stderr=stderr,
     )
+    return RolloutArtifact(
+        task=task,
+        mode=mode,
+        case_root=case_root,
+        workspace=workspace,
+        start_hash=start_hash,
+        agent=agent,
+        agent_elapsed_s=agent_elapsed,
+        agent_timed_out=agent_timed_out,
+        agent_returncode=agent_returncode,
+    )
+
+
+def score_rollout(
+    rollout: RolloutArtifact,
+    *,
+    provider: str,
+    model: str,
+    score_timeout_s: float,
+    keep_image: bool,
+    execution_backend: str = "local",
+    score_backend: str = "docker",
+    ags_image: str | None = None,
+    ags_env_file: Path | None = None,
+    ags_timeout: str = "3h",
+    ags_cpu: str = "2",
+    ags_memory: str = "4Gi",
+    ags_score_tool_id: str | None = None,
+) -> dict[str, Any]:
+    """Score a completed rollout in the independent reward pool."""
+    task = rollout.task
+    mode = rollout.mode
+    case_root = rollout.case_root
+    workspace = rollout.workspace
+    agent = rollout.agent
+    if score_backend == "ags":
+        if not ags_image:
+            raise ValueError("AGS scoring requires an image")
+        hidden = run_hidden_tests_ags(
+            task,
+            workspace,
+            case_root,
+            timeout_s=score_timeout_s,
+            ags_image=ags_image,
+            ags_env_file=ags_env_file,
+            ags_timeout=ags_timeout,
+            ags_cpu=ags_cpu,
+            ags_memory=ags_memory,
+            ags_score_tool_id=ags_score_tool_id,
+        )
+    else:
+        hidden = run_hidden_tests(
+            task,
+            workspace,
+            case_root,
+            timeout_s=score_timeout_s,
+            keep_image=keep_image,
+        )
     team = _team_metrics(workspace)
     protocol_ok = _protocol_ok(mode, team)
-    integrity_ok = (workspace / "start.md").is_file() and _hash_file(workspace / "start.md") == start_hash
+    integrity_ok = (
+        (workspace / "start.md").is_file()
+        and _hash_file(workspace / "start.md") == rollout.start_hash
+    )
     lead_usage = agent.get("lead_usage") or {}
     worker_usage = team.get("worker_usage") or {}
-    input_tokens = int(lead_usage.get("input_tokens", 0) or 0) + int(
-        worker_usage.get("input_tokens", 0) or 0
-    )
-    output_tokens = int(lead_usage.get("output_tokens", 0) or 0) + int(
-        worker_usage.get("output_tokens", 0) or 0
+    usage = _combined_usage(
+        lead_usage,
+        worker_usage,
+        used_team=bool(team["present"]),
+        lead_turns=int(agent.get("lead_turns", 0) or 0),
     )
     pytest_result = hidden["pytest"]
     result = {
@@ -688,9 +1216,11 @@ def run_case(
         "mode": mode,
         "provider": provider,
         "model": model,
-        "agent_elapsed_s": round(agent_elapsed, 3),
-        "agent_timed_out": agent_timed_out,
-        "agent_returncode": agent_returncode,
+        "execution_backend": execution_backend,
+        "score_backend": score_backend,
+        "agent_elapsed_s": round(rollout.agent_elapsed_s, 3),
+        "agent_timed_out": rollout.agent_timed_out,
+        "agent_returncode": rollout.agent_returncode,
         "agent_ok": bool(agent.get("ok")),
         "agent_error": agent.get("error"),
         "integrity_ok": integrity_ok,
@@ -698,13 +1228,7 @@ def run_case(
         "used_team": team["present"],
         "quality_score": pytest_result["quality_score"] if integrity_ok else 0.0,
         "success": bool(agent.get("ok") and integrity_ok and protocol_ok and pytest_result["all_passed"]),
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "lead_turns": int(agent.get("lead_turns", 0) or 0),
-            "worker_turns": int(worker_usage.get("turns", 0) or 0),
-        },
+        "usage": usage,
         "calls": {
             "model": team["trace_model_calls"] if team["present"] else agent.get("lead_model_calls", 0),
             "tools": team["trace_tool_calls"] if team["present"] else agent.get("lead_tool_calls", 0),
@@ -715,6 +1239,292 @@ def run_case(
     }
     _write_json(case_root / "result.json", result)
     return result
+
+
+def rescore_existing_case(
+    task: dict[str, Any],
+    mode: str,
+    output_root: Path,
+    *,
+    score_backend: str,
+    score_timeout_s: float,
+    keep_image: bool,
+    ags_image: str | None = None,
+    ags_env_file: Path | None = None,
+    ags_timeout: str = "3h",
+    ags_cpu: str = "2",
+    ags_memory: str = "4Gi",
+    ags_score_tool_id: str | None = None,
+) -> dict[str, Any]:
+    """Re-run only hidden tests for a persisted rollout workspace."""
+    case_root = output_root / task["id"] / mode
+    workspace = case_root / "workspace"
+    result_path = case_root / "result.json"
+    if not workspace.is_dir() or not result_path.is_file():
+        raise FileNotFoundError(f"completed case not found: {case_root}")
+    result = _read_json(result_path)
+    previous_reward = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "quality_score": result.get("quality_score"),
+        "success": result.get("success"),
+        "hidden_tests": result.get("hidden_tests"),
+    }
+    if score_backend == "ags":
+        if not ags_image:
+            raise ValueError("AGS scoring requires an image")
+        hidden = run_hidden_tests_ags(
+            task,
+            workspace,
+            case_root,
+            timeout_s=score_timeout_s,
+            ags_image=ags_image,
+            ags_env_file=ags_env_file,
+            ags_timeout=ags_timeout,
+            ags_cpu=ags_cpu,
+            ags_memory=ags_memory,
+            ags_score_tool_id=ags_score_tool_id,
+        )
+    else:
+        hidden = run_hidden_tests(
+            task,
+            workspace,
+            case_root,
+            timeout_s=score_timeout_s,
+            keep_image=keep_image,
+        )
+    pytest_result = hidden["pytest"]
+    result.setdefault("reward_history", []).append(previous_reward)
+    result["score_backend"] = score_backend
+    result["hidden_tests"] = hidden
+    result["quality_score"] = (
+        pytest_result["quality_score"] if result.get("integrity_ok") else 0.0
+    )
+    result["success"] = bool(
+        result.get("agent_ok")
+        and result.get("integrity_ok")
+        and result.get("protocol_ok")
+        and pytest_result["all_passed"]
+    )
+    result["rescored_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json(result_path, result)
+    return result
+
+
+def run_case(
+    task: dict[str, Any],
+    mode: str,
+    output_root: Path,
+    *,
+    provider: str,
+    model: str,
+    max_turns: int,
+    teammate_max_turns: int,
+    max_output_tokens: int,
+    agent_timeout_s: float,
+    score_timeout_s: float,
+    keep_image: bool,
+    stream: bool,
+    execution_backend: str = "local",
+    score_backend: str = "docker",
+    ags_image: str | None = None,
+    ags_env_file: Path | None = None,
+    ags_timeout: str = "3h",
+    ags_cpu: str = "2",
+    ags_memory: str = "4Gi",
+    ags_score_tool_id: str | None = None,
+) -> dict[str, Any]:
+    """Run and score one case sequentially for API compatibility."""
+    rollout = run_rollout(
+        task,
+        mode,
+        output_root,
+        provider=provider,
+        model=model,
+        max_turns=max_turns,
+        teammate_max_turns=teammate_max_turns,
+        max_output_tokens=max_output_tokens,
+        agent_timeout_s=agent_timeout_s,
+        stream=stream,
+        execution_backend=execution_backend,
+        ags_image=ags_image,
+        ags_env_file=ags_env_file,
+        ags_timeout=ags_timeout,
+        ags_cpu=ags_cpu,
+        ags_memory=ags_memory,
+    )
+    return score_rollout(
+        rollout,
+        provider=provider,
+        model=model,
+        score_timeout_s=score_timeout_s,
+        keep_image=keep_image,
+        execution_backend=execution_backend,
+        score_backend=score_backend,
+        ags_image=ags_image,
+        ags_env_file=ags_env_file,
+        ags_timeout=ags_timeout,
+        ags_cpu=ags_cpu,
+        ags_memory=ags_memory,
+        ags_score_tool_id=ags_score_tool_id,
+    )
+
+
+def _failed_case_result(
+    task: dict[str, Any],
+    mode: str,
+    phase: str,
+    error: Exception,
+    *,
+    output_root: Path,
+    provider: str,
+    model: str,
+    execution_backend: str,
+    score_backend: str,
+) -> dict[str, Any]:
+    """Persist a scheduler-level failure without aborting the remaining cases."""
+    case_root = output_root / task["id"] / mode
+    case_root.mkdir(parents=True, exist_ok=True)
+    message = f"{type(error).__name__}: {error}"
+    (case_root / f"{phase}-error.log").write_text(message + "\n", encoding="utf-8")
+    pytest_result = parse_pytest_output("", int(task["expected_tests"]), 1)
+    result = {
+        "task": task["id"],
+        "difficulty": task["difficulty"],
+        "mode": mode,
+        "provider": provider,
+        "model": model,
+        "execution_backend": execution_backend,
+        "score_backend": score_backend,
+        "agent_elapsed_s": 0.0,
+        "agent_timed_out": False,
+        "agent_returncode": 1,
+        "agent_ok": False,
+        "agent_error": f"{phase} failed: {message}",
+        "integrity_ok": False,
+        "protocol_ok": False,
+        "used_team": False,
+        "quality_score": 0.0,
+        "success": False,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "lead_turns": 0,
+            "worker_turns": 0,
+        },
+        "calls": {"model": 0, "tools": 0},
+        "team": {
+            "present": False,
+            "agents": [],
+            "peer_messages": 0,
+            "worker_usage": {},
+        },
+        "hidden_tests": {"error": message, "pytest": pytest_result},
+        "workspace": str(case_root / "workspace"),
+        "failure_phase": phase,
+    }
+    _write_json(case_root / "result.json", result)
+    return result
+
+
+def run_evaluation_pool(
+    cases: list[tuple[dict[str, Any], str]],
+    rollout_fn: Callable[[dict[str, Any], str], RolloutArtifact],
+    reward_fn: Callable[[RolloutArtifact], dict[str, Any]],
+    *,
+    rollout_concurrency: int,
+    reward_concurrency: int,
+    failure_fn: Callable[
+        [dict[str, Any], str, str, Exception], dict[str, Any]
+    ] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Continuously refill rollout slots while scoring in a separate pool."""
+    if rollout_concurrency < 1 or reward_concurrency < 1:
+        raise ValueError("rollout and reward concurrency must be positive")
+    started = time.monotonic()
+    event_lock = threading.Lock()
+
+    def emit(event: str, task: dict[str, Any], mode: str, **extra: Any) -> None:
+        if on_event is None:
+            return
+        value = {
+            "event": event,
+            "task": task["id"],
+            "mode": mode,
+            "elapsed_s": round(time.monotonic() - started, 3),
+            **extra,
+        }
+        with event_lock:
+            on_event(value)
+
+    def perform_rollout(
+        index: int, task: dict[str, Any], mode: str
+    ) -> tuple[int, dict[str, Any], str, RolloutArtifact | None, Exception | None]:
+        emit("rollout.started", task, mode)
+        try:
+            artifact = rollout_fn(task, mode)
+        except Exception as exc:
+            emit("rollout.failed", task, mode, error_type=type(exc).__name__)
+            return index, task, mode, None, exc
+        emit("rollout.completed", task, mode)
+        return index, task, mode, artifact, None
+
+    def perform_reward(
+        index: int, task: dict[str, Any], mode: str, artifact: RolloutArtifact
+    ) -> tuple[int, dict[str, Any], str, dict[str, Any] | None, Exception | None]:
+        emit("reward.started", task, mode)
+        try:
+            result = reward_fn(artifact)
+        except Exception as exc:
+            emit("reward.failed", task, mode, error_type=type(exc).__name__)
+            return index, task, mode, None, exc
+        emit(
+            "reward.completed",
+            task,
+            mode,
+            quality_score=result.get("quality_score"),
+            success=bool(result.get("success")),
+        )
+        return index, task, mode, result, None
+
+    indexed_results: list[tuple[int, dict[str, Any]]] = []
+    reward_futures: dict[Any, tuple[int, dict[str, Any], str]] = {}
+    with (
+        ThreadPoolExecutor(
+            max_workers=rollout_concurrency, thread_name_prefix="nl2repo-rollout"
+        ) as rollout_pool,
+        ThreadPoolExecutor(
+            max_workers=reward_concurrency, thread_name_prefix="nl2repo-reward"
+        ) as reward_pool,
+    ):
+        rollout_futures = [
+            rollout_pool.submit(perform_rollout, index, task, mode)
+            for index, (task, mode) in enumerate(cases)
+        ]
+        for future in as_completed(rollout_futures):
+            index, task, mode, artifact, error = future.result()
+            if error is not None:
+                if failure_fn is None:
+                    raise error
+                indexed_results.append((index, failure_fn(task, mode, "rollout", error)))
+                continue
+            assert artifact is not None
+            reward_future = reward_pool.submit(
+                perform_reward, index, task, mode, artifact
+            )
+            reward_futures[reward_future] = (index, task, mode)
+
+        for future in as_completed(reward_futures):
+            index, task, mode, result, error = future.result()
+            if error is not None:
+                if failure_fn is None:
+                    raise error
+                result = failure_fn(task, mode, "reward", error)
+            assert result is not None
+            indexed_results.append((index, result))
+
+    return [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
 
 
 def render_report(results: list[dict[str, Any]], run_id: str, upstream_ref: str) -> str:
@@ -791,15 +1601,32 @@ def _child_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True)
     parser.add_argument("--max-turns", type=int, required=True)
     parser.add_argument("--teammate-max-turns", type=int, required=True)
+    parser.add_argument("--teammate-min-timeout", type=float, default=0)
     parser.add_argument("--max-output-tokens", type=int, required=True)
     parser.add_argument("--progress-file", type=Path, required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("solo", "adaptive", "adaptive-team-v2", "forced-team"),
+        default="adaptive",
+    )
     parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--execution-backend", choices=("local", "ags"), default="local")
+    parser.add_argument("--ags-image")
+    parser.add_argument("--ags-env-file", type=Path)
+    parser.add_argument("--ags-timeout", default="3h")
+    parser.add_argument("--ags-cpu", default="2")
+    parser.add_argument("--ags-memory", default="4Gi")
     return parser
 
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "_run-one":
         args = _child_parser().parse_args()
+        def terminate_child(signum: int, frame: Any) -> None:
+            raise InterruptedError(f"agent child received signal {signum}")
+
+        signal.signal(signal.SIGTERM, terminate_child)
+        signal.signal(signal.SIGINT, terminate_child)
         return _run_agent_child(
             args.workspace.resolve(),
             args.prompt_file.resolve(),
@@ -811,28 +1638,90 @@ def main() -> int:
             args.max_output_tokens,
             args.stream,
             args.progress_file.resolve(),
+            teammate_min_timeout_s=args.teammate_min_timeout or None,
+            mode=args.mode,
+            execution_backend=args.execution_backend,
+            ags_image=args.ags_image,
+            ags_env_file=args.ags_env_file.resolve() if args.ags_env_file else None,
+            ags_timeout=args.ags_timeout,
+            ags_cpu=args.ags_cpu,
+            ags_memory=args.ags_memory,
         )
 
     parser = argparse.ArgumentParser(description="Run Clawd against pinned NL2Repo-Bench tasks.")
     parser.add_argument("--list", action="store_true", help="List all upstream tasks")
     parser.add_argument("--validate", action="store_true", help="Validate task metadata and images")
-    parser.add_argument("--task", action="append", help="Task ID; repeat to select several")
+    parser.add_argument("--plan", action="store_true", help="Print the resolved cases without running")
+    parser.add_argument(
+        "--rescore",
+        action="store_true",
+        help="Re-run only reward evaluation for completed --task cases in --output",
+    )
+    parser.add_argument("--task", action="append", help="Task ID; repeat to override --task-set")
+    parser.add_argument(
+        "--task-set",
+        choices=("pilot", "qwen32"),
+        default="pilot",
+        help="Built-in task selection; qwen32 is the fixed latency-probe subset",
+    )
     parser.add_argument(
         "--mode",
-        choices=("solo", "adaptive", "forced-team", "both", "all"),
-        default="both",
+        choices=("solo", "adaptive", "adaptive-team-v2", "forced-team", "both", "all"),
+        help="Defaults to adaptive for qwen32 and both for the pilot set",
     )
     parser.add_argument("--provider", default="anthropic")
     parser.add_argument("--model", default="glm-5.2")
     parser.add_argument("--max-turns", type=int, default=300)
-    parser.add_argument("--teammate-max-turns", type=int, default=80)
+    parser.add_argument("--teammate-max-turns", type=int, default=160)
+    parser.add_argument(
+        "--teammate-min-timeout",
+        type=float,
+        default=900.0,
+        help="Minimum effective timeout for each TeamRun call",
+    )
     parser.add_argument("--max-output-tokens", type=int, default=16384)
     parser.add_argument("--agent-timeout", type=float, default=7200.0)
     parser.add_argument("--score-timeout", type=float, default=1200.0)
+    parser.add_argument(
+        "--rollout-concurrency",
+        type=int,
+        help="Agent rollout slots; defaults to 8 for qwen32 and 1 otherwise",
+    )
+    parser.add_argument(
+        "--reward-concurrency",
+        type=int,
+        default=4,
+        help="Independent hidden-test workers; these never occupy rollout slots",
+    )
     parser.add_argument("--upstream-root", type=Path)
     parser.add_argument("--cache-root", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--keep-image", action="store_true")
+    parser.add_argument(
+        "--execution-backend",
+        choices=("local", "ags"),
+        default="local",
+        help="Where Bash and file tools execute",
+    )
+    parser.add_argument(
+        "--score-backend",
+        choices=("docker", "ags"),
+        default="docker",
+        help="Where the official hidden suite executes",
+    )
+    parser.add_argument("--ags-env-file", type=Path)
+    parser.add_argument("--ags-timeout", default="3h", help="AGS instance TTL")
+    parser.add_argument("--ags-cpu", default="2")
+    parser.add_argument("--ags-memory", default="4Gi")
+    parser.add_argument(
+        "--ags-score-tool-id",
+        help="Dedicated AGS SandboxTool configured with NetworkMode=SANDBOX",
+    )
+    parser.add_argument(
+        "--ags-image-template",
+        default=AGS_IMAGE_TEMPLATE,
+        help="Task image template; {task} is replaced with the NL2Repo task ID",
+    )
     parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
@@ -851,56 +1740,269 @@ def main() -> int:
             )
         return 0
 
-    task_names = args.task or list(PILOT_TASKS)
+    selected_task_set = "custom" if args.task else args.task_set
+    if args.task:
+        task_names = args.task
+    elif args.task_set == "qwen32":
+        task_names = select_task_subset(list_tasks(upstream_root))
+    else:
+        task_names = list(PILOT_TASKS)
+    if len(set(task_names)) != len(task_names):
+        parser.error("task IDs must be unique")
     tasks = [load_task(upstream_root, name) for name in task_names]
+    rollout_concurrency = args.rollout_concurrency
+    if rollout_concurrency is None:
+        rollout_concurrency = 8 if selected_task_set == "qwen32" else 1
+    if rollout_concurrency < 1:
+        parser.error("--rollout-concurrency must be positive")
+    if args.reward_concurrency < 1:
+        parser.error("--reward-concurrency must be positive")
+
+    selected_mode = args.mode
+    if selected_mode is None:
+        selected_mode = "adaptive" if selected_task_set == "qwen32" else "both"
+    if selected_mode == "both":
+        modes = ("solo", "adaptive")
+    elif selected_mode == "all":
+        modes = ("solo", "adaptive", "forced-team")
+    else:
+        modes = (selected_mode,)
+    cases = [(task, mode) for task in tasks for mode in modes]
+
+    if args.rescore:
+        if args.output is None:
+            parser.error("--rescore requires --output pointing to an existing run")
+        output_root = args.output.resolve()
+        ags_env_file = args.ags_env_file.resolve() if args.ags_env_file else None
+        rescored: list[dict[str, Any]] = []
+        for task, mode in cases:
+            print(f"[{task['id']}] rescoring {mode}...", flush=True)
+            result = rescore_existing_case(
+                task,
+                mode,
+                output_root,
+                score_backend=args.score_backend,
+                score_timeout_s=args.score_timeout,
+                keep_image=args.keep_image,
+                ags_image=format_ags_image(args.ags_image_template, task["id"]),
+                ags_env_file=ags_env_file,
+                ags_timeout=args.ags_timeout,
+                ags_cpu=args.ags_cpu,
+                ags_memory=args.ags_memory,
+                ags_score_tool_id=args.ags_score_tool_id,
+            )
+            tests = result["hidden_tests"]["pytest"]
+            print(
+                f"  quality={result['quality_score']:.2f} "
+                f"passed={tests['passed']}/{tests['expected']} "
+                f"success={result['success']}",
+                flush=True,
+            )
+            rescored.append(result)
+        return 0 if all(not result["hidden_tests"].get("error") for result in rescored) else 2
+
+    if args.plan:
+        print(
+            json.dumps(
+                {
+                    "task_set": selected_task_set,
+                    "tasks": task_names,
+                    "modes": list(modes),
+                    "cases": len(cases),
+                    "max_turns": args.max_turns,
+                    "rollout_concurrency": rollout_concurrency,
+                    "reward_concurrency": args.reward_concurrency,
+                    "reward_uses_rollout_slots": False,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
     if args.validate:
-        errors = validate_tasks(tasks)
+        if args.execution_backend == "ags" or args.score_backend == "ags":
+            from src.execution.ags import AGSSettings, ensure_swerex_importable
+
+            image = format_ags_image(args.ags_image_template, tasks[0]["id"])
+            settings = AGSSettings.from_env(
+                image=image,
+                env_file=args.ags_env_file,
+                timeout=args.ags_timeout,
+                cpu=args.ags_cpu,
+                memory=args.ags_memory,
+            )
+            settings.validate()
+            ensure_swerex_importable(settings)
+            errors = []
+            if args.score_backend == "ags":
+                score_tool_id = args.ags_score_tool_id or os.environ.get(
+                    "AGS_SCORE_TOOL_ID", ""
+                ).strip()
+                if not score_tool_id:
+                    errors.append(
+                        "AGS scoring requires AGS_SCORE_TOOL_ID for a dedicated SANDBOX "
+                        "network-mode tool; otherwise use --score-backend docker"
+                    )
+        else:
+            errors = validate_tasks(tasks)
         if errors:
             for error in errors:
                 print(f"- {error}")
             return 1
-        print(f"{len(tasks)} NL2Repo tasks and Docker images are available")
+        print(
+            f"{len(tasks)} NL2Repo tasks are configured for "
+            f"execution={args.execution_backend} scoring={args.score_backend}; "
+            f"cases={len(cases)} rollout_pool={rollout_concurrency} "
+            f"reward_pool={args.reward_concurrency}"
+        )
         return 0
 
-    if args.mode == "both":
-        modes = ("solo", "adaptive")
-    elif args.mode == "all":
-        modes = ("solo", "adaptive", "forced-team")
-    else:
-        modes = (args.mode,)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    started_at = datetime.now(timezone.utc)
+    run_id = started_at.strftime("%Y%m%dT%H%M%SZ")
     output_root = (args.output or ROOT / "runs" / run_id).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    results: list[dict[str, Any]] = []
-    for task in tasks:
-        for mode in modes:
-            print(f"[{task['id']}] running {mode}...", flush=True)
-            result = run_case(
-                task,
-                mode,
-                output_root,
-                provider=args.provider,
-                model=args.model,
-                max_turns=args.max_turns,
-                teammate_max_turns=args.teammate_max_turns,
-                max_output_tokens=args.max_output_tokens,
-                agent_timeout_s=args.agent_timeout,
-                score_timeout_s=args.score_timeout,
-                keep_image=args.keep_image,
-                stream=args.stream,
-            )
-            results.append(result)
+    _write_json(
+        output_root / "run-metadata.json",
+        {
+            "schema_version": 1,
+            "run_id": run_id,
+            "started_at": started_at.isoformat(),
+            "upstream_ref": UPSTREAM_REF,
+            "task_set": selected_task_set,
+            "tasks": task_names,
+            "modes": list(modes),
+            "cases": len(cases),
+            "provider": args.provider,
+            "model": args.model,
+            "execution_backend": args.execution_backend,
+            "score_backend": args.score_backend,
+            "max_turns": args.max_turns,
+            "teammate_max_turns": args.teammate_max_turns,
+            "teammate_min_timeout_s": args.teammate_min_timeout,
+            "rollout_concurrency": rollout_concurrency,
+            "reward_concurrency": args.reward_concurrency,
+            "reward_uses_rollout_slots": False,
+        },
+    )
+    scheduler_path = output_root / "scheduler.jsonl"
+    ags_env_file = args.ags_env_file.resolve() if args.ags_env_file else None
+
+    def rollout_task(task: dict[str, Any], mode: str) -> RolloutArtifact:
+        return run_rollout(
+            task,
+            mode,
+            output_root,
+            provider=args.provider,
+            model=args.model,
+            max_turns=args.max_turns,
+            teammate_max_turns=args.teammate_max_turns,
+            teammate_min_timeout_s=args.teammate_min_timeout,
+            max_output_tokens=args.max_output_tokens,
+            agent_timeout_s=args.agent_timeout,
+            stream=args.stream,
+            execution_backend=args.execution_backend,
+            ags_image=format_ags_image(args.ags_image_template, task["id"]),
+            ags_env_file=ags_env_file,
+            ags_timeout=args.ags_timeout,
+            ags_cpu=args.ags_cpu,
+            ags_memory=args.ags_memory,
+        )
+
+    def reward_task(rollout: RolloutArtifact) -> dict[str, Any]:
+        return score_rollout(
+            rollout,
+            provider=args.provider,
+            model=args.model,
+            score_timeout_s=args.score_timeout,
+            keep_image=args.keep_image,
+            execution_backend=args.execution_backend,
+            score_backend=args.score_backend,
+            ags_image=format_ags_image(args.ags_image_template, rollout.task["id"]),
+            ags_env_file=ags_env_file,
+            ags_timeout=args.ags_timeout,
+            ags_cpu=args.ags_cpu,
+            ags_memory=args.ags_memory,
+            ags_score_tool_id=args.ags_score_tool_id,
+        )
+
+    def failed_task(
+        task: dict[str, Any], mode: str, phase: str, error: Exception
+    ) -> dict[str, Any]:
+        return _failed_case_result(
+            task,
+            mode,
+            phase,
+            error,
+            output_root=output_root,
+            provider=args.provider,
+            model=args.model,
+            execution_backend=args.execution_backend,
+            score_backend=args.score_backend,
+        )
+
+    def scheduler_event(event: dict[str, Any]) -> None:
+        _append_jsonl(scheduler_path, event)
+        event_name = event["event"]
+        if event_name == "rollout.started":
+            print(f"[{event['task']}] rollout started ({event['mode']})", flush=True)
+        elif event_name == "rollout.completed":
             print(
-                f"  quality={result['quality_score']:.2f} success={result['success']} "
-                f"time={result['agent_elapsed_s']:.1f}s tokens={result['usage']['total_tokens']}",
+                f"[{event['task']}] rollout complete; slot released, reward queued",
                 flush=True,
             )
+        elif event_name == "reward.completed":
+            print(
+                f"[{event['task']}] reward={event.get('quality_score', 0):.2f} "
+                f"success={event.get('success', False)}",
+                flush=True,
+            )
+        elif event_name.endswith(".failed"):
+            print(
+                f"[{event['task']}] {event_name}: {event.get('error_type')}",
+                flush=True,
+            )
+
+    print(
+        f"Starting {len(cases)} cases with rollout_pool={rollout_concurrency}, "
+        f"reward_pool={args.reward_concurrency}, max_turns={args.max_turns}",
+        flush=True,
+    )
+    results = run_evaluation_pool(
+        cases,
+        rollout_task,
+        reward_task,
+        rollout_concurrency=rollout_concurrency,
+        reward_concurrency=args.reward_concurrency,
+        failure_fn=failed_task,
+        on_event=scheduler_event,
+    )
     aggregate = {
         "run_id": run_id,
         "upstream_url": UPSTREAM_URL,
         "upstream_ref": UPSTREAM_REF,
         "provider": args.provider,
         "model": args.model,
+        "execution_backend": args.execution_backend,
+        "score_backend": args.score_backend,
+        "task_set": selected_task_set,
+        "run_config": {
+            "tasks": len(tasks),
+            "cases": len(cases),
+            "max_turns": args.max_turns,
+            "teammate_max_turns": args.teammate_max_turns,
+            "teammate_min_timeout_s": args.teammate_min_timeout,
+            "max_output_tokens": args.max_output_tokens,
+            "agent_timeout_s": args.agent_timeout,
+            "score_timeout_s": args.score_timeout,
+            "rollout_concurrency": rollout_concurrency,
+            "reward_concurrency": args.reward_concurrency,
+            "reward_uses_rollout_slots": False,
+            "stream": args.stream,
+            "ags_timeout": args.ags_timeout if "ags" in {args.execution_backend, args.score_backend} else None,
+            "ags_cpu": args.ags_cpu if "ags" in {args.execution_backend, args.score_backend} else None,
+            "ags_memory": args.ags_memory if "ags" in {args.execution_backend, args.score_backend} else None,
+            "ags_image_template": args.ags_image_template if "ags" in {args.execution_backend, args.score_backend} else None,
+        },
         "results": results,
     }
     _write_json(output_root / "results.json", aggregate)

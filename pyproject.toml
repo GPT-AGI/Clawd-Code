@@ -39,6 +39,10 @@ dev = [
     "twine>=5.0.0",
     "pytest>=8.0.0",
 ]
+ags = [
+    "aiohttp>=3.10",
+    "swe-rex>=1.4.0",
+]
 
 [project.scripts]
 clawd = "src.cli:main"

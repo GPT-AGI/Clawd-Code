@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NL2Repo Evaluation Console</title>
+  <style>
+    :root {
+      --ink: #19232b;
+      --muted: #65717a;
+      --paper: #f3f0e8;
+      --panel: #fffdf7;
+      --line: #d8d2c6;
+      --line-strong: #bcb5a7;
+      --night: #172128;
+      --cyan: #0e7f8a;
+      --cyan-soft: #d8eceb;
+      --orange: #c9632c;
+      --orange-soft: #f5dfd1;
+      --green: #39724e;
+      --green-soft: #dce9dc;
+      --red: #b1463b;
+      --red-soft: #f0d8d3;
+      --yellow: #9b721a;
+      --yellow-soft: #eee4c5;
+      --mono: "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+      --sans: "Avenir Next", Avenir, Inter, system-ui, sans-serif;
+      --serif: Iowan Old Style, Charter, Georgia, serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: var(--sans);
+      font-size: 14px;
+    }
+    button, input, select { font: inherit; }
+    button { color: inherit; }
+    .topbar {
+      min-height: 58px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 10px 22px;
+      color: #f8f5ec;
+      background: var(--night);
+      border-bottom: 3px solid var(--cyan);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+    .brand strong { font-family: var(--serif); font-size: 21px; font-weight: 650; letter-spacing: .02em; }
+    .brand span { color: #8ccdd0; font: 700 10px/1 var(--mono); letter-spacing: .16em; }
+    .run-title { min-width: 0; flex: 1; color: #bbc5c8; font: 12px/1.3 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .run-select { height: 30px; max-width: 310px; padding: 0 8px; border: 1px solid #46545b; color: #e6e8e3; background: var(--night); font: 10px/1 var(--mono); }
+    .live-wrap { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+    .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .live-dot.live { background: #62c889; box-shadow: 0 0 0 4px rgba(98,200,137,.12); }
+    .live-dot.stale, .live-dot.idle, .live-dot.waiting { background: #e1a351; }
+    .live-dot.completed { background: #6ab5bb; }
+    .live-text { color: #cbd3d4; font: 700 10px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+    .refresh-control { display: flex; border: 1px solid #46545b; }
+    .refresh-control button, .refresh-control select {
+      height: 30px; border: 0; background: transparent; color: #e6e8e3; padding: 0 9px;
+    }
+    .refresh-control button { border-right: 1px solid #46545b; cursor: pointer; }
+    .refresh-control button:hover { background: #26343c; }
+    .refresh-control select { font-family: var(--mono); font-size: 11px; }
+    main { padding: 22px; max-width: 1800px; margin: 0 auto; }
+    .run-strip {
+      display: grid;
+      grid-template-columns: minmax(260px, 1.35fr) repeat(5, minmax(100px, .55fr));
+      border: 1px solid var(--line-strong);
+      background: var(--panel);
+    }
+    .run-ident { padding: 16px 18px; border-right: 1px solid var(--line); min-width: 0; }
+    .eyebrow { color: var(--cyan); font: 700 10px/1.2 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 6px 0 5px; font-family: var(--serif); font-size: clamp(20px, 2vw, 29px); font-weight: 600; line-height: 1.06; overflow-wrap: anywhere; }
+    .run-meta { color: var(--muted); font: 11px/1.5 var(--mono); }
+    .metric { padding: 14px 15px; border-right: 1px solid var(--line); min-width: 0; }
+    .metric:last-child { border-right: 0; }
+    .metric-label { color: var(--muted); font: 700 9px/1.2 var(--mono); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
+    .metric-value { margin-top: 6px; font: 600 23px/1 var(--mono); font-variant-numeric: tabular-nums; }
+    .metric-sub { margin-top: 5px; color: var(--muted); font: 10px/1.25 var(--mono); }
+    .progress-rack {
+      margin-top: 12px;
+      display: grid;
+      grid-template-columns: 1.4fr 1fr 1fr;
+      border: 1px solid var(--line-strong);
+      background: var(--panel);
+    }
+    .progress-cell { padding: 11px 14px 12px; border-right: 1px solid var(--line); }
+    .progress-cell:last-child { border-right: 0; }
+    .progress-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 7px; color: var(--muted); font: 10px/1 var(--mono); }
+    .track { height: 6px; background: #dfdbd1; overflow: hidden; }
+    .fill { height: 100%; width: 0; background: var(--cyan); transition: width .35s ease; }
+    .fill.orange { background: var(--orange); }
+    .fill.green { background: var(--green); }
+    .toolbar {
+      margin-top: 18px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 40px;
+    }
+    .view-switch { display: inline-flex; border: 1px solid var(--line-strong); background: var(--panel); }
+    .view-switch button { border: 0; border-right: 1px solid var(--line); padding: 8px 13px; background: transparent; cursor: pointer; font: 700 11px/1 var(--mono); }
+    .view-switch button:last-child { border-right: 0; }
+    .view-switch button.active { background: var(--night); color: #fff; }
+    .toolbar-spacer { flex: 1; }
+    .filter, .search {
+      height: 34px; border: 1px solid var(--line-strong); background: var(--panel); color: var(--ink); padding: 0 10px; font-size: 12px;
+    }
+    .search { width: min(260px, 30vw); }
+    .issue-toggle { height: 34px; border: 1px solid var(--line-strong); background: var(--panel); padding: 0 11px; cursor: pointer; font: 700 10px/1 var(--mono); }
+    .issue-toggle.active { color: var(--red); border-color: var(--red); background: var(--red-soft); }
+    .queue-alert { height: 34px; display: flex; align-items: center; padding: 0 11px; color: var(--orange); border: 1px solid var(--orange); background: var(--orange-soft); font: 700 10px/1 var(--mono); letter-spacing: .04em; }
+    .scale-control { height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 9px; border: 1px solid var(--line-strong); background: var(--panel); font: 700 9px/1 var(--mono); white-space: nowrap; }
+    .scale-control label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+    .slot-input { width: 42px; height: 24px; box-sizing: border-box; border: 1px solid var(--line); background: #fffefb; color: var(--ink); text-align: center; font: 700 10px/1 var(--mono); }
+    .scale-apply { height: 24px; border: 0; padding: 0 8px; color: #fff; background: var(--night); cursor: pointer; font: 700 9px/1 var(--mono); }
+    .scale-apply:disabled { opacity: .45; cursor: wait; }
+    .view { display: none; }
+    .view.active { display: block; }
+    .global-shell { border: 1px solid var(--line-strong); background: var(--panel); }
+    .global-head { display: flex; align-items: baseline; justify-content: space-between; gap: 18px; padding: 15px 17px; border-bottom: 1px solid var(--line-strong); background: #e9e5dc; }
+    .global-head h2 { margin: 0; font: 600 22px/1.1 var(--serif); }
+    .global-head p { margin: 0; color: var(--muted); font: 10px/1.4 var(--mono); }
+    .global-metrics { display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); border-bottom: 1px solid var(--line-strong); }
+    .global-metric { min-width: 0; padding: 13px 15px; border-right: 1px solid var(--line); }
+    .global-metric:last-child { border-right: 0; }
+    .global-metric label { color: var(--muted); font: 700 9px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .global-metric strong { display: block; margin-top: 7px; font: 700 20px/1 var(--mono); }
+    .global-metric span { display: block; margin-top: 5px; color: var(--muted); font: 9px/1.35 var(--mono); }
+    .global-pools { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line-strong); }
+    .pool-cell { padding: 13px 15px 14px; border-right: 1px solid var(--line); }
+    .pool-cell:last-child { border-right: 0; }
+    .pool-title { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; font: 700 10px/1 var(--mono); text-transform: uppercase; }
+    .pool-title span { color: var(--muted); font-weight: 500; }
+    .slot-track { height: 9px; background: #dfdbd1; overflow: hidden; }
+    .slot-fill { height: 100%; background: var(--cyan); transition: width .35s ease; }
+    .slot-fill.reward { background: var(--orange); }
+    .global-table { max-height: calc(100vh - 480px); overflow: auto; min-height: 280px; }
+    .global-table table { min-width: 1080px; }
+    .global-table tr.current { background: var(--cyan-soft); }
+    .batch-progress { min-width: 150px; }
+    .batch-progress .track { height: 4px; margin-top: 6px; }
+    .slot-pair { font: 700 13px/1 var(--mono); white-space: nowrap; }
+    .slot-pair .reward { color: var(--orange); }
+    .table-shell { border: 1px solid var(--line-strong); background: var(--panel); overflow: auto; max-height: calc(100vh - 315px); min-height: 280px; }
+    table { width: 100%; border-collapse: collapse; min-width: 1120px; }
+    thead { position: sticky; top: 0; z-index: 3; }
+    th { padding: 10px 11px; background: #e9e5dc; color: #536068; border-bottom: 1px solid var(--line-strong); border-right: 1px solid var(--line); text-align: left; font: 700 9px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    td { padding: 10px 11px; border-bottom: 1px solid #e6e1d7; border-right: 1px solid #eee9df; vertical-align: middle; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #f0f3ed; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .index { width: 36px; color: #9b958b; font: 10px/1 var(--mono); text-align: right; }
+    .task-name { font: 700 12px/1.25 var(--mono); }
+    .task-mode { color: var(--muted); font: 9px/1.3 var(--mono); margin-top: 2px; }
+    .badge { display: inline-flex; align-items: center; gap: 5px; min-width: 76px; padding: 4px 6px; border: 1px solid currentColor; font: 700 9px/1 var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+    .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .status-queued { color: #777b7b; background: #eeece6; }
+    .status-running { color: var(--cyan); background: var(--cyan-soft); }
+    .status-rewarding, .status-reward_waiting { color: var(--orange); background: var(--orange-soft); }
+    .status-scored, .status-success { color: var(--green); background: var(--green-soft); }
+    .status-infra_error { color: var(--red); background: var(--red-soft); }
+    .tiny-tag { margin-left: 5px; color: var(--cyan); font: 700 8px/1 var(--mono); text-transform: uppercase; }
+    .turn-cell { min-width: 125px; }
+    .turn-top { display: flex; justify-content: space-between; gap: 8px; font: 10px/1 var(--mono); }
+    .micro-track { height: 3px; margin-top: 6px; background: #e1ddd4; }
+    .micro-fill { height: 100%; background: var(--cyan); }
+    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .muted { color: var(--muted); }
+    .last-action { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 10px/1.3 var(--mono); }
+    .score { font: 700 14px/1 var(--mono); }
+    .score.empty { color: #aaa49a; font-weight: 400; }
+    .tests { margin-top: 3px; color: var(--muted); font: 9px/1.2 var(--mono); }
+    .error-note { max-width: 210px; color: var(--red); font: 10px/1.3 var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .empty-state { padding: 48px; text-align: center; color: var(--muted); font-family: var(--mono); }
+    .pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; min-height: 350px; }
+    .lane { border: 1px solid var(--line-strong); background: var(--panel); min-width: 0; }
+    .lane-head { display: flex; justify-content: space-between; padding: 11px 12px; border-bottom: 1px solid var(--line); background: #e9e5dc; font: 700 10px/1 var(--mono); text-transform: uppercase; }
+    .lane-list { padding: 8px; display: grid; gap: 7px; align-content: start; }
+    .task-card { width: 100%; padding: 9px 10px; border: 1px solid var(--line); background: #fffefb; text-align: left; cursor: pointer; }
+    .task-card:hover { border-color: var(--cyan); }
+    .card-top { display: flex; justify-content: space-between; gap: 8px; font: 700 11px/1.2 var(--mono); }
+    .card-bottom { display: flex; justify-content: space-between; gap: 8px; margin-top: 7px; color: var(--muted); font: 9px/1 var(--mono); }
+    .timeline-shell { border: 1px solid var(--line-strong); background: var(--panel); padding: 16px 18px; min-height: 350px; }
+    .timeline-row { display: grid; grid-template-columns: 90px 14px minmax(150px, 280px) 1fr; gap: 10px; align-items: center; min-height: 30px; font: 11px/1.25 var(--mono); }
+    .timeline-time { color: var(--muted); text-align: right; }
+    .timeline-mark { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); }
+    .timeline-mark::after { content: ""; position: absolute; top: 8px; left: 3px; width: 1px; height: 22px; background: var(--line-strong); }
+    .timeline-row:last-child .timeline-mark::after { display: none; }
+    .timeline-event { color: var(--muted); }
+    .compare-shell { border: 1px solid var(--line-strong); background: var(--panel); }
+    .compare-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 14px 16px; border-bottom: 1px solid var(--line); background: #e9e5dc; }
+    .compare-head h2 { margin: 0; font: 600 20px/1.1 var(--serif); }
+    .compare-head p { margin: 0; color: var(--muted); font: 10px/1.4 var(--mono); text-align: right; }
+    .compare-cards { display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); border-bottom: 1px solid var(--line-strong); }
+    .compare-card { min-width: 0; padding: 13px 14px; border-right: 1px solid var(--line); }
+    .compare-card:last-child { border-right: 0; }
+    .compare-card label { color: var(--muted); font: 700 9px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .compare-value { margin-top: 7px; font: 700 17px/1.15 var(--mono); font-variant-numeric: tabular-nums; }
+    .compare-sub { margin-top: 5px; color: var(--muted); font: 9px/1.35 var(--mono); }
+    .delta-good { color: var(--green); }
+    .delta-bad { color: var(--red); }
+    .compare-table { max-height: calc(100vh - 390px); overflow: auto; }
+    .compare-table table { min-width: 980px; }
+    .compare-table tbody tr { cursor: default; }
+    .compare-source { max-width: 250px; color: var(--muted); font: 9px/1.35 var(--mono); overflow-wrap: anywhere; }
+    .compare-note { padding: 10px 14px; color: var(--muted); border-top: 1px solid var(--line); font: 9px/1.45 var(--mono); }
+    .drawer-backdrop { position: fixed; inset: 0; background: rgba(23,33,40,.33); opacity: 0; pointer-events: none; transition: opacity .18s; z-index: 40; }
+    .drawer { position: fixed; right: 0; top: 0; bottom: 0; width: min(980px, 96vw); background: var(--panel); border-left: 1px solid var(--night); transform: translateX(100%); transition: transform .22s ease; z-index: 41; display: flex; flex-direction: column; box-shadow: -18px 0 50px rgba(20,28,33,.18); }
+    body.drawer-open .drawer-backdrop { opacity: 1; pointer-events: auto; }
+    body.drawer-open .drawer { transform: translateX(0); }
+    .drawer-head { padding: 16px 18px; color: #fff; background: var(--night); border-bottom: 3px solid var(--cyan); display: flex; gap: 12px; align-items: flex-start; }
+    .drawer-title { min-width: 0; flex: 1; }
+    .drawer-title h2 { margin: 3px 0 4px; font: 600 23px/1.1 var(--serif); overflow-wrap: anywhere; }
+    .drawer-title p { margin: 0; color: #b8c2c5; font: 10px/1.4 var(--mono); }
+    .close { width: 32px; height: 32px; border: 1px solid #536069; color: #fff; background: transparent; cursor: pointer; font-size: 19px; }
+    .drawer-body { overflow: auto; padding: 16px 18px 28px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(6, 1fr); border: 1px solid var(--line); margin-bottom: 14px; }
+    .detail-stat { padding: 10px; border-right: 1px solid var(--line); }
+    .detail-stat:last-child { border-right: 0; }
+    .detail-stat label { display: block; color: var(--muted); font: 8px/1 var(--mono); text-transform: uppercase; }
+    .detail-stat strong { display: block; margin-top: 5px; font: 700 15px/1 var(--mono); }
+    .section { margin-top: 16px; }
+    .section-head { display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid var(--line-strong); padding-bottom: 6px; margin-bottom: 7px; }
+    .section-head h3 { margin: 0; font: 700 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .team-band { margin: 14px 0 16px; border: 1px solid var(--line-strong); background: #f8f5ec; }
+    .team-band-head { display: flex; align-items: center; gap: 9px; padding: 9px 11px; border-bottom: 1px solid var(--line); font: 700 9px/1 var(--mono); text-transform: uppercase; }
+    .team-band-head .team-state { margin-left: auto; color: var(--green); }
+    .actor-roster { display: flex; flex-wrap: wrap; gap: 6px; padding: 9px 11px; }
+    .actor-summary { display: inline-flex; align-items: center; gap: 6px; padding: 5px 7px; border: 1px solid var(--line); background: var(--panel); font: 9px/1 var(--mono); }
+    .actor-summary b { color: var(--cyan); }
+    .team-task { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; padding: 8px 11px; border-top: 1px solid var(--line); font: 9px/1.35 var(--mono); }
+    .team-task-status { color: var(--green); text-transform: uppercase; }
+    .trace-section { margin-top: 16px; }
+    .trace-toolbar { position: sticky; top: -16px; z-index: 4; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; padding: 10px 0 9px; background: linear-gradient(var(--panel) 82%, rgba(255,253,247,0)); }
+    .trace-title { margin-right: 3px; font: 700 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .trace-chip, .trace-action { height: 28px; padding: 0 9px; border: 1px solid var(--line-strong); background: #f7f4ec; cursor: pointer; font: 700 9px/1 var(--mono); }
+    .trace-chip.active { color: #fff; border-color: var(--night); background: var(--night); }
+    .trace-action.active { color: var(--red); border-color: var(--red); background: var(--red-soft); }
+    .trace-search { margin-left: auto; width: min(220px, 32vw); height: 28px; padding: 0 8px; border: 1px solid var(--line-strong); background: #fffefb; font: 10px/1 var(--mono); }
+    .trace-count { color: var(--muted); font: 9px/1 var(--mono); white-space: nowrap; }
+    .trace-rail { display: flex; align-items: end; gap: 2px; height: 34px; padding: 6px 5px; border: 1px solid var(--line); background: #ece8df; overflow-x: auto; }
+    .rail-mark { flex: 0 0 7px; height: 12px; padding: 0; border: 0; background: var(--cyan); cursor: pointer; opacity: .75; }
+    .rail-mark.worker { background: var(--orange); }
+    .rail-mark.lifecycle { background: #8b9294; height: 7px; }
+    .rail-mark.is-error { height: 22px; background: var(--red); opacity: 1; }
+    .rail-mark[hidden] { display: none; }
+    .trace-feed { display: grid; gap: 8px; margin-top: 9px; }
+    .turn-card { border: 1px solid var(--line); background: #fffefb; scroll-margin-top: 62px; }
+    .turn-card.is-error { border-left: 3px solid var(--red); }
+    .turn-card[hidden] { display: none; }
+    .turn-head { display: grid; grid-template-columns: minmax(120px, auto) 1fr auto auto; gap: 10px; align-items: center; padding: 8px 10px; background: #ede9e0; border-bottom: 1px solid var(--line); font: 9px/1 var(--mono); }
+    .actor-label { color: var(--cyan); font-weight: 800; overflow: hidden; text-overflow: ellipsis; }
+    .actor-label.worker { color: var(--orange); }
+    .turn-index { color: var(--muted); }
+    .turn-error { color: var(--red); font-weight: 800; text-transform: uppercase; }
+    .model-copy { padding: 10px 11px; border-bottom: 1px solid #ece7dc; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 var(--mono); }
+    .model-copy.empty { color: #9a958b; font-style: italic; }
+    .tool-stack { display: grid; }
+    .tool-call { border-top: 1px solid #eee9df; }
+    .tool-call:first-child { border-top: 0; }
+    .tool-call summary { display: grid; grid-template-columns: 22px minmax(100px, 150px) 1fr auto; gap: 7px; align-items: center; padding: 8px 10px; cursor: pointer; list-style: none; font: 10px/1.25 var(--mono); }
+    .tool-call summary::-webkit-details-marker { display: none; }
+    .tool-caret { color: var(--muted); transition: transform .12s; }
+    .tool-call[open] .tool-caret { transform: rotate(90deg); }
+    .tool-name { font-weight: 800; }
+    .tool-status { color: var(--green); }
+    .tool-status.error { color: var(--red); }
+    .tool-duration { color: var(--muted); }
+    .io-grid { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); background: #202b31; }
+    .io-cell { min-width: 0; padding: 9px 10px; color: #dce3df; border-right: 1px solid #415058; }
+    .io-cell:last-child { border-right: 0; }
+    .io-label { display: block; margin-bottom: 5px; color: #8ccdd0; font: 700 8px/1 var(--mono); text-transform: uppercase; }
+    .io-cell code { display: block; max-height: 170px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 9px/1.45 var(--mono); }
+    .lifecycle-copy { padding: 9px 11px; color: var(--muted); font: 10px/1.4 var(--mono); }
+    pre { max-height: 260px; overflow: auto; margin: 0; padding: 11px; background: #202b31; color: #dce3df; border: 1px solid #0f171b; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.48 var(--mono); }
+    .footer-note { padding: 10px 1px 0; color: var(--muted); font: 9px/1.4 var(--mono); }
+    .toast { position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none; z-index: 60; padding: 9px 12px; color: #fff; background: var(--red); font: 11px/1.3 var(--mono); transition: .2s; }
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+    @media (max-width: 1100px) {
+      .run-strip { grid-template-columns: 1.5fr repeat(3, 1fr); }
+      .metric:nth-child(n+5) { border-top: 1px solid var(--line); }
+      .pipeline { grid-template-columns: repeat(2, 1fr); }
+      .compare-cards { grid-template-columns: repeat(3, 1fr); }
+      .global-metrics { grid-template-columns: repeat(3, 1fr); }
+      .global-metric:nth-child(n+4) { border-top: 1px solid var(--line); }
+      .compare-card:nth-child(n+4) { border-top: 1px solid var(--line); }
+    }
+    @media (max-width: 720px) {
+      .topbar { padding: 9px 12px; gap: 10px; flex-wrap: wrap; }
+      .run-title { order: 3; flex-basis: 100%; }
+      main { padding: 12px; }
+      .run-strip { grid-template-columns: repeat(2, 1fr); }
+      .run-ident { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--line); }
+      .metric { border-top: 1px solid var(--line); }
+      .progress-rack { grid-template-columns: 1fr; }
+      .progress-cell { border-right: 0; border-bottom: 1px solid var(--line); }
+      .toolbar { flex-wrap: wrap; }
+      .toolbar-spacer { display: none; }
+      .search { width: 100%; order: 3; }
+      .pipeline { grid-template-columns: 1fr; }
+      .compare-cards { grid-template-columns: 1fr 1fr; }
+      .global-metrics, .global-pools { grid-template-columns: 1fr; }
+      .global-metric, .pool-cell { border-right: 0; border-bottom: 1px solid var(--line); }
+      .compare-card { border-top: 1px solid var(--line); }
+      .detail-grid { grid-template-columns: repeat(2, 1fr); }
+      .trace-search { order: 5; width: 100%; margin-left: 0; }
+      .turn-head { grid-template-columns: 1fr auto; }
+      .turn-head .turn-time, .turn-head .turn-duration { display: none; }
+      .io-grid { grid-template-columns: 1fr; }
+      .io-cell { border-right: 0; border-bottom: 1px solid #415058; }
+      .team-task { grid-template-columns: 1fr auto; }
+      .team-task-owner { display: none; }
+      .timeline-row { grid-template-columns: 65px 12px 1fr; }
+      .timeline-event { grid-column: 3; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><strong>NL2Repo</strong><span>EVAL CONSOLE</span></div>
+    <div class="run-title" id="topRun">等待评测数据…</div>
+    <select class="run-select" id="runSelect" aria-label="评测批次"><option>加载批次…</option></select>
+    <div class="live-wrap"><i class="live-dot" id="liveDot"></i><span class="live-text" id="liveText">CONNECTING</span></div>
+    <div class="refresh-control">
+      <button id="pauseBtn" title="暂停自动刷新">Ⅱ</button>
+      <select id="interval" aria-label="刷新间隔"><option value="2000">2s</option><option value="5000">5s</option><option value="10000">10s</option></select>
+    </div>
+  </header>
+
+  <main>
+    <section class="run-strip">
+      <div class="run-ident">
+        <div class="eyebrow">Active benchmark run</div>
+        <h1 id="runId">—</h1>
+        <div class="run-meta" id="runMeta">—</div>
+      </div>
+      <div class="metric"><div class="metric-label">Overall</div><div class="metric-value" id="overall">—</div><div class="metric-sub" id="overallSub">—</div></div>
+      <div class="metric"><div class="metric-label">Rollouts</div><div class="metric-value" id="rollouts">—</div><div class="metric-sub" id="rolloutsSub">—</div></div>
+      <div class="metric"><div class="metric-label">Rewarded</div><div class="metric-value" id="rewarded">—</div><div class="metric-sub" id="rewardedSub">—</div></div>
+      <div class="metric"><div class="metric-label">Avg quality</div><div class="metric-value" id="quality">—</div><div class="metric-sub" id="qualitySub">—</div></div>
+      <div class="metric"><div class="metric-label">ETA</div><div class="metric-value" id="eta">—</div><div class="metric-sub" id="etaSub">—</div></div>
+    </section>
+
+    <section class="progress-rack">
+      <div class="progress-cell"><div class="progress-head"><span>总进度 · rollout + reward</span><b id="overallPct">0%</b></div><div class="track"><div class="fill green" id="overallBar"></div></div></div>
+      <div class="progress-cell"><div class="progress-head"><span>Agent rollouts</span><b id="rolloutPct">0%</b></div><div class="track"><div class="fill" id="rolloutBar"></div></div></div>
+      <div class="progress-cell"><div class="progress-head"><span>Reward scoring</span><b id="rewardPct">0%</b></div><div class="track"><div class="fill orange" id="rewardBar"></div></div></div>
+    </section>
+
+    <nav class="toolbar" aria-label="看板视图与筛选">
+      <div class="view-switch">
+        <button class="active" data-view="global">GLOBAL</button>
+        <button data-view="table">TABLE</button>
+        <button data-view="pipeline">PIPELINE</button>
+        <button data-view="timeline">TIMELINE</button>
+        <button data-view="compare">COMPARE</button>
+      </div>
+      <button class="issue-toggle" id="issueToggle">ISSUES ONLY</button>
+      <div class="queue-alert" id="queueAlert" hidden>QUEUE LOW</div>
+      <div class="toolbar-spacer"></div>
+      <div class="scale-control" id="scaleControl" hidden>
+        <span>SLOTS</span>
+        <label>R <input class="slot-input" id="rolloutSlots" type="number" min="0" step="1" aria-label="Rollout slots"></label>
+        <label>W <input class="slot-input" id="rewardSlots" type="number" min="0" step="1" aria-label="Reward slots"></label>
+        <button class="scale-apply" id="applySlots">APPLY</button>
+      </div>
+      <select class="filter" id="statusFilter" aria-label="状态筛选">
+        <option value="all">全部状态</option><option value="queued">排队中</option><option value="running">Rollout</option><option value="reward">Reward</option><option value="done">已评分</option><option value="infra_error">基础设施失败</option>
+      </select>
+      <input class="search" id="search" type="search" placeholder="搜索任务 / 工具…" aria-label="搜索任务">
+    </nav>
+
+    <section class="view active" id="view-global">
+      <div class="global-shell">
+        <div class="global-head"><h2 id="globalTitle">Global evaluation pool</h2><p id="globalMeta">读取全局队列…</p></div>
+        <div class="global-metrics" id="globalMetrics"></div>
+        <div class="global-pools">
+          <div class="pool-cell"><div class="pool-title">Rollout slots <span id="globalRolloutSlots">—</span></div><div class="slot-track"><div class="slot-fill" id="globalRolloutBar"></div></div></div>
+          <div class="pool-cell"><div class="pool-title">Reward slots <span id="globalRewardSlots">—</span></div><div class="slot-track"><div class="slot-fill reward" id="globalRewardBar"></div></div></div>
+        </div>
+        <div class="global-table"><table><thead><tr><th>#</th><th>Batch</th><th>Slots R + W</th><th>Queue</th><th>Rollout</th><th>Reward wait / active</th><th>Scored</th><th>Overall progress</th><th>Avg quality</th></tr></thead><tbody id="globalRows"></tbody></table><div class="empty-state" id="globalEmpty" hidden>当前 campaign 没有可展示的队列</div></div>
+      </div>
+    </section>
+    <section class="view" id="view-table"><div class="table-shell"><table><thead><tr><th>#</th><th>Task</th><th>Phase</th><th>Turns</th><th>Runtime</th><th>Last activity</th><th>Calls / errors</th><th>Reward</th><th>Signal</th></tr></thead><tbody id="taskRows"></tbody></table><div class="empty-state" id="tableEmpty" hidden>没有匹配的任务</div></div></section>
+    <section class="view" id="view-pipeline"><div class="pipeline" id="pipeline"></div></section>
+    <section class="view" id="view-timeline"><div class="timeline-shell" id="timeline"></div></section>
+    <section class="view" id="view-compare">
+      <div class="compare-shell">
+        <div class="compare-head"><h2>Adaptive vs Forced team</h2><p id="compareMeta">等待可配对结果…</p></div>
+        <div class="compare-cards" id="compareCards"></div>
+        <div class="compare-table"><table><thead><tr><th>#</th><th>Task</th><th>Adaptive quality</th><th>Forced quality</th><th>Quality Δ</th><th>Adaptive time</th><th>Forced time</th><th>Runtime Δ</th><th>Model calls</th><th>Source</th></tr></thead><tbody id="comparisonRows"></tbody></table><div class="empty-state" id="compareEmpty">当前批次没有配置合并比较</div></div>
+        <div class="compare-note" id="compareNote"></div>
+      </div>
+    </section>
+    <div class="footer-note" id="footerNote">数据来自本地评测产物。Reward worker 不占 rollout 连接池。</div>
+  </main>
+
+  <div class="drawer-backdrop" id="backdrop"></div>
+  <aside class="drawer" id="drawer" aria-label="任务详情">
+    <div class="drawer-head"><div class="drawer-title"><div class="eyebrow">Task inspection</div><h2 id="drawerTitle">—</h2><p id="drawerMeta">—</p></div><button class="close" id="closeDrawer" aria-label="关闭">×</button></div>
+    <div class="drawer-body" id="drawerBody"><div class="empty-state">读取任务日志…</div></div>
+  </aside>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const STATUS_LABEL = {queued:'QUEUED',running:'ROLLOUT',rewarding:'REWARD',reward_waiting:'REWARD WAIT',scored:'SCORED',success:'PASS',infra_error:'INFRA ERROR'};
+    const state = {data:null, globalData:null, paused:false, view:'global', issues:false, selected:null, timer:null, currentRun:null,detail:{actor:'all',query:'',errors:false,order:'desc'},detailData:null,detailGroups:[],detailFingerprint:'',detailRequest:0,detailLoading:false};
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    const pct = value => `${Math.round((Number(value)||0)*100)}%`;
+    function duration(seconds) {
+      if (seconds == null || !Number.isFinite(Number(seconds))) return '—';
+      const s=Math.max(0,Math.round(Number(seconds))), h=Math.floor(s/3600), m=Math.floor((s%3600)/60), r=s%60;
+      if (h) return `${h}h ${String(m).padStart(2,'0')}m`;
+      if (m) return `${m}m ${String(r).padStart(2,'0')}s`;
+      return `${r}s`;
+    }
+    function age(seconds) { if(seconds==null)return 'no signal'; const s=Number(seconds); return s<5?'now':`${duration(s)} ago`; }
+    function score(value) { return value == null ? '—' : Number(value).toFixed(1); }
+    function signed(value,digits=1) { if(value==null||!Number.isFinite(Number(value)))return '—'; const n=Number(value); return `${n>0?'+':''}${n.toFixed(digits)}`; }
+    function tokens(value) { const n=Number(value); if(!Number.isFinite(n))return '—'; return n>=1e6?`${(n/1e6).toFixed(2)}M`:n>=1e3?`${(n/1e3).toFixed(1)}K`:String(Math.round(n)); }
+    function statusGroup(status) { if(['rewarding','reward_waiting'].includes(status))return 'reward'; if(['scored','success'].includes(status))return 'done'; return status; }
+    function signal(t) { if(t.infrastructure_error)return t.infrastructure_error; if(t.status==='running')return t.last_tool||t.last_kind||'agent active'; if(t.status==='queued')return 'waiting for slot'; if(t.status==='rewarding')return 'hidden tests running'; if(t.rescored)return 'corrected reward'; return t.agent_ok===false?'agent failed':'reward recorded'; }
+    function filteredTasks() {
+      if(!state.data)return [];
+      const q=$('search').value.trim().toLowerCase(), filter=$('statusFilter').value;
+      return state.data.tasks.filter(t => {
+        const matchesFilter=filter==='all'||statusGroup(t.status)===filter;
+        const matchesIssue=!state.issues||(t.status==='infra_error'||t.tool_errors>0||t.agent_ok===false);
+        const hay=`${t.task} ${t.mode} ${t.last_tool} ${t.last_kind} ${t.infrastructure_error||''}`.toLowerCase();
+        return matchesFilter&&matchesIssue&&(!q||hay.includes(q));
+      });
+    }
+    function renderSummary(data) {
+      const r=data.run,s=data.summary;
+      $('runId').textContent=r.id;
+      $('topRun').textContent=`${r.id} · ${r.provider||'—'}/${r.model||'—'}`;
+      $('runMeta').textContent=`${r.execution_backend||'—'} rollout · ${r.score_backend||'—'} reward · pool ${r.rollout_concurrency??'—'} + ${r.reward_concurrency??'—'} · ${duration(r.elapsed_s)}`;
+      const scalable=r.queue_mode&&Number(r.max_rollout_concurrency)>0;
+      $('scaleControl').hidden=!scalable;
+      if(scalable){
+        const rollout=$('rolloutSlots'),reward=$('rewardSlots');
+        rollout.max=String(r.max_rollout_concurrency);reward.max=String(r.max_reward_concurrency);
+        if(document.activeElement!==rollout)rollout.value=String(r.rollout_concurrency);
+        if(document.activeElement!==reward)reward.value=String(r.reward_concurrency);
+        rollout.title=`0–${r.max_rollout_concurrency}; 0 pauses new rollouts`;
+        reward.title=`0–${r.max_reward_concurrency}; 0 pauses new rewards`;
+      }
+      $('liveDot').className=`live-dot ${r.status}`; $('liveText').textContent=r.status;
+      $('overall').textContent=pct(s.overall_progress); $('overallSub').textContent=`${s.started}/${s.total} started · ${s.queued} queued`;
+      $('rollouts').textContent=`${s.rollouts_completed}/${s.total}`; $('rolloutsSub').textContent=`${s.active} active · ${s.rollout_rate_h.toFixed(1)}/h`;
+      $('rewarded').textContent=`${s.rewards_completed}/${s.total}`; $('rewardedSub').textContent=`${s.reward_active} active · ${s.infrastructure_errors} infra errors`;
+      $('quality').textContent=s.average_quality==null?'—':Number(s.average_quality).toFixed(1); $('qualitySub').textContent=`${s.valid_rewards} valid rewards · ${s.strict_successes} strict pass`;
+      $('eta').textContent=r.queue_mode&&s.total===0?'waiting':s.rollouts_completed>=s.total?'done':duration(s.eta_s); $('etaSub').textContent=`${s.model_calls.toLocaleString()} model · ${s.tool_calls.toLocaleString()} tools`;
+      $('queueAlert').hidden=!r.queue_mode||!s.queue_low; $('queueAlert').textContent=`QUEUE LOW · ${s.queue_depth} waiting / ${r.rollout_concurrency} slots`;
+      [['overall',s.overall_progress],['rollout',s.rollout_progress],['reward',s.reward_progress]].forEach(([name,value])=>{$(`${name}Pct`).textContent=pct(value);$(`${name}Bar`).style.width=pct(value);});
+      $('footerNote').textContent=`Updated ${new Date(data.generated_at).toLocaleTimeString()} · ${s.tool_errors} tool errors observed · reward worker 不占 rollout 连接池`;
+    }
+    function renderTable(tasks) {
+      $('tableEmpty').hidden=tasks.length>0;
+      $('taskRows').innerHTML=tasks.map(t=>{
+        const turnPct=Math.min(100,Math.round((t.turns/(t.max_turns||300))*100));
+        const testText=t.expected!=null?`${t.passed||0}/${t.expected} hidden tests`:t.status==='infra_error'?'not scored':'pending';
+        const sig=signal(t);
+        return `<tr data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><td class="index">${t.index}</td><td><div class="task-name">${esc(t.task)}</div><div class="task-mode">${esc(t.mode)}</div></td><td><span class="badge status-${esc(t.status)}">${esc(STATUS_LABEL[t.status]||t.status)}</span>${t.rescored?'<span class="tiny-tag">rescored</span>':''}</td><td class="turn-cell"><div class="turn-top"><b>${t.turns}</b><span class="muted">/ ${t.max_turns}</span></div><div class="micro-track"><div class="micro-fill" style="width:${turnPct}%"></div></div></td><td class="mono">${duration(t.runtime_s)}</td><td><div class="last-action">${esc(t.last_tool||t.last_kind||'—')}</div><div class="task-mode">${age(t.activity_age_s)}</div></td><td class="mono">${t.model_calls}m / ${t.tool_calls}t<br><span class="${t.tool_errors?'status-infra_error':'muted'}">${t.tool_errors} err</span></td><td><div class="score ${t.quality_score==null?'empty':''}">${score(t.quality_score)}</div><div class="tests">${esc(testText)}</div></td><td><div class="${t.infrastructure_error?'error-note':'last-action muted'}" title="${esc(sig)}">${esc(sig)}</div></td></tr>`;
+      }).join('');
+      $('taskRows').querySelectorAll('tr').forEach(row=>row.addEventListener('click',()=>openTask(row.dataset.task,row.dataset.mode)));
+    }
+    function renderPipeline(tasks) {
+      const lanes=[['queued','Queue'],['running','Rollout pool'],['reward','Reward pool'],['done','Scored']];
+      const groups=Object.fromEntries(lanes.map(([k])=>[k,[]])); groups.done=[];
+      tasks.forEach(t=>{let g=statusGroup(t.status); if(g==='infra_error')g='done'; (groups[g]||groups.done).push(t);});
+      $('pipeline').innerHTML=lanes.map(([key,label])=>`<div class="lane"><div class="lane-head"><span>${label}</span><b>${groups[key].length}</b></div><div class="lane-list">${groups[key].map(t=>`<button class="task-card" data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><div class="card-top"><span>${esc(t.task)}</span><span class="${t.status==='infra_error'?'error-note':'muted'}">${t.quality_score==null?t.turns:score(t.quality_score)}</span></div><div class="card-bottom"><span>${esc(t.mode)} · ${esc(STATUS_LABEL[t.status]||t.status)}</span><span>${t.status==='queued'?'slot pending':duration(t.runtime_s)}</span></div></button>`).join('')||'<div class="empty-state">empty</div>'}</div></div>`).join('');
+      $('pipeline').querySelectorAll('[data-task]').forEach(el=>el.addEventListener('click',()=>openTask(el.dataset.task,el.dataset.mode)));
+    }
+    function renderTimeline() {
+      const events=(state.data?.timeline||[]).slice().reverse();
+      $('timeline').innerHTML=events.length?events.map(e=>`<div class="timeline-row"><div class="timeline-time">+${duration(e.elapsed_s)}</div><i class="timeline-mark"></i><button class="task-card" data-task="${esc(e.task)}" data-mode="${esc(e.mode||'adaptive')}">${esc(e.task||'scheduler')} · ${esc(e.mode||'adaptive')}</button><div class="timeline-event">${esc(e.event)}${e.quality_score!=null?` · quality ${score(e.quality_score)}`:''}</div></div>`).join(''):'<div class="empty-state">还没有 scheduler 事件</div>';
+      $('timeline').querySelectorAll('[data-task]').forEach(el=>el.addEventListener('click',()=>openTask(el.dataset.task,el.dataset.mode)));
+    }
+    function renderComparison(c) {
+      const button=document.querySelector('[data-view="compare"]'); if(button)button.hidden=!c;
+      $('compareEmpty').hidden=Boolean(c); $('compareCards').innerHTML=''; $('comparisonRows').innerHTML=''; $('compareNote').textContent='';
+      if(!c){$('compareMeta').textContent='当前批次没有配置合并比较';return;}
+      const [leftMode,rightMode]=c.modes,left=c.mode_summaries[leftMode],right=c.mode_summaries[rightMode],paired=c.paired;
+      $('compareMeta').textContent=`${c.paired_count} paired · ${c.cross_run_count} cross-run · ${c.deployment_mismatch_count||0} deployment-ID mismatch · baseline ${Object.values(c.baseline_runs||{}).join(', ')||'none'}`;
+      const qualityDelta=paired.average_quality_delta, runtimeDelta=paired.average_runtime_delta_s;
+      const cards=[
+        ['Paired tasks',String(c.paired_count),`${c.cross_run_count} 对跨批次 · ${c.deployment_mismatch_count||0} 对部署 ID 不同`],
+        ['Avg quality',`${Number(left.average_quality).toFixed(2)} → ${Number(right.average_quality).toFixed(2)}`,`Forced Δ ${signed(qualityDelta,2)} · W/T/L ${paired.right_quality_wins}/${paired.ties}/${paired.left_quality_wins}`],
+        ['Avg rollout',`${duration(left.average_runtime_s)} → ${duration(right.average_runtime_s)}`,`Forced Δ ${signed(runtimeDelta/60,1)} min · faster ${paired.right_faster}/${c.paired_count}`],
+        ['Avg model calls',`${Number(left.average_model_calls||0).toFixed(1)} → ${Number(right.average_model_calls||0).toFixed(1)}`,`tool ${Number(left.average_tool_calls||0).toFixed(1)} → ${Number(right.average_tool_calls||0).toFixed(1)}`],
+        ['Recorded tokens',`${tokens(left.total_tokens)} → ${tokens(right.total_tokens)}`,`coverage ${left.token_coverage}/${left.count} → ${right.token_coverage}/${right.count}`]
+      ];
+      $('compareCards').innerHTML=cards.map(([label,value,sub],index)=>`<div class="compare-card"><label>${esc(label)}</label><div class="compare-value ${index===1?(qualityDelta>=0?'delta-good':'delta-bad'):index===2?(runtimeDelta<=0?'delta-good':'delta-bad'):''}">${esc(value)}</div><div class="compare-sub">${esc(sub)}</div></div>`).join('');
+      const q=$('search').value.trim().toLowerCase(), rows=(c.rows||[]).filter(row=>!q||row.task.toLowerCase().includes(q));
+      $('comparisonRows').innerHTML=rows.map((row,index)=>{const leftCase=row[leftMode],rightCase=row[rightMode],qualityClass=row.quality_delta>0?'delta-good':row.quality_delta<0?'delta-bad':'muted',runtimeClass=row.runtime_delta_s<0?'delta-good':row.runtime_delta_s>0?'delta-bad':'muted',flags=[row.cross_run?'cross-run pair':'',row.deployment_mismatch?'deployment ID changed':''].filter(Boolean).join(' · ');return `<tr><td class="index">${index+1}</td><td><div class="task-name">${esc(row.task)}</div>${flags?`<div class="task-mode">${esc(flags)}</div>`:''}</td><td class="mono">${score(leftCase.quality_score)}</td><td class="mono">${score(rightCase.quality_score)}</td><td class="mono ${qualityClass}">${signed(row.quality_delta,2)}</td><td class="mono">${duration(leftCase.runtime_s)}</td><td class="mono">${duration(rightCase.runtime_s)}</td><td class="mono ${runtimeClass}">${row.runtime_delta_s==null?'—':`${signed(row.runtime_delta_s/60,1)}m`}</td><td class="mono">${leftCase.model_calls??'—'} → ${rightCase.model_calls??'—'}</td><td class="compare-source">${esc(leftCase.source_run)} → ${esc(rightCase.source_run)}</td></tr>`;}).join('');
+      $('compareNote').textContent='跨批次耗时可受并发度和服务负载影响；部署 ID 不同的行另行标注。Token 仅统计有效 usage 记录，Forced-team 值可能是下界。';
+    }
+    function renderGlobal(g) {
+      if(!g)return;
+      const s=g.summary,p=g.pool,runs=g.runs||[],rolloutCap=Number(p.rollout_capacity)||0,rewardCap=Number(p.reward_capacity)||0;
+      $('globalTitle').textContent=g.campaign||'Global evaluation pool';
+      $('globalMeta').textContent=`${runs.length} batches · ${p.status||'observed'} · updated ${new Date(g.generated_at).toLocaleTimeString()}`;
+      const cards=[
+        ['All cases',`${s.rewards_completed}/${s.total}`,`${s.queued} queued · ${s.failed} failed`],
+        ['Rollout active',String(s.rollout_active),`${s.rollouts_completed}/${s.total} generated`],
+        ['Reward active',String(s.reward_active),`${s.reward_pending} waiting`],
+        ['Overall',pct(s.overall_progress),`${s.runs} batches in campaign`],
+        ['Assigned slots',`${p.allocated_rollout} + ${p.allocated_reward}`,'rollout + reward']
+      ];
+      $('globalMetrics').innerHTML=cards.map(([label,value,sub])=>`<div class="global-metric"><label>${esc(label)}</label><strong>${esc(value)}</strong><span>${esc(sub)}</span></div>`).join('');
+      $('globalRolloutSlots').textContent=rolloutCap?`${p.allocated_rollout} / ${rolloutCap}`:`${p.allocated_rollout} assigned`;
+      $('globalRewardSlots').textContent=rewardCap?`${p.allocated_reward} / ${rewardCap}`:`${p.allocated_reward} assigned`;
+      $('globalRolloutBar').style.width=pct(rolloutCap?p.allocated_rollout/rolloutCap:0);
+      $('globalRewardBar').style.width=pct(rewardCap?p.allocated_reward/rewardCap:0);
+      $('globalEmpty').hidden=runs.length>0;
+      $('globalRows').innerHTML=runs.map((run,index)=>{
+        const c=run.counts, active=c.rollout, reward=`${c.reward_pending} / ${c.rewarding}`;
+        return `<tr class="${run.id===state.currentRun?'current':''}" data-run="${esc(run.id)}"><td class="index">${index+1}</td><td><div class="task-name">${esc(run.id)}</div><div class="task-mode">${esc(run.provider||'—')} / ${esc(run.model||'—')}</div></td><td><div class="slot-pair">${run.rollout_slots} <span class="muted">+</span> <span class="reward">${run.reward_slots}</span></div></td><td class="mono">${c.queued}</td><td class="mono">${active}</td><td class="mono">${reward}</td><td class="mono">${run.rewards_completed}/${run.total}</td><td class="batch-progress"><div class="turn-top"><b>${pct(run.overall_progress)}</b><span class="muted">${run.started}/${run.total} started</span></div><div class="track"><div class="fill green" style="width:${pct(run.overall_progress)}"></div></div></td><td class="score ${run.average_quality==null?'empty':''}">${score(run.average_quality)}</td></tr>`;
+      }).join('');
+      $('globalRows').querySelectorAll('[data-run]').forEach(row=>row.addEventListener('click',()=>selectRun(row.dataset.run)));
+    }
+    function updateViewControls(){const global=state.view==='global';$('issueToggle').hidden=global;$('statusFilter').hidden=global;$('search').hidden=global;if(global)$('scaleControl').hidden=true;else if(state.data)renderSummary(state.data);}
+    function render() { if(!state.data)return; renderSummary(state.data); renderGlobal(state.globalData); const tasks=filteredTasks(); renderTable(tasks); renderPipeline(tasks); renderTimeline(); renderComparison(state.data.comparison); updateViewControls(); }
+    function detailBlock(title, content) { return content?`<details class="section"><summary class="section-head"><h3>${esc(title)}</h3><span class="task-mode">展开原始日志</span></summary><pre>${esc(content)}</pre></details>`:''; }
+    function clock(value) { const date=new Date(value); return Number.isNaN(date.getTime())?'—':date.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+    function ms(value) { const n=Number(value); if(!Number.isFinite(n))return '—'; return n<1000?`${Math.round(n)}ms`:`${(n/1000).toFixed(n<10000?1:0)}s`; }
+    function groupTrace(events) {
+      const groups=[], byKey=new Map();
+      (events||[]).forEach((event,eventIndex)=>{
+        const actor=event.actor||'lead', hasTurn=Number.isInteger(event.turn);
+        const key=hasTurn?`${actor}\u0000${event.turn}`:`${actor}\u0000event-${eventIndex}`;
+        let group=byKey.get(key);
+        if(!group){group={key,actor,turn:hasTurn?event.turn:null,events:[],tools:new Map(),response:'',started:false,isError:false,createdAt:event.created_at,durationMs:0};byKey.set(key,group);groups.push(group);}
+        group.events.push(event); group.createdAt=group.createdAt||event.created_at; group.isError=group.isError||Boolean(event.is_error); group.durationMs+=Number(event.duration_ms)||0;
+        if(event.kind==='model_started')group.started=true;
+        else if(event.kind==='model_response')group.response=event.detail||group.response;
+        else if(['tool_started','tool_use','tool_completed','tool_result','tool_failed','tool_error'].includes(event.kind)){
+          const toolKey=event.tool_use_id||`${event.tool||'tool'}-${group.tools.size}`;
+          let tool=group.tools.get(toolKey); if(!tool){tool={id:toolKey,name:event.tool||'tool',input:null,result:null,isError:false,durationMs:null};group.tools.set(toolKey,tool);}
+          tool.name=event.tool||tool.name; tool.isError=tool.isError||Boolean(event.is_error)||['tool_failed','tool_error'].includes(event.kind);
+          if(['tool_started','tool_use'].includes(event.kind))tool.input=event;
+          else tool.result=event;
+          if(event.duration_ms!=null)tool.durationMs=event.duration_ms;
+        }
+      });
+      groups.sort((left,right)=>(Date.parse(left.createdAt)||0)-(Date.parse(right.createdAt)||0));
+      return groups.map((group,index)=>{
+        group.index=index; group.tools=[...group.tools.values()];
+        group.isLifecycle=group.turn==null&&!group.response&&!group.tools.length;
+        group.search=[group.actor,group.turn,group.response,...group.tools.flatMap(tool=>[tool.name,tool.input?.detail,tool.result?.detail]),...group.events.map(event=>event.detail)].join(' ').toLowerCase();
+        return group;
+      });
+    }
+    function actorClass(actor) { return actor==='lead'||actor==='team'?'':'worker'; }
+    function renderTool(tool) {
+      const status=tool.isError?'error':tool.result?'ok':'running';
+      return `<details class="tool-call" ${tool.isError?'open':''}><summary><span class="tool-caret">▶</span><span class="tool-name">${esc(tool.name)}</span><span class="tool-status ${tool.isError?'error':''}">${status}</span><span class="tool-duration">${ms(tool.durationMs)}</span></summary><div class="io-grid"><div class="io-cell"><span class="io-label">input</span><code>${esc(tool.input?.detail||'—')}</code></div><div class="io-cell"><span class="io-label">${tool.isError?'error':'result'}</span><code>${esc(tool.result?.detail||(tool.result?'—':'等待返回…'))}</code></div></div></details>`;
+    }
+    function renderGroup(group) {
+      const lifecycle=group.events.filter(event=>!['model_started','model_response','tool_started','tool_use','tool_completed','tool_result','tool_failed','tool_error'].includes(event.kind));
+      const label=group.turn==null?'lifecycle':`turn ${group.turn}`;
+      return `<article class="turn-card ${group.isError?'is-error':''}" id="trace-group-${group.index}" data-group-index="${group.index}"><header class="turn-head"><span class="actor-label ${actorClass(group.actor)}">${esc(group.actor)}</span><span class="turn-index">${esc(label)} · ${group.tools.length} tools</span><span class="turn-time">${clock(group.createdAt)}</span><span class="${group.isError?'turn-error':'turn-duration'}">${group.isError?'error':ms(group.durationMs)}</span></header>${group.response?`<div class="model-copy">${esc(group.response)}</div>`:(group.turn!=null?'<div class="model-copy empty">模型未输出文本，直接调用工具或仍在采样</div>':'')}${group.tools.length?`<div class="tool-stack">${group.tools.map(renderTool).join('')}</div>`:''}${lifecycle.length?`<div class="lifecycle-copy">${lifecycle.map(event=>`${esc(event.kind)}${event.detail?` · ${esc(event.detail)}`:''}`).join('<br>')}</div>`:''}</article>`;
+    }
+    function renderTeam(team) {
+      if(!team)return '';
+      const actors=(team.actors||[]).map(actor=>`<span class="actor-summary"><b>${esc(actor.name)}</b><span>${actor.turns} turns</span><span>${actor.tools} tools</span>${actor.errors?`<span class="turn-error">${actor.errors} err</span>`:''}</span>`).join('');
+      const tasks=(team.tasks||[]).map(task=>`<div class="team-task" title="${esc(task.output||'')}"><span>${esc(task.subject)}</span><span class="team-task-owner">${esc(task.owner)}</span><span class="team-task-status">${esc(task.status)}</span></div>`).join('');
+      return `<section class="team-band"><div class="team-band-head"><span>Team routing</span><span>${esc(team.name)}</span><span class="team-state">${esc(team.status)}</span></div><div class="actor-roster">${actors||'<span class="task-mode">暂无 actor 事件</span>'}</div>${tasks}</section>`;
+    }
+    function applyTraceFilters() {
+      const q=state.detail.query.trim().toLowerCase(); let visible=0;
+      document.querySelectorAll('.turn-card[data-group-index]').forEach(card=>{const group=state.detailGroups[Number(card.dataset.groupIndex)];const show=Boolean(group)&&(state.detail.actor==='all'||group.actor===state.detail.actor)&&(!state.detail.errors||group.isError)&&(!q||group.search.includes(q));card.hidden=!show;if(show)visible++;});
+      document.querySelectorAll('.rail-mark[data-group-index]').forEach(mark=>{const card=document.querySelector(`.turn-card[data-group-index="${mark.dataset.groupIndex}"]`);mark.hidden=!card||card.hidden;});
+      document.querySelectorAll('.trace-chip[data-actor]').forEach(button=>button.classList.toggle('active',button.dataset.actor===state.detail.actor));
+      if($('traceError'))$('traceError').classList.toggle('active',state.detail.errors);
+      if($('traceCount'))$('traceCount').textContent=`${visible}/${state.detailGroups.length} groups`;
+      if($('traceEmpty'))$('traceEmpty').hidden=visible>0;
+    }
+    function wireTraceControls() {
+      document.querySelectorAll('.trace-chip[data-actor]').forEach(button=>button.addEventListener('click',()=>{state.detail.actor=button.dataset.actor;applyTraceFilters();}));
+      $('traceError')?.addEventListener('click',()=>{state.detail.errors=!state.detail.errors;applyTraceFilters();});
+      $('traceSearch')?.addEventListener('input',event=>{state.detail.query=event.target.value;applyTraceFilters();});
+      $('traceOrder')?.addEventListener('click',()=>{const scroll=$('drawerBody').scrollTop;state.detail.order=state.detail.order==='desc'?'asc':'desc';renderTaskDetail(state.detailData);requestAnimationFrame(()=>$('drawerBody').scrollTop=scroll);});
+      document.querySelectorAll('.rail-mark[data-group-index]').forEach(mark=>mark.addEventListener('click',()=>document.querySelector(`#trace-group-${mark.dataset.groupIndex}`)?.scrollIntoView({behavior:'smooth',block:'start'})));
+      applyTraceFilters();
+    }
+    function renderTaskDetail(d) {
+      state.detailData=d; const t=d.task, test=t.expected!=null?`${t.passed||0}/${t.expected}`:'—';
+      $('drawerMeta').textContent=`${t.mode} · ${STATUS_LABEL[t.status]||t.status} · ${duration(t.runtime_s)}${t.rescored?' · rescored':''}`;
+      const groups=groupTrace(d.trace_events||d.recent_events||[]); state.detailGroups=groups;
+      const actors=[...new Set(groups.map(group=>group.actor))]; const errors=groups.filter(group=>group.isError).length;
+      const ordered=state.detail.order==='desc'?groups.slice().reverse():groups;
+      const actorButtons=[`<button class="trace-chip" data-actor="all">ALL · ${groups.length}</button>`,...actors.map(actor=>`<button class="trace-chip" data-actor="${esc(actor)}">${esc(actor)} · ${groups.filter(group=>group.actor===actor).length}</button>`)].join('');
+      const rail=ordered.map(group=>`<button class="rail-mark ${actorClass(group.actor)} ${group.isLifecycle?'lifecycle':''} ${group.isError?'is-error':''}" data-group-index="${group.index}" title="${esc(group.actor)} · ${group.turn==null?'lifecycle':`turn ${group.turn}`}"></button>`).join('');
+      $('drawerBody').innerHTML=`<div class="detail-grid"><div class="detail-stat"><label>quality</label><strong>${score(t.quality_score)}</strong></div><div class="detail-stat"><label>hidden</label><strong>${test}</strong></div><div class="detail-stat"><label>lead turns</label><strong>${t.turns}/${t.max_turns}</strong></div><div class="detail-stat"><label>model calls</label><strong>${t.model_calls}</strong></div><div class="detail-stat"><label>tool calls</label><strong>${t.tool_calls}</strong></div><div class="detail-stat"><label>errors</label><strong>${t.tool_errors}</strong></div></div>${t.infrastructure_error?`<div class="error-note">${esc(t.infrastructure_error)}</div>`:''}${renderTeam(d.team)}<section class="trace-section"><div class="trace-toolbar"><span class="trace-title">Trajectory</span>${actorButtons}<button class="trace-action" id="traceError">ERRORS · ${errors}</button><button class="trace-action" id="traceOrder">${state.detail.order==='desc'?'LATEST FIRST':'EARLIEST FIRST'}</button><input class="trace-search" id="traceSearch" value="${esc(state.detail.query)}" placeholder="搜索响应 / 工具 / 输出" aria-label="搜索轨迹"><span class="trace-count" id="traceCount"></span></div><div class="trace-rail">${rail}</div><div class="trace-feed">${ordered.map(renderGroup).join('')}<div class="empty-state" id="traceEmpty" hidden>没有匹配的轨迹分组</div></div></section>${detailBlock('Agent response',d.agent_response||d.recent_text)}${detailBlock('Hidden test log',d.hidden_log)}${detailBlock('Docker build log',d.docker_build_log)}${detailBlock('stderr',d.stderr_log)}${detailBlock('stdout',d.stdout_log)}`;
+      wireTraceControls();
+    }
+    async function openTask(name,mode,{silent=false}={}) {
+      const same=state.selected?.name===name&&state.selected?.mode===mode;
+      if(state.detailLoading&&silent)return;
+      if(!same){state.detail={actor:'all',query:'',errors:false,order:'desc'};state.detailFingerprint='';state.detailData=null;}
+      state.selected={name,mode}; document.body.classList.add('drawer-open'); $('drawerTitle').textContent=name;
+      const oldScroll=same?$('drawerBody').scrollTop:0, activeId=document.activeElement?.id||'', selectionStart=document.activeElement?.selectionStart;
+      if(!silent){$('drawerMeta').textContent=`${mode} · 读取 progress / result / scorer logs…`; $('drawerBody').innerHTML='<div class="empty-state">读取任务日志…</div>';}
+      const requestId=++state.detailRequest; state.detailLoading=true;
+      try {
+        const res=await fetch(`/api/task?run=${encodeURIComponent(state.currentRun)}&task=${encodeURIComponent(name)}&mode=${encodeURIComponent(mode)}`,{cache:'no-store'}); if(!res.ok)throw new Error(`HTTP ${res.status}`); const d=await res.json(); if(requestId!==state.detailRequest||state.selected?.name!==name||state.selected?.mode!==mode)return;
+        const trace=d.trace_events||d.recent_events||[], last=trace[trace.length-1]; const fingerprint=[trace.length,last?.created_at,d.task.status,d.task.turns,d.task.tool_errors].join('|');
+        if(silent&&fingerprint===state.detailFingerprint)return;
+        state.detailFingerprint=fingerprint; renderTaskDetail(d);
+        requestAnimationFrame(()=>{if(silent)$('drawerBody').scrollTop=oldScroll;if(activeId&&$(activeId)){ $(activeId).focus(); if(selectionStart!=null&&$(activeId).setSelectionRange)$(activeId).setSelectionRange(selectionStart,selectionStart); }});
+      } catch(err) { if(!silent){toast(`无法读取 ${name}: ${err.message}`); $('drawerBody').innerHTML='<div class="empty-state">任务详情读取失败</div>';}}
+      finally { if(requestId===state.detailRequest)state.detailLoading=false; }
+    }
+    function closeDrawer(){state.selected=null;state.detailRequest++;state.detailLoading=false;document.body.classList.remove('drawer-open');}
+    function toast(message){const el=$('toast');el.textContent=message;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2800);}
+    async function applySlots(){
+      if(!state.currentRun)return;
+      const rollout=Number($('rolloutSlots').value),reward=Number($('rewardSlots').value),button=$('applySlots');
+      if(!Number.isInteger(rollout)||!Number.isInteger(reward)||rollout<0||reward<0){toast('槽位必须是非负整数');return;}
+      button.disabled=true;
+      try{
+        const res=await fetch('/api/concurrency',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:state.currentRun,rollout_concurrency:rollout,reward_concurrency:reward})});
+        const payload=await res.json();if(!res.ok)throw new Error(payload.error||`HTTP ${res.status}`);
+        toast(`已调整：rollout ${rollout} · reward ${reward}`);await refresh();
+      }catch(err){toast(`调整失败: ${err.message}`);}finally{button.disabled=false;}
+    }
+    async function refresh() {
+      if(state.paused||!state.currentRun)return;
+      try { const [res,globalRes]=await Promise.all([fetch(`/api/state?run=${encodeURIComponent(state.currentRun)}`,{cache:'no-store'}),fetch(`/api/global?run=${encodeURIComponent(state.currentRun)}`,{cache:'no-store'})]); if(!res.ok||!globalRes.ok)throw new Error(`HTTP ${!res.ok?res.status:globalRes.status}`); state.data=await res.json();state.globalData=await globalRes.json(); render(); if(state.selected)openTask(state.selected.name,state.selected.mode,{silent:true}); }
+      catch(err){$('liveDot').className='live-dot stale';$('liveText').textContent='DISCONNECTED';toast(`刷新失败: ${err.message}`);}
+    }
+    function selectRun(runId){state.currentRun=runId;state.data=null;closeDrawer();localStorage.setItem('nl2repo-dashboard-run',runId);history.replaceState({},'',`?run=${encodeURIComponent(runId)}`);$('runSelect').value=runId;state.view='table';document.querySelectorAll('[data-view]').forEach(button=>button.classList.toggle('active',button.dataset.view==='table'));document.querySelectorAll('.view').forEach(view=>view.classList.toggle('active',view.id==='view-table'));refresh();}
+    async function loadRuns() {
+      const res=await fetch('/api/runs',{cache:'no-store'}); if(!res.ok)throw new Error(`HTTP ${res.status}`); const payload=await res.json();
+      const requested=new URLSearchParams(location.search).get('run'); const remembered=localStorage.getItem('nl2repo-dashboard-run');
+      const ids=payload.runs.map(run=>run.id); const selected=[requested,remembered,payload.default,ids[0]].find(id=>id&&ids.includes(id));
+      $('runSelect').innerHTML=payload.runs.map(run=>`<option value="${esc(run.id)}">${esc(run.id)}${run.queue_mode?' · continuous':''}${run.invalidated?' · INVALID':''}</option>`).join('');
+      state.currentRun=selected||null; if(state.currentRun)$('runSelect').value=state.currentRun;
+    }
+    function schedule(){clearInterval(state.timer);state.timer=setInterval(refresh,Number($('interval').value));}
+    document.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('click',()=>{state.view=btn.dataset.view;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b===btn));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${state.view}`));updateViewControls();}));
+    $('issueToggle').addEventListener('click',()=>{state.issues=!state.issues;$('issueToggle').classList.toggle('active',state.issues);render();});
+    $('statusFilter').addEventListener('change',render); $('search').addEventListener('input',render);
+    $('applySlots').addEventListener('click',applySlots);
+    $('pauseBtn').addEventListener('click',()=>{state.paused=!state.paused;$('pauseBtn').textContent=state.paused?'▶':'Ⅱ';$('pauseBtn').title=state.paused?'恢复自动刷新':'暂停自动刷新';if(!state.paused)refresh();});
+    $('interval').addEventListener('change',schedule); $('closeDrawer').addEventListener('click',closeDrawer); $('backdrop').addEventListener('click',closeDrawer); document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer();});
+    $('runSelect').addEventListener('change',()=>{state.currentRun=$('runSelect').value;state.data=null;closeDrawer();localStorage.setItem('nl2repo-dashboard-run',state.currentRun);history.replaceState({},'',`?run=${encodeURIComponent(state.currentRun)}`);refresh();});
+    loadRuns().then(()=>refresh()).catch(err=>toast(`批次列表读取失败: ${err.message}`)); schedule();
+  </script>
+</body>
+</html>

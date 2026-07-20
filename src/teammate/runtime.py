@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -94,11 +94,30 @@ class TeammateRuntime:
         *,
         max_turns: int = 30,
         max_output_tokens: int = 4096,
+        allowed_models: set[str] | None = None,
+        minimum_timeout_s: float | None = None,
     ):
         self.provider = provider
         self.registry = registry
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
+        self.allowed_models = {
+            model.strip() for model in (allowed_models or set()) if model.strip()
+        }
+        self.minimum_timeout_s = minimum_timeout_s
+
+    def validate_model(self, model: str | None) -> str | None:
+        """Reject teammate model overrides unsupported by this endpoint."""
+        if model is None:
+            return None
+        normalized = model.strip()
+        if self.allowed_models and normalized not in self.allowed_models:
+            allowed = ", ".join(sorted(self.allowed_models))
+            raise ValueError(
+                f"unsupported teammate model {normalized!r}; omit model to inherit the "
+                f"lead model or choose one of: {allowed}"
+            )
+        return normalized
 
     def validate_tools(self, names: list[str]) -> list[str]:
         canonical: list[str] = []
@@ -136,7 +155,27 @@ class TeammateRuntime:
             return {"status": "failed", "error": "no active team"}
         if team.status == "completed":
             lead_context.reload_team_state()
-            return self._result(lead_context, team, [])
+            if all(
+                task.get("status") == "completed"
+                for task in lead_context.tasks.values()
+            ):
+                return self._result(lead_context, team, [])
+            team.transition_to("running")
+            team.completed_at = None
+            lead_context.team_store.save_team(team)
+            lead_context.team_store.append_event(
+                team.team_id,
+                "team.reopened",
+                {
+                    "reason": "unfinished tasks were added after completion",
+                    "unfinished_task_ids": [
+                        task_id
+                        for task_id, task in lead_context.tasks.items()
+                        if task.get("status") != "completed"
+                    ],
+                },
+            )
+            lead_context.reload_team_state()
         if team.status == "cancelled" and not resume:
             return {"status": "cancelled", "error": "team is cancelled", "team_id": team.team_id}
 
@@ -152,6 +191,22 @@ class TeammateRuntime:
                 "lease_timeout_s": lease_timeout_s,
             },
         )
+        requested_timeout_s = options.timeout_s
+        if self.minimum_timeout_s is not None and (
+            options.timeout_s is None or options.timeout_s < self.minimum_timeout_s
+        ):
+            options = replace(options, timeout_s=self.minimum_timeout_s)
+            lead_context.team_store.append_event(
+                team.team_id,
+                "team.options_adjusted",
+                {
+                    "timeout_s": {
+                        "requested": requested_timeout_s,
+                        "effective": self.minimum_timeout_s,
+                        "reason": "runtime minimum",
+                    }
+                },
+            )
         persisted_options = options.to_dict()
         persisted_options.pop("max_batches", None)
         team.settings.update(persisted_options)
@@ -226,7 +281,7 @@ class TeammateRuntime:
                     and self._dependencies_completed(task, tasks)
                     and task.get("owner") in agents
                     and agents[str(task.get("owner"))].status
-                    not in {"stopping", "cancelled", "completed"}
+                    not in {"stopping", "cancelled"}
                 ]
                 if not ready:
                     active = [
@@ -777,6 +832,9 @@ class TeammateRuntime:
             workspace_root=workspace_root,
             permission_context=permissions,
             cwd=workspace_root,
+            workspace_backend=lead_context.workspace_backend,
+            execution_workspace_root=lead_context.execution_workspace_root,
+            execution_cwd=lead_context.execution_workspace_root,
             actor_id=agent.agent_id,
             current_task_id=task.id,
             model_override=agent.model,

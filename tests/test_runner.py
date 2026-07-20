@@ -52,6 +52,10 @@ class TestRunner(unittest.TestCase):
         self.assertIsNotNone(call["tool_context"].teammate_runtime)
         self.assertEqual(call["tool_context"].teammate_runtime.max_turns, 77)
         self.assertEqual(call["tool_context"].teammate_runtime.max_output_tokens, 8192)
+        self.assertEqual(
+            call["tool_context"].teammate_runtime.allowed_models,
+            {"configured-model"},
+        )
         self.assertEqual(call["max_turns"], 100)
         self.assertEqual(call["max_output_tokens"], 8192)
 
@@ -97,6 +101,120 @@ class TestRunner(unittest.TestCase):
             api_key="env-token",
             base_url="https://env.example.invalid",
             model="env-model",
+        )
+
+    def test_qwen_environment_overrides_persisted_config(self) -> None:
+        provider_class = Mock(return_value=Mock(model="ms-env"))
+        environment = {
+            "QWEN_API_KEY": "tione-token",
+            "QWEN_BASE_URL": "https://qwen.example.invalid/v1",
+            "QWEN_MODEL": "ms-env",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.dict(os.environ, environment, clear=False),
+                patch(
+                    "src.runner.get_provider_config",
+                    return_value={
+                        "api_key": "saved-token",
+                        "base_url": "https://saved.invalid/v1",
+                        "default_model": "ms-saved",
+                    },
+                ),
+                patch("src.runner.get_provider_class", return_value=provider_class),
+                patch(
+                    "src.runner.run_agent_loop",
+                    return_value=AgentLoopResult("done", None, 1),
+                ),
+            ):
+                run_prompt("task", workspace=tmp, provider_name="qwen")
+
+        provider_class.assert_called_once_with(
+            api_key="tione-token",
+            base_url="https://qwen.example.invalid/v1",
+            model="ms-env",
+        )
+
+    def test_explicit_provider_environment_takes_precedence(self) -> None:
+        provider_class = Mock(return_value=Mock(model="explicit-model"))
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "QWEN_API_KEY": "process-token",
+                        "QWEN_BASE_URL": "https://process.invalid/v1",
+                    },
+                    clear=False,
+                ),
+                patch(
+                    "src.runner.get_provider_config",
+                    return_value={"default_model": "saved-model"},
+                ),
+                patch("src.runner.get_provider_class", return_value=provider_class),
+                patch(
+                    "src.runner.run_agent_loop",
+                    return_value=AgentLoopResult("done", None, 1),
+                ),
+            ):
+                run_prompt(
+                    "task",
+                    workspace=tmp,
+                    provider_name="qwen",
+                    provider_env={
+                        "QWEN_API_KEY": "explicit-token",
+                        "QWEN_BASE_URL": "https://explicit.invalid/v1",
+                        "QWEN_MODEL": "explicit-model",
+                        "QWEN_ENABLE_THINKING": "1",
+                        "QWEN_ROUTING_KEY": "trial-route",
+                    },
+                )
+
+        provider_class.assert_called_once_with(
+            api_key="explicit-token",
+            base_url="https://explicit.invalid/v1",
+            model="explicit-model",
+            enable_thinking=True,
+            routing_key="trial-route",
+        )
+
+    def test_solo_runtime_removes_all_collaboration_tools(self) -> None:
+        provider = Mock(model="configured-model")
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("src.runner.get_default_provider", return_value="anthropic"),
+                patch(
+                    "src.runner.get_provider_config",
+                    return_value={"api_key": "test-key", "default_model": "model"},
+                ),
+                patch(
+                    "src.runner.get_provider_class",
+                    return_value=Mock(return_value=provider),
+                ),
+                patch(
+                    "src.runner.run_agent_loop",
+                    return_value=AgentLoopResult("done", None, 1),
+                ) as agent_loop,
+            ):
+                run_prompt(
+                    "task",
+                    workspace=tmp,
+                    include_team_tools=False,
+                )
+
+        registry = agent_loop.call_args.kwargs["tool_registry"]
+        names = {spec.name for spec in registry.list_specs()}
+        self.assertTrue({"Bash", "Read", "Write"}.issubset(names))
+        self.assertTrue(
+            {
+                "Agent",
+                "TaskCreate",
+                "TeamCreate",
+                "TeammateCreate",
+                "TeamRun",
+                "SendMessage",
+                "ReadMessages",
+            }.isdisjoint(names)
         )
 
     def test_read_prompt_file_relative_to_workspace(self) -> None:
