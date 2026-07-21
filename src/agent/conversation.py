@@ -49,7 +49,7 @@ class Message:
 class Conversation:
     """Conversation manager."""
     messages: list[Message] = field(default_factory=list)
-    max_history: int = 100
+    max_history: int = 300
 
     def add_message(self, role: str, content: Union[str, list[ContentBlock]]):
         """Add a message to conversation."""
@@ -150,7 +150,7 @@ class Conversation:
     @classmethod
     def from_dict(cls, data: dict) -> 'Conversation':
         """Deserialize conversation."""
-        conv = cls(max_history=data.get("max_history", 100))
+        conv = cls(max_history=data.get("max_history", 300))
         for msg_data in data.get("messages", []):
             content = msg_data["content"]
             if isinstance(content, str):

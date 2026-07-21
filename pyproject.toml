@@ -39,6 +39,12 @@ dev = [
     "twine>=5.0.0",
     "pytest>=8.0.0",
 ]
+ags = [
+    "aiohttp>=3.10",
+    "swe-rex>=1.4.0",
+    "tencentcloud-sdk-python-ags>=3.1.132",
+    "tencentcloud-sdk-python-common>=3.1.132",
+]
 
 [project.scripts]
 clawd = "src.cli:main"
@@ -51,3 +57,9 @@ Documentation = "https://github.com/GPT-AGI/Clawd-Codex#readme"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.teammate" = ["trace_viewer.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

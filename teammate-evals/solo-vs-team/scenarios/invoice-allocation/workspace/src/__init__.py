@@ -1,0 +1,1 @@
+"""Invoice allocation fixture."""

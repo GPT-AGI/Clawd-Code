@@ -126,6 +126,8 @@ clawd              # Start REPL
 clawd login        # Configure API
 clawd --version    # Check version
 clawd config       # View settings
+clawd config --use glm5      # Switch to Z.ai GLM-5.2 profile
+clawd config --use qwen3.5   # Switch to Tencent TI-ONE Qwen 3.5 profile
 ```
 
 ***
@@ -145,7 +147,7 @@ clawd config       # View settings
 |--------|--------|-------------|
 | CLI Entry | ✅ | `clawd`, `login`, `config`, `--version` |
 | Interactive REPL | ✅ | Rich interactive output, history, tab completion, multiline |
-| Multi-Provider | ✅ | Anthropic, OpenAI, GLM support |
+| Multi-Provider | ✅ | Anthropic, OpenAI, GLM, Qwen/TI-ONE support |
 | Session Persistence | ✅ | Save/load sessions locally |
 | Agent Loop | ✅ | Tool calling loop implementation |
 | Skill System | ✅ | SKILL.md-based slash-command skills with args + tool limits |
@@ -209,6 +211,19 @@ This flow will:
 4. optionally save a default model
 5. set the selected provider as default
 
+For the preconfigured benchmark model profiles, switching does not require
+re-entering keys:
+
+```bash
+clawd config --use glm5
+clawd config --use qwen3.5
+```
+
+The Qwen profile uses the TI-ONE service group ID `ms-mnhdj86z` as its model
+and the service URL ending in `/ms-mnhdj86z/v1`. Store the service AuthToken
+through `clawd login` or `QWEN_API_KEY`; it is sent as the Authorization header
+value and is never committed to the repository.
+
 The configuration file is saved in in `~/.clawd/config.json`. Example structure:
 
 ```json
@@ -239,7 +254,19 @@ The configuration file is saved in in `~/.clawd/config.json`. Example structure:
 ```bash
 python -m src.cli          # Start REPL
 python -m src.cli --help   # Show help
+clawd run -C ./project --prompt-file TASK.md  # Run one task non-interactively
+clawd trace ./project      # Inspect teammate traces locally
+clawd peer run --repo ./project --prompt-file TASK.md --peers 2 --communication p2p --workspace-mode worktree
 ```
+
+`clawd run` also accepts a quoted prompt or piped stdin. Local file operations
+are scoped to the selected workspace, progress is written to stderr, and the
+final answer is written to stdout for scripting and CI use. Provider credentials
+can come from `clawd login` or standard environment variables such as
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and `OPENAI_API_KEY`.
+Peer-native runs create equal persistent sessions without a lead or owned task
+graph. See `teammate-evals/peer-collaboration/README.md` for conditions,
+scripted smoke tests, output schemas, and real-model pilot commands.
 
 **That's it!** Start chatting with AI in 3 steps.
 
@@ -258,6 +285,89 @@ python -m src.cli --help   # Show help
 | `/multiline` | Toggle multiline mode |
 | `/clear`     | Clear history         |
 | `/exit`      | Exit REPL             |
+
+### Teammate Workflows
+
+The lead can create persistent teammates, assign dependency-aware tasks, and
+run them with bounded concurrency.
+
+The lead first decides whether collaboration is worthwhile; using no team is a
+valid outcome. When delegation helps, the lead chooses any task-specific roles,
+models, tool allowlists, workspace modes, dependencies, and concurrency. There
+is no required planner/coder/reviewer pipeline. Teammates can communicate
+directly with one another using `SendMessage` and poll peer replies with
+`ReadMessages`, so the communication topology emerges from the work.
+
+```text
+TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
+```
+
+For repository-generation work, enable `quality_gates` on `TeamCreate` and use the
+protocol-v2 atomic workflow:
+
+```text
+TeamCreate -> TeamPlan -> TeamRun
+```
+
+`TeamPlan` atomically replaces the complete contract, worker set, task DAG, validation
+profile, and execution budget. It requires two independently runnable implementation
+owners, concrete non-overlapping `owned_files`, behavioral `acceptance_checks`, and
+explicit frozen or handoff interfaces. Worker writes are checked against their current
+task ownership. `TeamRun` owns produced-to-accepted transitions and automatically creates
+a fresh environment for install, import, and integration verification before the Team can
+transition to `completed`. A validation or ownership failure enters `repair_required` and
+can continue only after a new `TeamPlan` revision. `TeamAbort` is the explicit terminal
+escape hatch. The incremental `TeamConfigure`/`TeammateCreate`/`TaskCreate` flow remains
+available only for protocol-v1 teams.
+
+Creation tools return structured `next_required_actions`; creating a teammate
+does not start it. A worker runs only after it owns a task and the lead calls
+`TeamRun`. If the lead tries to finish with an active team that has not settled,
+the agent loop returns a lifecycle warning and requires the lead to run, resume,
+or explicitly delete the team first.
+
+For protocol v1, `TeamRun` accepts `max_workers`, `max_batches`, `max_retries`,
+`lease_timeout_s`, `timeout_s`, `token_budget`, and `turn_budget`. Use
+`TeamResume` to recover expired leases or
+resume a failed/cancelled team, `TaskRetry` for an explicit task retry, and
+`TeamCancel` for cooperative cancellation. Every state transition, model call,
+tool call, and message handoff is persisted for `clawd trace`.
+Set `max_batches` to return control after a bounded number of scheduling batches
+so the lead can inspect progress, add or reassign tasks, adjust dependencies,
+stop or resume workers, and then continue the team.
+
+Only the lead may call `TeammateStop` or `TeammateResume`. `TeammateStop` stops
+one worker without cancelling the team and applies `task_policy: "requeue"`
+(the default) or `task_policy: "cancel"` to unfinished work. Active model and
+tool calls stop cooperatively at the next safe boundary; they are not force-killed.
+
+Human operators can inspect and control the same persisted state without a lead
+model round trip. The worker lifecycle and process-based force-stop migration
+are documented in `docs/guide/TEAMMATE_WORKER_LIFECYCLE.md`:
+
+```bash
+clawd team list -C ./project
+clawd team status -C ./project
+clawd team stop coder --task-policy requeue -C ./project
+clawd team resume-worker coder -C ./project
+clawd team reassign implementation replacement-coder -C ./project
+clawd team cancel --reason "operator request" -C ./project
+clawd team resume --provider anthropic --model glm-5.2 -C ./project
+```
+
+The atomic repository-generation protocol, ownership enforcement, repair lifecycle,
+and Q/P/E evaluation policy are documented in `docs/guide/TEAM_PROTOCOL_V2.md`.
+
+Set `workspace_mode: "worktree"` on `TeammateCreate` for git isolation. With
+`auto_integrate: true`, successful changes are committed in the isolated
+worktree and cherry-picked into the lead repository. Downstream reviewers that
+must inspect newly integrated changes should use the shared workspace. The
+resilience evaluator is in `teammate-evals/runtime-resilience/`.
+
+The five-scenario real-model benchmark in `teammate-evals/solo-vs-team/`
+compares solo and adaptive lead-controlled execution on identical business
+tasks. It records acceptance quality, elapsed time, token use, model/tool calls,
+and collaboration evidence in isolated workspaces.
 
 ### Skills (Slash Commands)
 
@@ -558,6 +668,8 @@ clawd              # 启动 REPL
 clawd login        # 配置 API
 clawd --version    # 检查版本
 clawd config       # 查看设置
+clawd config --use glm5      # 切换到 Z.ai GLM-5.2
+clawd config --use qwen3.5   # 切换到腾讯 TI-ONE Qwen 3.5
 ```
 
 ***
@@ -577,7 +689,7 @@ clawd config       # 查看设置
 |------|------|------|
 | CLI 入口 | ✅ | `clawd`、`login`、`config`、`--version` |
 | 交互式 REPL | ✅ | 丰富的交互输出、历史记录、Tab 补全、多行输入 |
-| 多提供商支持 | ✅ | 支持 Anthropic、OpenAI、GLM |
+| 多提供商支持 | ✅ | 支持 Anthropic、OpenAI、GLM、Qwen/TI-ONE |
 | 会话持久化 | ✅ | 本地保存/加载会话 |
 | Agent Loop | ✅ | 工具调用循环实现 |
 | Skill 系统 | ✅ | 基于 SKILL.md 的 /skill 技能：参数替换 + 工具限制 |
@@ -641,6 +753,17 @@ python -m src.cli login
 4. 可选：保存默认 model
 5. 将该 provider 设为默认
 
+两个评测模型可以直接切换，不需要重复录入已有密钥：
+
+```bash
+clawd config --use glm5
+clawd config --use qwen3.5
+```
+
+Qwen profile 使用 TI-ONE 服务组 ID `ms-mnhdj86z` 作为模型 ID，Base URL
+以 `/ms-mnhdj86z/v1` 结尾。请通过 `clawd login` 或 `QWEN_API_KEY` 配置服务
+AuthToken；密钥只保存在用户配置中，不会写入仓库。
+
 配置文件会保存在 `~/.clawd/config.json`。示例结构：
 
 ```json
@@ -671,7 +794,18 @@ python -m src.cli login
 ```bash
 python -m src.cli          # 启动 REPL
 python -m src.cli --help   # 显示帮助
+clawd run -C ./project --prompt-file TASK.md  # 非交互执行单次任务
+clawd trace ./project      # 在本地查看 teammate 运行轨迹
+clawd peer run --repo ./project --prompt-file TASK.md --peers 2 --communication p2p --workspace-mode worktree
 ```
+
+`clawd run` 也支持直接传入 prompt 或从 stdin 读取。本地文件操作范围限制在指定
+workspace 内，执行进度输出到 stderr，最终回答输出到 stdout，便于脚本和 CI 使用。
+Provider 凭据既可来自 `clawd login`，也可使用 `ANTHROPIC_AUTH_TOKEN`、
+`ANTHROPIC_BASE_URL`、`OPENAI_API_KEY` 等标准环境变量。
+Peer-native 模式会创建没有 lead 和 owned task graph 的平等持久 session。五种实验
+condition、scripted smoke、输出 schema 与真实模型命令见
+`teammate-evals/peer-collaboration/README.md`。
 
 **就这样！** 3 步开始与 AI 对话。
 
@@ -690,6 +824,75 @@ python -m src.cli --help   # 显示帮助
 | `/multiline` | 切换多行模式  |
 | `/clear`     | 清空历史    |
 | `/exit`      | 退出 REPL |
+
+### Teammate 工作流
+
+Lead 可以创建持久化 teammate、分配带依赖的任务，并限制并行度执行。
+
+Lead 会先判断协作是否值得；完全不创建 team 也是正确结果。需要分工时，Lead 根据
+任务自行决定任意角色、模型、工具权限、workspace、依赖和并行度，不要求固定的
+planner/coder/reviewer 流水线。Teammate 可通过 `SendMessage` 直接相互通信，并用
+`ReadMessages` 获取 peer 回复，因此通信拓扑由实际工作自然产生。
+
+```text
+TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
+```
+
+仓库生成任务建议在 `TeamCreate` 开启 `quality_gates`，使用 protocol v2 原子链路：
+
+```text
+TeamCreate -> TeamPlan -> TeamRun
+```
+
+`TeamPlan` 会一次性原子替换完整契约、worker、任务 DAG、验证配置和执行预算。严格
+模式要求至少两个可立即并行的真实实现 owner、明确且不重叠的 `owned_files`、行为级
+`acceptance_checks`，以及 frozen/handoff 接口。worker 的实际写入也会按当前任务所有权
+检查。`TeamRun` 负责从 produced 到 accepted 的转换，并自动在新虚拟环境中完成安装、
+import smoke 和 integration 三段验证；验证或越界写入失败会进入 `repair_required`，只能
+提交新的 `TeamPlan` revision 后继续。`TeamAbort` 是不可恢复的终止操作。增量式
+`TeamConfigure`/`TeammateCreate`/`TaskCreate` 链路仅为 protocol v1 保留。
+
+创建类工具会返回结构化的 `next_required_actions`；创建 teammate 并不等于启动它。
+只有 worker 已拥有任务且 Lead 调用 `TeamRun` 后才会执行。如果 Lead 在 active team
+尚未收敛时尝试结束，agent loop 会返回生命周期警告，要求先运行、恢复或显式删除 team。
+
+protocol v1 的 `TeamRun` 支持 `max_workers`、`max_batches`、`max_retries`、`lease_timeout_s`、
+`timeout_s`、`token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，
+`TaskRetry` 显式重试单个任务，`TeamCancel` 执行协作式取消。所有状态迁移、模型调用、
+工具调用和消息交接都会持久化，可通过 `clawd trace` 查看。
+设置 `max_batches` 可在执行限定批次后把控制权交还 Lead，供其检查进度、追加或重派
+任务、调整依赖、停止或恢复 worker，然后继续运行。
+
+只有 Lead 可以调用 `TeammateStop` 和 `TeammateResume`。`TeammateStop` 只停止一个
+worker，不会取消整个团队；未完成任务可选择默认的 `task_policy: "requeue"`，或使用
+`task_policy: "cancel"`。当前停止会在模型/工具调用的下一个安全边界生效，不会伪装成
+能够强杀线程中的 HTTP 或 Bash 调用。
+
+人类操作者也可以直接控制同一份持久化状态，无需额外消耗 Lead 模型回合。
+完整生命周期与进程级 force-stop 迁移设计见
+`docs/guide/TEAMMATE_WORKER_LIFECYCLE.md`：
+
+```bash
+clawd team list -C ./project
+clawd team status -C ./project
+clawd team stop coder --task-policy requeue -C ./project
+clawd team resume-worker coder -C ./project
+clawd team reassign implementation replacement-coder -C ./project
+clawd team cancel --reason "operator request" -C ./project
+clawd team resume --provider anthropic --model glm-5.2 -C ./project
+```
+
+原子仓库生成协议、写入所有权、repair 生命周期和 Q/P/E 评测口径见
+`docs/guide/TEAM_PROTOCOL_V2.md`。
+
+在 `TeammateCreate` 中设置 `workspace_mode: "worktree"` 可启用 Git 隔离；配合
+`auto_integrate: true`，成功改动会在隔离 worktree 中提交并 cherry-pick 回 lead 仓库。
+需要检查新整合改动的下游 reviewer 应使用 shared workspace。稳定性评测位于
+`teammate-evals/runtime-resilience/`。
+
+`teammate-evals/solo-vs-team/` 还提供五场景真实模型 benchmark，在保持业务任务
+一致的前提下比较单 agent 与 Lead 自主决策的 teammate 工作流，并记录验收质量、耗时、token、
+模型/工具调用次数和协作证据。
 
 ### Skills（技能 / 斜杠命令）教程
 

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Clawd peer collaboration result",
+  "type": "object",
+  "required": [
+    "schema_version", "run_id", "status", "stop_reason", "run", "participants",
+    "messages", "broadcasts", "submissions", "workspace_attribution", "usage",
+    "wall_time_seconds", "orphan_threads", "retained_worktrees", "manifest_path",
+    "events_path", "result_path"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer"},
+    "run_id": {"type": "string"},
+    "status": {"type": "string"},
+    "run": {"type": "object"},
+    "participants": {"type": "array", "items": {"type": "object"}},
+    "messages": {"type": "array", "items": {"type": "object"}},
+    "broadcasts": {"type": "array", "items": {"type": "object"}},
+    "submissions": {"type": "array", "items": {"type": "object"}},
+    "workspace_attribution": {"type": "array", "items": {"type": "object"}},
+    "usage": {"type": "object"},
+    "wall_time_seconds": {"type": "number"},
+    "orphan_threads": {"type": "array", "items": {"type": "string"}},
+    "retained_worktrees": {"type": "array", "items": {"type": "string"}},
+    "manifest_path": {"type": "string"},
+    "events_path": {"type": "string"},
+    "result_path": {"type": "string"}
+  }
+}

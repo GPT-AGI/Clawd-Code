@@ -12,16 +12,17 @@ from .grep import GrepTool
 from .lsp import LSPTool
 from .mcp import MCPTool
 from .mcp_resources import ListMcpResourcesTool, ReadMcpResourceTool
-from .misc import NotebookEditTool, PowerShellTool, REPLTool, RemoteTriggerTool, SendMessageTool, TestingPermissionTool
+from .misc import NotebookEditTool, PowerShellTool, ReadMessagesTool, REPLTool, RemoteTriggerTool, SendMessageTool, TestingPermissionTool
 from .plan_mode import EnterPlanModeTool, ExitPlanModeTool
 from .read import FileReadTool
 from .send_user_message import SendUserMessageTool
 from .sleep import SleepTool
 from .skill import SkillTool
 from .structured_output import StructuredOutputTool
-from .team import TeamCreateTool, TeamDeleteTool
+from .team import TeamAbortTool, TeamCancelTool, TeamConfigureTool, TeamCreateTool, TeamDeleteTool, TeamIntegrateTool, TeamReplanTool, TeamResumeTool, TeamVerifyTool, TeammateCreateTool, TeammateResumeTool, TeammateStopTool, TeamRunTool
+from .team_plan import TeamPlanTool
 from .task_stop import TaskStopTool
-from .tasks_v2 import TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskUpdateTool
+from .tasks_v2 import TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskRetryTool, TaskUpdateTool
 from .todo_write import TodoWriteTool
 from .tool_search import ToolSearchTool
 from .web_fetch import WebFetchTool
@@ -55,17 +56,31 @@ __all__ = [
     "PowerShellTool",
     "REPLTool",
     "RemoteTriggerTool",
+    "ReadMessagesTool",
     "SendMessageTool",
     "SendUserMessageTool",
     "SkillTool",
     "SleepTool",
     "StructuredOutputTool",
     "TeamCreateTool",
+    "TeamConfigureTool",
+    "TeamAbortTool",
+    "TeamCancelTool",
     "TeamDeleteTool",
+    "TeamIntegrateTool",
+    "TeamPlanTool",
+    "TeamReplanTool",
+    "TeamResumeTool",
+    "TeammateCreateTool",
+    "TeammateResumeTool",
+    "TeammateStopTool",
+    "TeamRunTool",
+    "TeamVerifyTool",
     "TaskCreateTool",
     "TaskGetTool",
     "TaskListTool",
     "TaskOutputTool",
+    "TaskRetryTool",
     "TaskStopTool",
     "TaskUpdateTool",
     "TestingPermissionTool",

@@ -8,6 +8,7 @@ from ..errors import ToolInputError, ToolPermissionError
 from ..permission_handler import PermissionResult
 from ..protocol import ToolResult
 from ..diff_utils import unified_diff_hunks
+from ..ownership import require_owned_path
 from ..registry import ToolSpec
 
 
@@ -65,27 +66,31 @@ class FileEditTool:
 
         path = context.ensure_allowed_path(file_path)
 
-        if not path.exists():
-            raise ToolInputError(f"file does not exist: {path}")
-        if not context.was_file_read_and_unchanged(path):
-            raise ToolInputError("refusing to edit: file must be read first and unchanged since last read")
+        with context.mutation_lock:
+            require_owned_path(context, path, tool_name="Edit")
+            if not path.exists():
+                raise ToolInputError(f"file does not exist: {path}")
+            if not context.was_file_read_and_unchanged(path):
+                raise ToolInputError(
+                    "refusing to edit: file must be read first and unchanged since last read"
+                )
 
-        original_file = path.read_text(encoding="utf-8", errors="replace")
-        count = original_file.count(old)
-        if count == 0:
-            raise ToolInputError("old_string not found in file")
-        if count > 1 and not replace_all:
-            raise ToolInputError("old_string is not unique; provide a larger old_string or set replace_all=true")
+            original_file = path.read_text(encoding="utf-8", errors="replace")
+            count = original_file.count(old)
+            if count == 0:
+                raise ToolInputError("old_string not found in file")
+            if count > 1 and not replace_all:
+                raise ToolInputError(
+                    "old_string is not unique; provide a larger old_string or set replace_all=true"
+                )
 
-        if replace_all:
-            updated = original_file.replace(old, new)
-            replaced = count
-        else:
-            updated = original_file.replace(old, new, 1)
-            replaced = 1
+            if replace_all:
+                updated = original_file.replace(old, new)
+            else:
+                updated = original_file.replace(old, new, 1)
 
-        path.write_text(updated, encoding="utf-8")
-        context.mark_file_read(path)
+            path.write_text(updated, encoding="utf-8")
+            context.mark_file_read(path)
         before_lines = original_file.splitlines(keepends=True)
         after_lines = updated.splitlines(keepends=True)
         diff_lines = list(

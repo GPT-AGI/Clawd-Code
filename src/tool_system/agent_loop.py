@@ -3,25 +3,87 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .registry import ToolRegistry
 from .context import ToolContext
-from ..agent.conversation import Conversation, TextContentBlock, ToolUseContentBlock
+from ..agent.conversation import (
+    Conversation,
+    TextContentBlock,
+    ToolResultContentBlock,
+    ToolUseContentBlock,
+)
 from ..context_system import build_context_prompt
 from ..outputStyles import resolve_output_style
 from ..providers.base import BaseProvider, ChatResponse
 from ..providers.anthropic_provider import AnthropicProvider
 from ..providers.minimax_provider import MinimaxProvider
+from ..teammate.trace import TeamTraceRecorder
+from ..peer.trace import PeerTraceRecorder
+
+
+_LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
+- Local workspace files are accessed with `Read`, `Glob`, and `Grep`.
+- Use `Write` to create files and `Edit` for exact replacements in files you have read.
+- Use `Bash` to run local commands and tests. For Python, prefer `$CLAWD_PYTHON`; it points to the interpreter running Clawd.
+- Use web tools only for HTTP or HTTPS resources. Never send local paths or `file://` URLs to `webReader`, `WebFetch`, or other web tools.
+- These local tools are registered even if a provider also offers built-in web tools. If unsure, call `ToolSearch` with focused keywords or query `*`; do not conclude that a tool is unavailable after one empty search."""
+
+_LEADER_TEAM_GUIDANCE = """## Adaptive Team Orchestration
+- You are the lead and remain responsible for the final result. First decide whether delegation is likely to improve quality, latency, or context coverage enough to justify its cost. It is valid to complete the task without creating a team.
+- For a strict quality-gated team, submit the complete contract, workers, tasks, ownership, acceptance, validation, and execution settings in one atomic TeamPlan, then call TeamRun. TeamRun owns task acceptance and final verification. Do not assemble protocol v2 incrementally with TeamConfigure, TeammateCreate, TaskCreate, or TeamVerify.
+- When a team is useful, choose the number of teammates, their roles, tool allowlists, workspace modes, tasks, dependencies, and concurrency from the task itself. Omit a teammate model override unless the runtime explicitly lists it as supported; otherwise inherit the lead model. Do not default to a fixed planner/coder/reviewer pipeline.
+- Teammates may communicate directly with one another through `SendMessage` and receive new peer messages through `ReadMessages`; useful peer coordination does not need to be routed through the lead.
+- Use stable task keys and explicit ownership. Prefer dependencies only when work truly must be sequential, and allow independent tasks to run in parallel.
+- Include persistent project test files in the owning task's owned_files. For behavioral acceptance without a deliverable test file, prefer an inline command; teammates receive a private scratch-test path for additional disposable checks.
+- Observe persisted task, message, and agent state. You may run a bounded number of scheduling batches, then add or reassign tasks, adjust dependencies, stop or resume workers, recover failures, and continue.
+- Treat teammate output as evidence, not authority. Integrate the work, run final verification yourself, and stop unnecessary work when the expected value of more collaboration is low.
+- The resulting communication topology is an execution outcome, not a prescribed shape."""
+
+_EMPTY_RESPONSE_RETRY_LIMIT = 3
+_EMPTY_RESPONSE_CORRECTION = (
+    "Your previous response contained neither visible content nor a tool call. "
+    "Continue the task instead of stopping silently. If work remains, call the "
+    "appropriate tools now; if the task is genuinely complete, provide a non-empty "
+    "final response describing the completed work."
+)
 
 
 def _is_anthropic_provider(provider: BaseProvider) -> bool:
     return isinstance(provider, (AnthropicProvider, MinimaxProvider))
 
 
-def _build_openai_tool_result_content(result_output: Any) -> str:
-    """Format tool result as string for OpenAI/GLM."""
+def _truncate_provider_text(value: Any, limit: int = 8_000) -> Any:
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    half = limit // 2
+    return f"{value[:half]}\n\n... [truncated for model context] ...\n\n{value[-half:]}"
+
+
+def _build_tool_result_content(tool_name: str, result_output: Any) -> str:
+    """Serialize structured tool output without echoing large redundant payloads."""
+    lowered = tool_name.lower()
+    if (
+        isinstance(result_output, dict)
+        and lowered in {"write", "edit"}
+        and ("filePath" in result_output or "file_path" in result_output)
+    ):
+        keys = (
+            ("type", "filePath")
+            if lowered == "write"
+            else ("filePath", "replaceAll", "userModified")
+        )
+        compact = {key: result_output[key] for key in keys if key in result_output}
+        compact["success"] = True
+        return json.dumps(compact, ensure_ascii=False)
+    if isinstance(result_output, dict) and lowered == "bash":
+        compact = dict(result_output)
+        compact["stdout"] = _truncate_provider_text(compact.get("stdout"))
+        compact["stderr"] = _truncate_provider_text(compact.get("stderr"))
+        return json.dumps(compact, ensure_ascii=False)
     if isinstance(result_output, str):
         return result_output
     return json.dumps(result_output, ensure_ascii=False)
@@ -92,12 +154,23 @@ def summarize_tool_result(name: str, output: Any) -> str:
 @dataclass(frozen=True)
 class ToolEvent:
     kind: str
-    tool_name: str
+    tool_name: str | None = None
     tool_input: dict[str, Any] | None = None
     tool_output: Any | None = None
     tool_use_id: str | None = None
     is_error: bool = False
     error: str | None = None
+    content: str | None = None
+    model: str | None = None
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
+    turn: int | None = None
+    duration_ms: int | None = None
+    created_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.created_at:
+            object.__setattr__(self, "created_at", datetime.now(timezone.utc).isoformat())
 
 
 @dataclass(frozen=True)
@@ -106,10 +179,14 @@ class AgentLoopResult:
     response_text: str
     usage: dict[str, Any] | None = None  # {"input_tokens": int, "output_tokens": int}
     num_turns: int = 0
+    cancelled: bool = False
+    failed: bool = False
+    failure_reason: str | None = None
 
 
 ToolEventHandler = Callable[[ToolEvent], None]
 TextChunkHandler = Callable[[str], None]
+StopPredicate = Callable[[], bool]
 
 
 def _safe_call_handler(handler: ToolEventHandler | None, event: ToolEvent) -> None:
@@ -119,6 +196,15 @@ def _safe_call_handler(handler: ToolEventHandler | None, event: ToolEvent) -> No
         handler(event)
     except Exception:
         return
+
+
+def _safe_should_stop(predicate: StopPredicate | None) -> bool:
+    if predicate is None:
+        return False
+    try:
+        return bool(predicate())
+    except Exception:
+        return False
 
 
 def _emit_text_chunks(handler: TextChunkHandler | None, text: str, *, chunk_size: int = 12) -> None:
@@ -174,9 +260,145 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
         )
     except Exception:
         context_prompt = ""
-    if not context_prompt.strip():
-        return style_prompt
-    return f"{style_prompt}\n\n{context_prompt}"
+    sections = [style_prompt, _LOCAL_TOOL_GUIDANCE]
+    if tool_context.actor_id is None:
+        sections.append(_LEADER_TEAM_GUIDANCE)
+    if tool_context.workspace_backend is not None:
+        execution_root = tool_context.execution_workspace_root or "/workspace"
+        execution_cwd = tool_context.execution_cwd or execution_root
+        sections.append(
+            "## Sandboxed Execution Workspace\n"
+            f"Bash and file tools execute inside a remote sandbox. Its workspace root is "
+            f"`{execution_root}` and the current directory is `{execution_cwd}`. "
+            "Use these paths for repository work. The host workspace shown in environment "
+            "context contains control metadata and maps transparently to this remote workspace."
+        )
+    if tool_context.system_prompt_extra and tool_context.system_prompt_extra.strip():
+        sections.append(tool_context.system_prompt_extra.strip())
+    if context_prompt.strip():
+        sections.append(context_prompt)
+    return "\n\n".join(sections)
+
+
+def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
+    """Return a corrective prompt when a lead tries to finish with unsettled team state."""
+    if tool_context.actor_id is not None:
+        return None
+    try:
+        tool_context.reload_team_state()
+    except Exception:
+        return None
+    team = tool_context.team
+    if team is None:
+        return None
+
+    team_id = str(team.get("team_id") or "")
+    status = str(team.get("status") or "created")
+    agents = tool_context.team_store.list_agents(team_id) if team_id else []
+    tasks = list(tool_context.tasks.values())
+    task_counts = {
+        name: sum(task.get("status") == name for task in tasks)
+        for name in ("pending", "in_progress", "completed", "failed", "cancelled")
+    }
+    quality = dict((team.get("settings") or {}).get("quality_gates") or {})
+    strict = bool(quality.get("strict"))
+    versions = [1]
+    for raw_version in (
+        team.get("protocol_version"),
+        (team.get("settings") or {}).get("protocol_version"),
+        quality.get("protocol_version"),
+    ):
+        try:
+            versions.append(int(raw_version))
+        except (TypeError, ValueError):
+            continue
+    protocol_version = max(versions)
+    lifecycle_state = str(team.get("lifecycle_state") or status)
+    validation_status = (quality.get("validation") or {}).get("status")
+
+    if protocol_version >= 2 and lifecycle_state == "completed":
+        v2_tasks_settled = bool(tasks) and all(
+            task.get("status") == "completed"
+            and task.get("lifecycle_state") == "accepted"
+            for task in tasks
+        )
+        if v2_tasks_settled and validation_status == "passed":
+            return None
+    if (
+        protocol_version < 2
+        and
+        team.get("status") == "completed"
+        and tasks
+        and task_counts["completed"] == len(tasks)
+        and (not strict or validation_status == "passed")
+    ):
+        return None
+
+    if protocol_version >= 2 and lifecycle_state == "completed":
+        action = (
+            "The completed state has drifted from its accepted tasks or validation. "
+            "Do not reopen or replace this terminal team; preserve its workspace and "
+            "report the lifecycle inconsistency as a harness failure."
+        )
+    elif protocol_version >= 2 and lifecycle_state == "draft":
+        action = "Submit one atomic TeamPlan before attempting execution."
+    elif protocol_version >= 2 and lifecycle_state == "ready":
+        action = "Call TeamRun to execute the accepted atomic plan."
+    elif protocol_version >= 2 and lifecycle_state == "repair_required":
+        action = (
+            "Stop any active workers, call TeamReplan to checkpoint the current "
+            "workspace, submit one complete replacement TeamPlan, then call TeamRun."
+        )
+    elif protocol_version >= 2 and lifecycle_state == "budget_exhausted":
+        action = (
+            "This rollout is terminal because its frozen execution budget was exhausted. "
+            "Preserve the workspace for scoring; TeamResume and TeamReplan cannot add budget."
+        )
+    elif protocol_version >= 2 and lifecycle_state == "paused":
+        action = "Call TeamRun to continue the persisted protocol v2 lifecycle."
+    elif protocol_version >= 2 and lifecycle_state in {
+        "awaiting_verification",
+        "verifying",
+    }:
+        action = "Call TeamRun; protocol v2 will run or resume verification automatically."
+    elif not agents:
+        action = "Call TeammateCreate, create an owned task with TaskCreate, then call TeamRun."
+    elif not tasks:
+        action = "Call TaskCreate with a teammate owner, then call TeamRun. TeammateCreate did not start the worker."
+    elif status in {"failed", "cancelled"} or task_counts["failed"] or task_counts["cancelled"]:
+        action = (
+            "Inspect the failed state, call TeamReplan to preserve the current workspace, "
+            "submit one complete repair TeamPlan revision, and call TeamRun."
+            if protocol_version >= 2
+            else "Inspect the failed task, then call TeamResume (retry_failed=true) or explicitly abandon it with TeamDelete."
+        )
+    elif task_counts["pending"] or task_counts["in_progress"]:
+        action = "Call TeamRun to execute or continue the pending teammate tasks."
+    elif strict and task_counts["completed"] == len(tasks) and validation_status != "passed":
+        action = (
+            "Call TeamVerify now. Strict clean-install, import, and integration validation "
+            "must pass before the team can complete."
+        )
+    else:
+        action = "Call TeamRun once more so the runtime records the completed team state."
+
+    counts = ", ".join(f"{name}={count}" for name, count in task_counts.items() if count)
+    summary = (
+        f"status={status}, lifecycle={lifecycle_state}, "
+        f"agents={len(agents)}, tasks={len(tasks)}"
+    )
+    if counts:
+        summary += f" ({counts})"
+    ending = (
+        "TeamDelete cannot bypass a strict protocol v2 lifecycle; use TeamAbort only "
+        "when you intend to report an explicit failed/aborted outcome."
+        if strict and protocol_version >= 2
+        else "If the team is no longer needed, call TeamDelete before finishing."
+    )
+    return (
+        f"Team lifecycle guard: active team `{team.get('team_name') or team_id}` is not settled "
+        f"({summary}). Do not provide the final answer yet. {action} {ending}"
+    )
 
 
 def summarize_tool_use(name: str, tool_input: dict[str, Any]) -> str:
@@ -243,10 +465,12 @@ def run_agent_loop(
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
     max_turns: int = 20,
+    max_output_tokens: int = 4096,
     stream: bool = False,
     verbose: bool = False,
     on_event: ToolEventHandler | None = None,
     on_text_chunk: TextChunkHandler | None = None,
+    should_stop: StopPredicate | None = None,
 ) -> AgentLoopResult:
     """Run agent loop: LLM -> tools -> LLM until no more tools or max turns.
 
@@ -256,14 +480,23 @@ def run_agent_loop(
         tool_registry: Tool registry to use
         tool_context: Tool context
         max_turns: Maximum tool turns before stopping
+        max_output_tokens: Maximum output tokens requested from the model per turn
         stream: Whether to stream responses
         verbose: Whether to print tool calls/results
         on_event: Optional callback for tool events
         on_text_chunk: Optional callback for incremental user-visible text chunks
+        should_stop: Optional cooperative cancellation check at model/tool boundaries
 
     Returns:
         AgentLoopResult with final text response, usage info, and turn count
     """
+    # A tool turn adds one assistant message and one grouped tool-result message.
+    # Do not let the generic message-count cap split Anthropic tool pairs mid-run.
+    conversation.max_history = max(
+        conversation.max_history,
+        len(conversation.messages) + (2 * max_turns) + 1,
+    )
+
     # Convert tools to schemas (Anthropic format)
     tool_schemas = []
     for spec in tool_registry.list_specs():
@@ -290,38 +523,120 @@ def run_agent_loop(
             pass
 
     # Track usage across all turns
-    total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    total_usage: dict[str, int] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
     turn_count = 0
+    consecutive_empty_responses = 0
+    trace_recorder = (
+        PeerTraceRecorder(tool_context)
+        if tool_context.peer_run_id is not None
+        else TeamTraceRecorder(tool_context)
+    )
+
+    def emit(event: ToolEvent) -> None:
+        _safe_call_handler(on_event, event)
+        trace_recorder.record(event)
+
+    def finish(
+        response_text: str,
+        *,
+        failed: bool = False,
+        cancelled: bool = False,
+        failure_reason: str | None = None,
+    ) -> AgentLoopResult:
+        usage = total_usage if any(total_usage.values()) else None
+        emit(ToolEvent(
+            kind="run_cancelled" if cancelled else ("run_failed" if failed else "run_completed"),
+            content=response_text,
+            model=tool_context.model_override or getattr(provider, "model", None),
+            usage=usage,
+            turn=turn_count,
+            is_error=failed,
+            error=response_text if failed else None,
+        ))
+        return AgentLoopResult(
+            response_text=response_text,
+            usage=usage,
+            num_turns=turn_count,
+            cancelled=cancelled,
+            failed=failed,
+            failure_reason=failure_reason,
+        )
+
+    emit(ToolEvent(
+        kind="run_started",
+        model=tool_context.model_override or getattr(provider, "model", None),
+        turn=0,
+    ))
 
     for turn in range(max_turns):
+        if _safe_should_stop(should_stop):
+            return finish("[Run stopped]", cancelled=True)
         if _is_anthropic_provider(provider):
             api_messages = conversation.get_messages()
         else:
             # Use OpenAI formatted messages for non-Anthropic
             api_messages = openai_messages
 
-        call_kwargs: dict[str, Any] = {"tools": tool_schemas}
+        call_kwargs: dict[str, Any] = {
+            "tools": tool_schemas,
+            "max_tokens": max_output_tokens,
+        }
+        if tool_context.model_override:
+            call_kwargs["model"] = tool_context.model_override
         if _is_anthropic_provider(provider):
             call_kwargs["system"] = effective_system_prompt
         else:
             if turn == 0:
                 api_messages = [{"role": "system", "content": effective_system_prompt}, *api_messages]
-        response, streamed_live_text = _call_provider_for_turn(
-            provider=provider,
-            api_messages=api_messages,
-            call_kwargs=call_kwargs,
-            stream=stream,
-            on_text_chunk=on_text_chunk,
-        )
+        model_name = tool_context.model_override or getattr(provider, "model", None)
+        emit(ToolEvent(kind="model_started", model=model_name, turn=turn + 1))
+        model_started_at = time.monotonic()
+        try:
+            response, streamed_live_text = _call_provider_for_turn(
+                provider=provider,
+                api_messages=api_messages,
+                call_kwargs=call_kwargs,
+                stream=stream,
+                on_text_chunk=on_text_chunk,
+            )
+        except Exception as exc:
+            duration_ms = round((time.monotonic() - model_started_at) * 1000)
+            error = f"{type(exc).__name__}: {exc}"
+            emit(ToolEvent(
+                kind="model_error",
+                model=model_name,
+                turn=turn + 1,
+                duration_ms=duration_ms,
+                is_error=True,
+                error=error,
+            ))
+            finish(error, failed=True)
+            raise
         turn_count += 1
 
         # Collect usage info
         if response.usage:
-            total_usage["input_tokens"] += response.usage.get("input_tokens", 0)
-            total_usage["output_tokens"] += response.usage.get("output_tokens", 0)
+            for usage_key in total_usage:
+                total_usage[usage_key] += int(response.usage.get(usage_key, 0) or 0)
 
         # Build assistant content for Anthropic or just text for OpenAI
         final_assistant_content = response.content or ""
+        emit(ToolEvent(
+            kind="model_response",
+            content=final_assistant_content,
+            model=response.model or model_name,
+            usage=response.usage,
+            finish_reason=response.finish_reason,
+            turn=turn_count,
+            duration_ms=round((time.monotonic() - model_started_at) * 1000),
+        ))
+        if _safe_should_stop(should_stop):
+            return finish("[Run stopped]", cancelled=True)
 
         if _is_anthropic_provider(provider):
             assistant_blocks: list = []
@@ -363,30 +678,101 @@ def run_agent_loop(
         tool_uses = response.tool_uses or []
 
         if not tool_uses:
+            lifecycle_warning = _team_lifecycle_warning(tool_context)
+            if lifecycle_warning is not None:
+                current_team = tool_context.team or {}
+                if current_team.get("lifecycle_state") in {
+                    "aborted",
+                    "budget_exhausted",
+                }:
+                    budget_exhausted = (
+                        current_team.get("lifecycle_state") == "budget_exhausted"
+                    )
+                    terminal_text = (
+                        final_assistant_content.strip()
+                        or (
+                            "Team execution budget exhausted before successful completion."
+                            if budget_exhausted
+                            else "Team aborted before successful completion."
+                        )
+                    )
+                    if stream and terminal_text and not streamed_live_text:
+                        _emit_text_chunks(on_text_chunk, terminal_text)
+                    return finish(
+                        terminal_text,
+                        failed=True,
+                        failure_reason=(
+                            "team_budget_exhausted"
+                            if budget_exhausted
+                            else "team_aborted"
+                        ),
+                    )
+                emit(
+                    ToolEvent(
+                        kind="team_lifecycle_warning",
+                        content=lifecycle_warning,
+                        model=response.model or model_name,
+                        turn=turn_count,
+                    )
+                )
+                conversation.add_user_message(lifecycle_warning)
+                if not _is_anthropic_provider(provider):
+                    openai_messages.append({"role": "user", "content": lifecycle_warning})
+                continue
+            if not final_assistant_content.strip() and last_user_visible_message is None:
+                consecutive_empty_responses += 1
+                if consecutive_empty_responses <= _EMPTY_RESPONSE_RETRY_LIMIT:
+                    emit(
+                        ToolEvent(
+                            kind="empty_response_retry",
+                            content=_EMPTY_RESPONSE_CORRECTION,
+                            model=response.model or model_name,
+                            finish_reason=response.finish_reason,
+                            turn=turn_count,
+                            is_error=True,
+                            error=(
+                                "model returned no content or tool calls "
+                                f"({consecutive_empty_responses}/"
+                                f"{_EMPTY_RESPONSE_RETRY_LIMIT})"
+                            ),
+                        )
+                    )
+                    conversation.add_user_message(_EMPTY_RESPONSE_CORRECTION)
+                    if not _is_anthropic_provider(provider):
+                        openai_messages.append(
+                            {"role": "user", "content": _EMPTY_RESPONSE_CORRECTION}
+                        )
+                    continue
+                error = (
+                    "model returned no content or tool calls after "
+                    f"{_EMPTY_RESPONSE_RETRY_LIMIT} corrective retries"
+                )
+                finish(error, failed=True)
+                raise RuntimeError(error)
             # No more tools, done
             if stream and final_assistant_content and not streamed_live_text:
                 _emit_text_chunks(on_text_chunk, final_assistant_content)
             if (final_assistant_content or "").strip() == "" and last_user_visible_message is not None:
-                return AgentLoopResult(
-                    response_text=last_user_visible_message,
-                    usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-                    num_turns=turn_count,
-                )
-            return AgentLoopResult(
-                response_text=final_assistant_content,
-                usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-                num_turns=turn_count,
-            )
+                return finish(last_user_visible_message)
+            return finish(final_assistant_content)
+
+        consecutive_empty_responses = 0
+
+        # Anthropic expects all results for one assistant tool-use response in a
+        # single following user message.
+        anthropic_result_blocks: list[ToolResultContentBlock] = []
 
         # Call each tool
         for tool_use in tool_uses:
+            if _safe_should_stop(should_stop):
+                return finish("[Run stopped]", cancelled=True)
             tool_id = tool_use["id"]
             tool_name = tool_use["name"]
             tool_input = tool_use["input"]
+            tool_started_at = time.monotonic()
 
             try:
-                _safe_call_handler(
-                    on_event,
+                emit(
                     ToolEvent(
                         kind="tool_use",
                         tool_name=tool_name,
@@ -417,31 +803,35 @@ def run_agent_loop(
                     summary = summarize_tool_result(tool_name, result_output)
                     print(f"{summary}")
 
-                _safe_call_handler(
-                    on_event,
+                emit(
                     ToolEvent(
                         kind="tool_result",
                         tool_name=tool_name,
                         tool_output=result_output,
                         tool_use_id=tool_id,
                         is_error=result.is_error,
+                        duration_ms=round((time.monotonic() - tool_started_at) * 1000),
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, result_output)
+                    anthropic_result_blocks.append(ToolResultContentBlock(
+                        type="tool_result",
+                        tool_use_id=tool_id,
+                        content=_build_tool_result_content(tool_name, result_output),
+                        is_error=result.is_error,
+                    ))
                 else:
                     # Add tool result in OpenAI format
                     openai_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_id,
-                        "content": _build_openai_tool_result_content(result_output)
+                        "content": _build_tool_result_content(tool_name, result_output)
                     })
             except Exception as e:
                 error_str = f"Error: {e}"
                 if verbose:
                     print(f"[Tool Error] {error_str}")
-                _safe_call_handler(
-                    on_event,
+                emit(
                     ToolEvent(
                         kind="tool_error",
                         tool_name=tool_name,
@@ -449,10 +839,16 @@ def run_agent_loop(
                         tool_use_id=tool_id,
                         is_error=True,
                         error=error_str,
+                        duration_ms=round((time.monotonic() - tool_started_at) * 1000),
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, error_str, is_error=True)
+                    anthropic_result_blocks.append(ToolResultContentBlock(
+                        type="tool_result",
+                        tool_use_id=tool_id,
+                        content=error_str,
+                        is_error=True,
+                    ))
                 else:
                     openai_messages.append({
                         "role": "tool",
@@ -460,9 +856,39 @@ def run_agent_loop(
                         "content": error_str
                     })
 
-    # Reached max turns
-    return AgentLoopResult(
-        response_text="[Max tool turns reached]",
-        usage=total_usage if total_usage["input_tokens"] > 0 or total_usage["output_tokens"] > 0 else None,
-        num_turns=turn_count,
+            if _safe_should_stop(should_stop):
+                if anthropic_result_blocks:
+                    conversation.add_message("user", anthropic_result_blocks)
+                return finish("[Run stopped]", cancelled=True)
+
+        if anthropic_result_blocks:
+            conversation.add_message("user", anthropic_result_blocks)
+
+    # Reached max turns.  An unsettled protocol v2 team is a distinct lifecycle
+    # failure, not a successful model stop.  Preserve the historical response text
+    # so existing CLI/evaluation callers continue to recognize max-turn failures.
+    lifecycle_warning = _team_lifecycle_warning(tool_context)
+    if lifecycle_warning is not None:
+        emit(
+            ToolEvent(
+                kind="team_lifecycle_failed",
+                content=lifecycle_warning,
+                model=tool_context.model_override or getattr(provider, "model", None),
+                turn=turn_count,
+                is_error=True,
+                error="maximum turns reached with an unsettled team lifecycle",
+            )
+        )
+        return finish(
+            "[Max tool turns reached]",
+            failed=True,
+            failure_reason=(
+                "team_budget_exhausted"
+                if (tool_context.team or {}).get("lifecycle_state")
+                == "budget_exhausted"
+                else "team_lifecycle_failure"
+            ),
+        )
+    return finish(
+        "[Max tool turns reached]", failed=True, failure_reason="max_turns"
     )

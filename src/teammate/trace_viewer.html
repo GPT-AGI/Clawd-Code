@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clawd Teammate Trace</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f3f4f0;
+      --surface: #ffffff;
+      --surface-muted: #e9ebe6;
+      --ink: #1c1f21;
+      --ink-muted: #62686b;
+      --line: #cfd3cd;
+      --line-strong: #aeb5af;
+      --cyan: #087e8b;
+      --orange: #c45d1a;
+      --green: #39764a;
+      --red: #b33a3a;
+      --violet: #6657a8;
+      --yellow: #a97b0d;
+      --header-h: 64px;
+      --summary-h: 74px;
+      --lane-h: 88px;
+      --axis-h: 42px;
+      --label-w: 132px;
+      --slot-w: 86px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      min-height: 100%;
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button, input, select { font: inherit; letter-spacing: 0; }
+    button { color: inherit; }
+
+    .topbar {
+      height: var(--header-h);
+      display: grid;
+      grid-template-columns: minmax(210px, 1fr) minmax(260px, 430px) minmax(210px, 1fr);
+      align-items: center;
+      gap: 18px;
+      padding: 0 22px;
+      background: #202426;
+      color: #f7f8f4;
+      border-bottom: 1px solid #111415;
+    }
+
+    .brand { min-width: 0; }
+    .brand-name { font-size: 15px; font-weight: 720; }
+    .brand-subtitle {
+      margin-top: 3px;
+      color: #adb5b6;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .team-picker {
+      width: 100%;
+      height: 36px;
+      border: 1px solid #50585a;
+      border-radius: 5px;
+      background: #2c3234;
+      color: #fff;
+      padding: 0 34px 0 11px;
+    }
+
+    .connection {
+      justify-self: end;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #c9cfce;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .connection-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--yellow);
+      box-shadow: 0 0 0 3px rgba(169, 123, 13, .18);
+    }
+    .connection.is-live .connection-dot { background: #52a866; box-shadow: 0 0 0 3px rgba(82, 168, 102, .18); }
+    .connection.is-offline .connection-dot { background: #cf5555; box-shadow: 0 0 0 3px rgba(207, 85, 85, .18); }
+
+    .summary-band {
+      min-height: var(--summary-h);
+      display: grid;
+      grid-template-columns: minmax(220px, 1.4fr) repeat(5, minmax(92px, .55fr));
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .summary-primary, .metric {
+      min-width: 0;
+      padding: 13px 18px;
+      border-right: 1px solid var(--line);
+    }
+    .metric:last-child { border-right: 0; }
+
+    .summary-primary { display: flex; align-items: center; gap: 13px; }
+    .status-mark {
+      width: 11px;
+      height: 42px;
+      flex: 0 0 auto;
+      background: var(--line-strong);
+      border-radius: 2px;
+    }
+    .status-mark.completed { background: var(--green); }
+    .status-mark.running { background: var(--cyan); }
+    .status-mark.failed { background: var(--red); }
+    .status-mark.cancelled { background: var(--ink-muted); }
+    .summary-title { font-size: 16px; font-weight: 720; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .summary-meta { margin-top: 5px; color: var(--ink-muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .metric-label { color: var(--ink-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+    .metric-value { margin-top: 7px; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 16px; font-weight: 700; }
+
+    .workspace-grid {
+      min-height: calc(100vh - var(--header-h) - var(--summary-h));
+      display: grid;
+      grid-template-columns: 248px minmax(500px, 1fr) 354px;
+    }
+
+    .sidebar, .inspector {
+      background: var(--surface);
+      min-width: 0;
+    }
+    .sidebar { border-right: 1px solid var(--line); }
+    .inspector { border-left: 1px solid var(--line); }
+
+    .sidebar-section, .inspector-section {
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin: 0 0 11px;
+      color: var(--ink-muted);
+      font-size: 10px;
+      font-weight: 780;
+      text-transform: uppercase;
+    }
+    .section-count {
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      color: var(--ink);
+    }
+
+    .agent-list, .task-list, .handoff-list, .activity-list { display: grid; gap: 7px; }
+    .agent-row {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 9px 1fr auto;
+      align-items: center;
+      gap: 9px;
+      min-height: 38px;
+      padding: 6px 8px;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+    .agent-row:hover, .agent-row.is-selected { background: var(--surface-muted); border-color: var(--line); }
+    .agent-color { width: 8px; height: 24px; border-radius: 2px; background: var(--agent-color, var(--cyan)); }
+    .agent-name { display: block; min-width: 0; font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
+    .agent-role { display: block; margin-top: 2px; color: var(--ink-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
+    .status-text { color: var(--ink-muted); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+
+    .task-row {
+      position: relative;
+      min-height: 54px;
+      padding: 8px 8px 8px 14px;
+      border-left: 2px solid var(--line-strong);
+      background: #f8f9f6;
+    }
+    .task-row.completed { border-left-color: var(--green); }
+    .task-row.in_progress { border-left-color: var(--cyan); }
+    .task-row.failed { border-left-color: var(--red); }
+    .task-key { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 10px; font-weight: 780; }
+    .task-subject { margin-top: 4px; font-size: 11px; line-height: 1.35; }
+    .task-deps { margin-top: 5px; color: var(--ink-muted); font-size: 9px; line-height: 1.3; overflow-wrap: anywhere; }
+
+    .handoff-row {
+      padding: 7px 8px;
+      background: #f8f9f6;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+    }
+    .handoff-route { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 10px; font-weight: 700; }
+    .handoff-summary { margin-top: 4px; color: var(--ink-muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+
+    .main-panel { min-width: 0; background: var(--paper); }
+    .toolbar {
+      min-height: 56px;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 9px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+    }
+    .tabs { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 5px; overflow: hidden; }
+    .tab-button {
+      height: 32px;
+      padding: 0 12px;
+      border: 0;
+      border-right: 1px solid var(--line-strong);
+      background: var(--surface);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .tab-button:last-child { border-right: 0; }
+    .tab-button.is-active { background: #252a2c; color: #fff; }
+
+    .filter-select, .search-input {
+      height: 32px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      color: var(--ink);
+      padding: 0 9px;
+      font-size: 11px;
+    }
+    .filter-select { min-width: 116px; }
+    .search-input { min-width: 150px; flex: 1 1 170px; }
+    .check-label { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-muted); font-size: 10px; white-space: nowrap; }
+    .check-label input { accent-color: var(--red); }
+    .live-button {
+      height: 32px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      padding: 0 10px;
+      font-size: 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .live-button.is-active { border-color: var(--green); color: var(--green); background: #f0f7f1; }
+
+    .reconstruction-note {
+      display: none;
+      padding: 8px 12px;
+      border-bottom: 1px solid #e2cf9b;
+      background: #fff8e4;
+      color: #775c16;
+      font-size: 10px;
+      line-height: 1.4;
+    }
+    .reconstruction-note.is-visible { display: block; }
+
+    .view { display: none; }
+    .view.is-active { display: block; }
+    .timeline-viewport {
+      height: calc(100vh - var(--header-h) - var(--summary-h) - 57px);
+      min-height: 420px;
+      overflow: auto;
+      background: #f7f8f5;
+    }
+    .timeline-canvas { position: relative; min-height: 100%; background: #f7f8f5; }
+    .time-axis {
+      position: sticky;
+      top: 0;
+      z-index: 12;
+      height: var(--axis-h);
+      border-bottom: 1px solid var(--line-strong);
+      background: rgba(247, 248, 245, .96);
+    }
+    .axis-label {
+      position: absolute;
+      top: 13px;
+      width: 78px;
+      color: var(--ink-muted);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 9px;
+      text-align: center;
+      transform: translateX(-50%);
+    }
+    .axis-label::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 21px;
+      width: 1px;
+      height: calc(100vh - 180px);
+      background: #e4e6e1;
+    }
+
+    .lane {
+      position: relative;
+      height: var(--lane-h);
+      border-bottom: 1px solid var(--line);
+    }
+    .lane-label {
+      position: sticky;
+      left: 0;
+      z-index: 10;
+      width: var(--label-w);
+      height: 100%;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 10px;
+      background: #eceee9;
+      border-right: 1px solid var(--line-strong);
+    }
+    .lane-swatch { width: 5px; height: 36px; flex: 0 0 auto; border-radius: 2px; background: var(--agent-color, var(--cyan)); }
+    .lane-agent { min-width: 0; }
+    .lane-agent strong { display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+    .lane-agent span { display: block; margin-top: 3px; color: var(--ink-muted); font-size: 9px; overflow: hidden; text-overflow: ellipsis; }
+    .lane-track {
+      position: absolute;
+      left: var(--label-w);
+      right: 0;
+      top: 0;
+      bottom: 0;
+    }
+    .lane-track::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 42px;
+      height: 1px;
+      background: #bfc5bf;
+    }
+
+    .event-node {
+      position: absolute;
+      top: 17px;
+      width: 72px;
+      min-height: 56px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      text-align: center;
+      z-index: 4;
+    }
+    .event-marker {
+      width: 27px;
+      height: 27px;
+      display: grid;
+      place-items: center;
+      margin: 0 auto;
+      border: 2px solid var(--marker, var(--ink-muted));
+      border-radius: 50%;
+      background: #fff;
+      color: var(--marker, var(--ink-muted));
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 9px;
+      font-weight: 800;
+      transition: transform .12s ease, background .12s ease;
+    }
+    .event-node:hover .event-marker, .event-node.is-selected .event-marker { transform: scale(1.12); background: var(--marker, var(--ink)); color: #fff; }
+    .event-label {
+      display: block;
+      width: 72px;
+      margin-top: 5px;
+      overflow: hidden;
+      color: var(--ink-muted);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 8px;
+      line-height: 1.2;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .event-node[data-kind^="tool."] { --marker: var(--orange); }
+    .event-node[data-kind^="model."] { --marker: var(--violet); }
+    .event-node[data-kind^="message."] { --marker: var(--cyan); }
+    .event-node[data-kind^="task."] { --marker: var(--green); }
+    .event-node[data-kind$="failed"] { --marker: var(--red); }
+    .message-links { position: absolute; inset: var(--axis-h) 0 auto 0; pointer-events: none; z-index: 3; overflow: visible; }
+
+    .activity-view {
+      height: calc(100vh - var(--header-h) - var(--summary-h) - 57px);
+      min-height: 420px;
+      overflow: auto;
+      padding: 12px;
+    }
+    .activity-row {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 78px 110px 18px minmax(120px, 1fr) auto;
+      align-items: start;
+      gap: 10px;
+      min-height: 50px;
+      padding: 9px 10px;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+    .activity-row:hover, .activity-row.is-selected { background: var(--surface); }
+    .activity-time, .activity-actor, .activity-duration { color: var(--ink-muted); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+    .activity-dot { width: 8px; height: 8px; margin-top: 2px; border-radius: 50%; background: var(--marker, var(--line-strong)); }
+    .activity-kind { display: block; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 10px; font-weight: 760; }
+    .activity-summary { display: block; margin-top: 4px; color: var(--ink-muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
+
+    .inspector { overflow: auto; max-height: calc(100vh - var(--header-h) - var(--summary-h)); }
+    .inspector-empty { padding: 38px 22px; color: var(--ink-muted); font-size: 12px; line-height: 1.6; }
+    .detail-head { position: relative; padding: 17px 16px 14px; border-bottom: 1px solid var(--line); }
+    .close-detail {
+      display: none;
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      height: 28px;
+      padding: 0 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      font-size: 9px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .detail-kind { color: var(--ink-muted); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 10px; }
+    .detail-title { margin-top: 7px; font-size: 15px; font-weight: 760; overflow-wrap: anywhere; }
+    .detail-meta { display: flex; flex-wrap: wrap; gap: 5px 11px; margin-top: 9px; color: var(--ink-muted); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+    .detail-block { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+    .detail-block h3 { margin: 0 0 8px; color: var(--ink-muted); font-size: 10px; text-transform: uppercase; }
+    .detail-text { margin: 0; color: #2b3032; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .json-block {
+      max-height: 310px;
+      margin: 0;
+      overflow: auto;
+      padding: 10px;
+      border: 1px solid #303638;
+      border-radius: 4px;
+      background: #23282a;
+      color: #e8ece8;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .copy-button {
+      height: 28px;
+      margin-top: 9px;
+      padding: 0 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: var(--surface);
+      font-size: 9px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .empty-state {
+      display: grid;
+      place-items: center;
+      min-height: 420px;
+      padding: 30px;
+      color: var(--ink-muted);
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 1180px) {
+      .workspace-grid { grid-template-columns: 220px minmax(480px, 1fr); }
+      .inspector {
+        position: fixed;
+        top: calc(var(--header-h) + var(--summary-h));
+        right: 0;
+        z-index: 30;
+        width: min(390px, 92vw);
+        height: calc(100vh - var(--header-h) - var(--summary-h));
+        box-shadow: -10px 0 25px rgba(30, 34, 35, .13);
+        transform: translateX(100%);
+        transition: transform .16s ease;
+      }
+      .inspector.has-selection { transform: translateX(0); }
+      .close-detail { display: block; }
+    }
+
+    @media (max-width: 780px) {
+      .topbar { height: auto; min-height: 88px; grid-template-columns: 1fr auto; padding: 11px 13px; }
+      .team-picker { grid-column: 1 / -1; grid-row: 2; }
+      .summary-band { grid-template-columns: 1fr 1fr 1fr; }
+      .summary-primary { grid-column: 1 / -1; border-bottom: 1px solid var(--line); }
+      .metric { padding: 10px; }
+      .metric:nth-last-child(-n + 2) { display: none; }
+      .workspace-grid { display: block; }
+      .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar-section { padding: 10px 12px; }
+      .sidebar-section:nth-child(n + 2) { display: none; }
+      .agent-list { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+      .toolbar { position: sticky; top: 0; z-index: 20; }
+      .timeline-viewport, .activity-view { height: 62vh; }
+      .activity-row { grid-template-columns: 65px 80px 12px 1fr; }
+      .activity-duration { display: none; }
+      .inspector { top: 12vh; height: 88vh; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-name">Clawd Teammate Trace</div>
+      <div class="brand-subtitle" id="workspacePath">Loading workspace...</div>
+    </div>
+    <select class="team-picker" id="teamPicker" aria-label="Select team"></select>
+    <div class="connection" id="connectionState">
+      <span class="connection-dot"></span>
+      <span id="connectionText">CONNECTING</span>
+    </div>
+  </header>
+
+  <section class="summary-band" id="summaryBand">
+    <div class="summary-primary">
+      <span class="status-mark" id="statusMark"></span>
+      <div>
+        <div class="summary-title" id="teamTitle">No team selected</div>
+        <div class="summary-meta" id="teamMeta">Waiting for teammate state</div>
+      </div>
+    </div>
+    <div class="metric"><div class="metric-label">Events</div><div class="metric-value" id="eventCount">0</div></div>
+    <div class="metric"><div class="metric-label">Tool Calls</div><div class="metric-value" id="toolCount">0</div></div>
+    <div class="metric"><div class="metric-label">Messages</div><div class="metric-value" id="messageCount">0</div></div>
+    <div class="metric"><div class="metric-label">Tokens</div><div class="metric-value" id="tokenCount">0</div></div>
+    <div class="metric"><div class="metric-label">Duration</div><div class="metric-value" id="durationValue">0s</div></div>
+  </section>
+
+  <main class="workspace-grid">
+    <aside class="sidebar">
+      <section class="sidebar-section">
+        <h2 class="section-heading"><span>Agents</span><span class="section-count" id="agentCount">0</span></h2>
+        <div class="agent-list" id="agentList"></div>
+      </section>
+      <section class="sidebar-section">
+        <h2 class="section-heading"><span>Task Graph</span><span class="section-count" id="taskCount">0</span></h2>
+        <div class="task-list" id="taskList"></div>
+      </section>
+      <section class="sidebar-section">
+        <h2 class="section-heading"><span>Handoffs</span><span class="section-count" id="handoffCount">0</span></h2>
+        <div class="handoff-list" id="handoffList"></div>
+      </section>
+    </aside>
+
+    <section class="main-panel">
+      <div class="toolbar">
+        <div class="tabs" role="tablist">
+          <button class="tab-button is-active" data-view="timeline" role="tab">Timeline</button>
+          <button class="tab-button" data-view="activity" role="tab">Activity</button>
+        </div>
+        <select class="filter-select" id="kindFilter" aria-label="Event type filter">
+          <option value="all">All events</option>
+          <option value="tools">Tools</option>
+          <option value="models">Model turns</option>
+          <option value="messages">Messages</option>
+          <option value="tasks">Tasks</option>
+          <option value="state">State changes</option>
+        </select>
+        <input class="search-input" id="searchInput" type="search" placeholder="Search calls, paths, output" aria-label="Search events">
+        <label class="check-label"><input id="errorsOnly" type="checkbox"> Errors only</label>
+        <button class="live-button is-active" id="liveButton" type="button">LIVE ON</button>
+      </div>
+      <div class="reconstruction-note" id="reconstructionNote">
+        Historical run: tool events were reconstructed from persisted teammate sessions. New runs stream native timing and usage events.
+      </div>
+      <div class="view is-active" id="timelineView">
+        <div class="timeline-viewport" id="timelineViewport">
+          <div class="timeline-canvas" id="timelineCanvas"></div>
+        </div>
+      </div>
+      <div class="view" id="activityView">
+        <div class="activity-view"><div class="activity-list" id="activityList"></div></div>
+      </div>
+    </section>
+
+    <aside class="inspector" id="inspector">
+      <div class="inspector-empty" id="inspectorEmpty">No event selected.</div>
+      <div id="inspectorContent"></div>
+    </aside>
+  </main>
+
+  <script>
+    const AGENT_COLORS = ["#087e8b", "#c45d1a", "#39764a", "#6657a8", "#b33a3a", "#a97b0d"];
+    const SLOT_WIDTH = 86;
+    const LABEL_WIDTH = 132;
+    const LANE_HEIGHT = 88;
+    const AXIS_HEIGHT = 42;
+
+    const app = {
+      snapshot: null,
+      selectedTeam: null,
+      selectedEvent: null,
+      selectedAgent: "all",
+      kind: "all",
+      search: "",
+      errorsOnly: false,
+      live: true,
+      view: "timeline",
+      source: null,
+      fetching: false,
+    };
+
+    const el = id => document.getElementById(id);
+    const escapeHtml = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", "'":"&#39;", '"':"&quot;"})[char]);
+    const jsonText = value => JSON.stringify(value, null, 2);
+
+    function formatTime(value, withDate = false) {
+      if (!value) return "--:--:--";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "--:--:--";
+      return new Intl.DateTimeFormat(undefined, {
+        ...(withDate ? {month: "short", day: "2-digit"} : {}),
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+      }).format(date);
+    }
+
+    function formatDuration(ms) {
+      const value = Number(ms || 0);
+      if (value < 1000) return `${value}ms`;
+      if (value < 60000) return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)}s`;
+      const minutes = Math.floor(value / 60000);
+      return `${minutes}m ${Math.round((value % 60000) / 1000)}s`;
+    }
+
+    function category(type) {
+      if (type.startsWith("tool.")) return "tools";
+      if (type.startsWith("model.") || type.startsWith("run.")) return "models";
+      if (type.startsWith("message.")) return "messages";
+      if (type.startsWith("task.")) return "tasks";
+      return "state";
+    }
+
+    function isError(event) {
+      return event.type.endsWith("failed") || Boolean(event.data && event.data.is_error);
+    }
+
+    function eventLabel(event) {
+      const data = event.data || {};
+      if (event.type.startsWith("tool.")) {
+        const started = data.tool_use_id && app.snapshot?.events.find(candidate =>
+          candidate.type === "tool.started" && candidate.data?.tool_use_id === data.tool_use_id
+        );
+        return data.tool_name || started?.data?.tool_name || "tool";
+      }
+      if (event.type === "model.response") return `turn ${data.turn || ""}`.trim();
+      if (event.type.startsWith("message.")) {
+        const message = data.message || {};
+        return message.summary || "handoff";
+      }
+      if (event.type.startsWith("task.")) return data.task_key || (data.task || {}).key || "task";
+      if (event.type.startsWith("agent.")) return data.name || (data.agent || {}).name || event.type.slice(6);
+      return event.type.split(".").pop();
+    }
+
+    function eventSummary(event) {
+      const data = event.data || {};
+      if (event.type === "model.response") return data.content || "Model returned no text";
+      if (event.type === "model.started") return `${data.model || "model"} request started`;
+      if (event.type.startsWith("tool.")) {
+        const payload = data.tool_input ?? data.tool_output ?? data.error ?? "";
+        return typeof payload === "string" ? payload : jsonText(payload);
+      }
+      if (event.type === "message.delivered") {
+        const message = data.message || {};
+        return `${message.summary || "Message"}: ${typeof message.content === "string" ? message.content : jsonText(message.content)}`;
+      }
+      if (event.type === "message.consumed") return `Message ${data.message_id || ""} consumed`;
+      if (data.error) return data.error;
+      if (data.task && data.task.subject) return data.task.subject;
+      return eventLabel(event);
+    }
+
+    function markerText(type) {
+      if (type.startsWith("tool.")) return "T";
+      if (type.startsWith("model.")) return "M";
+      if (type.startsWith("run.")) return "R";
+      if (type.startsWith("message.")) return ">";
+      if (type.startsWith("task.")) return "K";
+      if (type.startsWith("agent.")) return "A";
+      return "S";
+    }
+
+    function agentColor(agentId) {
+      const agents = app.snapshot?.agents || [];
+      const index = Math.max(0, agents.findIndex(agent => agent.agent_id === agentId));
+      return AGENT_COLORS[index % AGENT_COLORS.length];
+    }
+
+    function filteredEvents() {
+      if (!app.snapshot) return [];
+      const needle = app.search.trim().toLowerCase();
+      return app.snapshot.events.filter(event => {
+        if (app.selectedAgent !== "all") {
+          const data = event.data || {};
+          const message = data.message || {};
+          const touchesAgent = event.actor_id === app.selectedAgent || data.agent_id === app.selectedAgent ||
+            message.sender_id === app.selectedAgent || message.recipient_id === app.selectedAgent;
+          if (!touchesAgent) return false;
+        }
+        if (app.kind !== "all" && category(event.type) !== app.kind) return false;
+        if (app.errorsOnly && !isError(event)) return false;
+        if (needle && !jsonText(event).toLowerCase().includes(needle)) return false;
+        return true;
+      });
+    }
+
+    async function fetchState() {
+      if (app.fetching) return;
+      app.fetching = true;
+      try {
+        const query = app.selectedTeam ? `?team=${encodeURIComponent(app.selectedTeam)}` : "";
+        const response = await fetch(`/api/state${query}`, {cache: "no-store"});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        app.snapshot = await response.json();
+        app.selectedTeam = app.snapshot.team?.team_id || null;
+        setConnection("live", "LIVE");
+        renderAll();
+        connectStream();
+      } catch (error) {
+        setConnection("offline", "DISCONNECTED");
+      } finally {
+        app.fetching = false;
+      }
+    }
+
+    function connectStream() {
+      if (!app.live) return;
+      const expected = app.selectedTeam || "";
+      if (app.source && app.source.teamId === expected) return;
+      if (app.source) app.source.close();
+      const source = new EventSource(expected ? `/api/stream?team=${encodeURIComponent(expected)}` : "/api/stream");
+      source.teamId = expected;
+      source.onmessage = () => {
+        if (app.live && (app.selectedTeam || "") === expected) fetchState();
+      };
+      source.onerror = () => setConnection("offline", "RECONNECTING");
+      source.onopen = () => setConnection("live", "LIVE");
+      app.source = source;
+    }
+
+    function setConnection(state, text) {
+      el("connectionState").className = `connection is-${state}`;
+      el("connectionText").textContent = text;
+    }
+
+    function renderAll() {
+      renderHeader();
+      renderSidebar();
+      renderTimeline();
+      renderActivity();
+      renderInspector();
+    }
+
+    function renderHeader() {
+      const data = app.snapshot;
+      const team = data.team;
+      el("workspacePath").textContent = data.workspace;
+      el("teamPicker").innerHTML = data.teams.length
+        ? data.teams.map(item => `<option value="${escapeHtml(item.team_id)}" ${item.team_id === team?.team_id ? "selected" : ""}>${escapeHtml(item.team_name)} / ${escapeHtml(item.status)}</option>`).join("")
+        : '<option value="">No teammate runs</option>';
+      el("teamTitle").textContent = team?.team_name || "No teammate run found";
+      el("teamMeta").textContent = team ? `${team.team_id} / ${team.status} / ${formatTime(team.created_at, true)}` : "No persisted .clawd team state found.";
+      el("statusMark").className = `status-mark ${team?.status || ""}`;
+      el("eventCount").textContent = data.stats.event_count.toLocaleString();
+      el("toolCount").textContent = data.stats.tool_count.toLocaleString();
+      el("messageCount").textContent = data.stats.message_count.toLocaleString();
+      el("tokenCount").textContent = ((data.stats.input_tokens || 0) + (data.stats.output_tokens || 0)).toLocaleString();
+      el("durationValue").textContent = formatDuration(data.stats.duration_ms || 0);
+      el("reconstructionNote").classList.toggle("is-visible", Boolean(data.historical_reconstruction));
+    }
+
+    function renderSidebar() {
+      const data = app.snapshot;
+      el("agentCount").textContent = data.agents.length;
+      el("agentList").innerHTML = data.agents.map((agent, index) => `
+        <button class="agent-row ${app.selectedAgent === agent.agent_id ? "is-selected" : ""}" data-agent="${escapeHtml(agent.agent_id)}" type="button">
+          <span class="agent-color" style="--agent-color:${AGENT_COLORS[index % AGENT_COLORS.length]}"></span>
+          <span><span class="agent-name">${escapeHtml(agent.name)}</span><span class="agent-role">${agent.role && agent.role !== agent.name ? escapeHtml(agent.role) : ""}</span></span>
+          <span class="status-text">${escapeHtml(agent.status)}</span>
+        </button>`).join("");
+      el("agentList").querySelectorAll("[data-agent]").forEach(button => {
+        button.addEventListener("click", () => {
+          app.selectedAgent = app.selectedAgent === button.dataset.agent ? "all" : button.dataset.agent;
+          renderAll();
+        });
+      });
+
+      const keyById = Object.fromEntries(data.tasks.map(task => [task.id, task.key || task.id]));
+      el("taskCount").textContent = data.tasks.length;
+      el("taskList").innerHTML = data.tasks.map(task => {
+        const deps = (task.blockedBy || []).map(id => keyById[id] || id);
+        return `<div class="task-row ${escapeHtml(task.status)}">
+          <div class="task-key">${escapeHtml(task.key || task.id)} / ${escapeHtml(task.status)}</div>
+          <div class="task-subject">${escapeHtml(task.subject)}</div>
+          <div class="task-deps">${deps.length ? `after: ${escapeHtml(deps.join(", "))}` : "ready immediately"}</div>
+        </div>`;
+      }).join("") || '<div class="handoff-summary">No tasks persisted.</div>';
+
+      el("handoffCount").textContent = data.messages.length;
+      el("handoffList").innerHTML = data.messages.map(message => `
+        <div class="handoff-row">
+          <div class="handoff-route">${escapeHtml(message.sender_name)} -> ${escapeHtml(message.recipient_name)}</div>
+          <div class="handoff-summary">${escapeHtml(message.summary || String(message.content).slice(0, 90))}</div>
+        </div>`).join("") || '<div class="handoff-summary">No teammate messages.</div>';
+    }
+
+    function renderTimeline() {
+      const events = filteredEvents();
+      const agents = app.snapshot.agents;
+      const canvas = el("timelineCanvas");
+      if (!app.snapshot.team) {
+        canvas.innerHTML = '<div class="empty-state">No teammate trace is available in this workspace.</div>';
+        return;
+      }
+      const width = Math.max(900, LABEL_WIDTH + events.length * SLOT_WIDTH + 90);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${AXIS_HEIGHT + agents.length * LANE_HEIGHT}px`;
+
+      const positions = new Map(events.map((event, index) => [event.event_id, index]));
+      let html = '<div class="time-axis">';
+      events.forEach((event, index) => {
+        if (index % Math.max(1, Math.ceil(events.length / 12)) !== 0) return;
+        const left = LABEL_WIDTH + index * SLOT_WIDTH + 36;
+        html += `<span class="axis-label" style="left:${left}px">${escapeHtml(formatTime(event.created_at))}</span>`;
+      });
+      html += '</div>';
+
+      agents.forEach((agent, agentIndex) => {
+        const laneEvents = events.filter(event => event.actor_id === agent.agent_id ||
+          (event.type === "message.consumed" && event.data?.agent_id === agent.agent_id));
+        html += `<div class="lane" data-lane="${escapeHtml(agent.agent_id)}">
+          <div class="lane-label" style="--agent-color:${AGENT_COLORS[agentIndex % AGENT_COLORS.length]}">
+            <span class="lane-swatch"></span><span class="lane-agent"><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.role || "agent")}</span></span>
+          </div><div class="lane-track">`;
+        laneEvents.forEach(event => {
+          const index = positions.get(event.event_id);
+          const left = index * SLOT_WIDTH;
+          html += `<button class="event-node ${app.selectedEvent === event.event_id ? "is-selected" : ""}" data-event="${escapeHtml(event.event_id)}" data-kind="${escapeHtml(event.type)}" style="left:${left}px" title="${escapeHtml(event.type)} / ${escapeHtml(eventLabel(event))}" type="button">
+            <span class="event-marker">${markerText(event.type)}</span><span class="event-label">${escapeHtml(eventLabel(event))}</span>
+          </button>`;
+        });
+        html += '</div></div>';
+      });
+      html += `<svg class="message-links" width="${width}" height="${agents.length * LANE_HEIGHT}" aria-hidden="true"><defs><marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#087e8b"></path></marker></defs>${messagePaths(events, positions, agents)}</svg>`;
+      canvas.innerHTML = html;
+      bindEventSelection(canvas);
+    }
+
+    function messagePaths(events, positions, agents) {
+      if (app.kind !== "all" && app.kind !== "messages") return "";
+      const laneIndex = Object.fromEntries(agents.map((agent, index) => [agent.agent_id, index]));
+      const deliveries = new Map();
+      const consumptions = new Map();
+      events.forEach(event => {
+        if (event.type === "message.delivered" && event.data?.message?.message_id) deliveries.set(event.data.message.message_id, event);
+        if (event.type === "message.consumed" && event.data?.message_id) consumptions.set(event.data.message_id, event);
+      });
+      let paths = "";
+      deliveries.forEach((event, messageId) => {
+        const message = event.data.message;
+        const fromLane = laneIndex[message.sender_id];
+        const toLane = laneIndex[message.recipient_id];
+        const startIndex = positions.get(event.event_id);
+        if (fromLane === undefined || toLane === undefined || startIndex === undefined) return;
+        const consumed = consumptions.get(messageId);
+        const endIndex = consumed ? positions.get(consumed.event_id) : startIndex + .65;
+        if (endIndex === undefined) return;
+        const x1 = LABEL_WIDTH + startIndex * SLOT_WIDTH + 36;
+        const x2 = LABEL_WIDTH + endIndex * SLOT_WIDTH + 36;
+        const y1 = fromLane * LANE_HEIGHT + 43;
+        const y2 = toLane * LANE_HEIGHT + 43;
+        const bend = Math.max(26, Math.abs(x2 - x1) * .42);
+        paths += `<path d="M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}" fill="none" stroke="#087e8b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)" opacity=".82"></path>`;
+      });
+      return paths;
+    }
+
+    function renderActivity() {
+      const events = filteredEvents();
+      el("activityList").innerHTML = events.map(event => `
+        <button class="activity-row ${app.selectedEvent === event.event_id ? "is-selected" : ""}" data-event="${escapeHtml(event.event_id)}" type="button">
+          <span class="activity-time">${escapeHtml(formatTime(event.created_at))}</span>
+          <span class="activity-actor">${escapeHtml(event.actor_name)}</span>
+          <span class="activity-dot" style="--marker:${agentColor(event.actor_id)}"></span>
+          <span><span class="activity-kind">${escapeHtml(event.type)} / ${escapeHtml(eventLabel(event))}</span><span class="activity-summary">${escapeHtml(eventSummary(event).slice(0, 220))}</span></span>
+          <span class="activity-duration">${event.data?.duration_ms != null ? formatDuration(event.data.duration_ms) : ""}</span>
+        </button>`).join("") || '<div class="empty-state">No events match the current filters.</div>';
+      bindEventSelection(el("activityList"));
+    }
+
+    function bindEventSelection(root) {
+      root.querySelectorAll("[data-event]").forEach(button => {
+        button.addEventListener("click", () => {
+          app.selectedEvent = button.dataset.event;
+          renderTimeline();
+          renderActivity();
+          renderInspector();
+        });
+      });
+    }
+
+    function findToolPair(event) {
+      const id = event?.data?.tool_use_id;
+      if (!id) return {};
+      const related = app.snapshot.events.filter(candidate => candidate.data?.tool_use_id === id);
+      return {
+        started: related.find(candidate => candidate.type === "tool.started"),
+        completed: related.find(candidate => candidate.type === "tool.completed" || candidate.type === "tool.failed"),
+      };
+    }
+
+    function renderInspector() {
+      const event = app.snapshot?.events.find(item => item.event_id === app.selectedEvent);
+      el("inspector").classList.toggle("has-selection", Boolean(event));
+      el("inspectorEmpty").style.display = event ? "none" : "block";
+      if (!event) {
+        el("inspectorContent").innerHTML = "";
+        return;
+      }
+      const data = event.data || {};
+      const pair = findToolPair(event);
+      const input = data.tool_input ?? pair.started?.data?.tool_input;
+      const output = data.tool_output ?? pair.completed?.data?.tool_output;
+      const duration = data.duration_ms ?? pair.completed?.data?.duration_ms;
+      const content = data.content || (event.type === "message.delivered" ? data.message?.content : null);
+      let blocks = "";
+      if (content != null && content !== "") blocks += detailText("Content", typeof content === "string" ? content : jsonText(content));
+      if (input != null) blocks += detailJson("Tool input", input, "input");
+      if (output != null) blocks += detailJson("Tool result", output, "output");
+      if (data.error) blocks += detailText("Error", data.error);
+      if (data.message) blocks += detailJson("Message envelope", data.message, "message");
+      if (data.usage) blocks += detailJson("Usage", data.usage, "usage");
+      blocks += detailJson("Raw event", event, "raw");
+      el("inspectorContent").innerHTML = `
+        <div class="detail-head">
+          <button class="close-detail" id="closeDetail" type="button">Close</button>
+          <div class="detail-kind">${escapeHtml(event.type)}</div>
+          <div class="detail-title">${escapeHtml(eventLabel(event))}</div>
+          <div class="detail-meta"><span>${escapeHtml(event.actor_name)}</span><span>${escapeHtml(formatTime(event.created_at, true))}</span>${duration != null ? `<span>${escapeHtml(formatDuration(duration))}</span>` : ""}${data.model ? `<span>${escapeHtml(data.model)}</span>` : ""}</div>
+        </div>${blocks}`;
+      el("inspectorContent").querySelectorAll("[data-copy]").forEach(button => {
+        button.addEventListener("click", async () => {
+          const pre = button.previousElementSibling;
+          try {
+            await navigator.clipboard.writeText(pre.textContent);
+            button.textContent = "Copied";
+          } catch (_) {
+            button.textContent = "Copy unavailable";
+          }
+        });
+      });
+      el("closeDetail").addEventListener("click", () => {
+        app.selectedEvent = null;
+        renderTimeline();
+        renderActivity();
+        renderInspector();
+      });
+    }
+
+    function detailText(title, content) {
+      return `<section class="detail-block"><h3>${escapeHtml(title)}</h3><p class="detail-text">${escapeHtml(content)}</p></section>`;
+    }
+
+    function detailJson(title, value, key) {
+      return `<section class="detail-block"><h3>${escapeHtml(title)}</h3><pre class="json-block">${escapeHtml(jsonText(value))}</pre><button class="copy-button" data-copy="${escapeHtml(key)}" type="button">Copy JSON</button></section>`;
+    }
+
+    el("teamPicker").addEventListener("change", event => {
+      app.selectedTeam = event.target.value || null;
+      app.selectedEvent = null;
+      if (app.source) { app.source.close(); app.source = null; }
+      fetchState();
+    });
+    el("kindFilter").addEventListener("change", event => { app.kind = event.target.value; renderTimeline(); renderActivity(); });
+    el("searchInput").addEventListener("input", event => { app.search = event.target.value; renderTimeline(); renderActivity(); });
+    el("errorsOnly").addEventListener("change", event => { app.errorsOnly = event.target.checked; renderTimeline(); renderActivity(); });
+    el("liveButton").addEventListener("click", () => {
+      app.live = !app.live;
+      el("liveButton").classList.toggle("is-active", app.live);
+      el("liveButton").textContent = app.live ? "LIVE ON" : "LIVE OFF";
+      if (!app.live && app.source) { app.source.close(); app.source = null; setConnection("offline", "PAUSED"); }
+      if (app.live) { fetchState(); connectStream(); }
+    });
+    document.querySelectorAll("[data-view]").forEach(button => {
+      button.addEventListener("click", () => {
+        app.view = button.dataset.view;
+        document.querySelectorAll("[data-view]").forEach(item => item.classList.toggle("is-active", item.dataset.view === app.view));
+        el("timelineView").classList.toggle("is-active", app.view === "timeline");
+        el("activityView").classList.toggle("is-active", app.view === "activity");
+      });
+    });
+
+    fetchState();
+  </script>
+</body>
+</html>
