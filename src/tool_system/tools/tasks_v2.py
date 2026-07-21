@@ -18,6 +18,35 @@ def _new_task_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _team_protocol_version(context: ToolContext) -> int:
+    team = context.team or {}
+    settings = team.get("settings") if isinstance(team.get("settings"), dict) else {}
+    quality = (
+        settings.get("quality_gates")
+        if isinstance(settings.get("quality_gates"), dict)
+        else {}
+    )
+    versions = [1]
+    for raw in (
+        team.get("protocol_version"),
+        settings.get("protocol_version"),
+        quality.get("protocol_version"),
+    ):
+        try:
+            versions.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return max(versions)
+
+
+def _require_legacy_task_mutation(context: ToolContext, tool_name: str) -> None:
+    if context.team is not None and _team_protocol_version(context) >= 2:
+        raise ToolInputError(
+            f"{tool_name} cannot change a protocol v2 plan; submit one complete "
+            "TeamPlan replacement instead"
+        )
+
+
 def _task_key(subject: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", subject.strip().lower()).strip("-")
     return normalized or _new_task_id()
@@ -106,6 +135,7 @@ class TaskCreateTool:
         )
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        _require_legacy_task_mutation(context, "TaskCreate")
         subject = tool_input.get("subject")
         description = tool_input.get("description")
         active_form = tool_input.get("activeForm") or ""
@@ -330,6 +360,16 @@ class TaskUpdateTool:
         if context.actor_id is not None and context.current_task_id is not None and task_id != context.current_task_id:
             raise ToolInputError("teammates may only update their current task")
 
+        if _team_protocol_version(context) >= 2:
+            if context.actor_id is None:
+                _require_legacy_task_mutation(context, "TaskUpdate")
+            disallowed = set(tool_input) - {"taskId", "status", "output"}
+            if disallowed:
+                raise ToolInputError(
+                    "protocol v2 teammates may only update their own status and output; "
+                    "immutable fields: " + ", ".join(sorted(disallowed))
+                )
+
         updated_fields: list[str] = []
         status_change: dict[str, str] | None = None
         requested_status = tool_input.get("status")
@@ -497,6 +537,7 @@ class TaskRetryTool:
         )
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        _require_legacy_task_mutation(context, "TaskRetry")
         if context.actor_id is not None:
             raise ToolInputError("only the lead may retry tasks")
         identity = tool_input.get("taskId")

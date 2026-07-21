@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = (
@@ -21,6 +22,22 @@ SPEC.loader.exec_module(probe)
 
 
 class TestNL2RepoLatencyProbe(unittest.TestCase):
+    def test_live_probe_is_disabled_even_when_global_pool_is_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(SystemExit, "global-pool-only"):
+                probe.main(["--upstream-root", str(root)])
+
+    def test_dry_run_does_not_claim_model_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(probe, "find_upstream_root", return_value=root), patch.object(
+                probe, "load_tasks", return_value=[]
+            ), patch.object(probe, "reject_if_global_pool_active") as guard:
+                with self.assertRaisesRegex(ValueError, "cannot select"):
+                    probe.main(["--dry-run", "--subset-size", "1"])
+                guard.assert_not_called()
+
     def test_parse_concurrency_sweep(self) -> None:
         self.assertEqual(probe.parse_concurrency_sweep("1,2,4,8"), [1, 2, 4, 8])
         with self.assertRaisesRegex(Exception, "positive"):

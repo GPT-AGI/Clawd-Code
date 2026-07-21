@@ -6,17 +6,25 @@ The upstream task documents and hidden tests are not copied into this repository
 The default pinned commit is `781a1da1ee41fb8edb0bed22f586d69111610edf`.
 
 The pilot compares solo execution with adaptive lead-controlled collaboration.
-`forced-team` remains a runtime diagnostic, but now enables strict quality gates:
-at least two independently runnable teammate tasks, non-overlapping file ownership,
-explicit interface contracts, peer acknowledgement on dependency edges, and a fresh
-environment install/import/integration verification before the Team can complete.
-Role names, permissions, workspaces, and the concrete task graph remain task-specific.
+`adaptive-team-v2` and `forced-team` use protocol v2: the lead submits one atomic
+`TeamPlan`, the harness materializes exactly two real implementation workers, freezes
+file ownership and interface contracts, runs the task DAG, and performs fresh-environment
+acceptance before the Team can complete. A failed verification requires a replacement
+plan revision; the lead cannot reopen a completed Team by mutating legacy tasks.
 
-Reward is skipped when the rollout, specification-integrity check, or Team protocol is
-incomplete. This prevents an unfinished strict Team from entering the AGS/Docker reward
-pool merely because the lead model stopped. Results and the dashboard expose a stable
-`failure_class` such as `dependency_environment`, `collection_error`,
-`cross_module_contract`, `team_validation`, or `functional_test_failure`.
+Scoring separates three questions instead of hiding Team failures behind one number:
+
+- **Q (code quality):** hidden-test score for every intact, scoreable workspace, even
+  when the Team protocol failed.
+- **P (protocol yield):** fraction of eligible rollouts that completed the committed
+  TeamPlan, including real task attempts, produced events, harness acceptance, and final
+  verification.
+- **E (effective quality):** delivery-valid quality multiplied by protocol credit.
+
+Rollout or scorer infrastructure failures are retryable and excluded from Q/P/E. Candidate
+timeouts and incomplete Teams remain candidate/protocol outcomes. Results and the dashboard
+also expose stable `failure_domain`, `failure_class`, `reward_outcome`, and metric-eligibility
+fields so infrastructure does not silently become a zero-quality sample.
 
 ## Docker environment
 
@@ -252,29 +260,56 @@ treated as missing measurements.
 
 ### Continuous evaluation queue
 
-For sustained utilization, run a queue worker instead of launching fixed-size
-batches. Its SQLite/WAL state can be updated from another process while eight
-rollout workers and four independent reward workers stay alive:
+For sustained utilization, register every queue with the shared global pool.
+The supervisor is the only supported worker launcher, including when there is
+only one run. Its SQLite/WAL queues can still be updated from another process
+while the supervisor allocates the global rollout and reward capacities:
 
 ```bash
 RUN=teammate-evals/nl2repo-pilot/runs/qwen-continuous
 
-# Long-lived process. It waits instead of exiting when the queue is empty.
-.venv/bin/python teammate-evals/nl2repo-pilot/evaluation_queue.py \
-  --run "$RUN" serve \
+# One or more --run arguments share these capacities.
+.venv/bin/python teammate-evals/nl2repo-pilot/global_pool_supervisor.py \
+  --run "$RUN" \
   --provider qwen \
-  --model ms-mnhdj86z \
-  --rollout-concurrency 8 \
-  --reward-concurrency 4 \
-  --execution-backend ags \
-  --score-backend docker \
+  --model ms-rns547kc \
+  --rollout-capacity 8 \
+  --reward-capacity 4 \
+  --worker-capacity 8 \
   --ags-env-file ../sandbox/ags/.env
 ```
 
-Add `--start-after <previous-run-dir>` to prepare and fill the next queue while
-the current fixed batch is still running. Workers will not claim queued cases
-until the predecessor writes `results.json`, preventing the two runs from
-competing for the same model capacity during handoff.
+Do not invoke the queue's internal `serve` command directly or start a second
+private pool for handoff/rescoring. Prepare all runs first and pass another
+`--run <run-dir>` for each one; the global allocator shares capacity across them.
+The supervisor holds the pilot-wide `runs/global-pool.lock`, so a second NL2Repo
+supervisor is rejected even if it is given runs from another directory. To add a new
+run to a live pool, stop the supervisor and restart it once with the complete
+repeated `--run` list; persisted in-flight queue state is recovered.
+
+Either stage may be disabled without leaving the global-pool path: use
+`--rollout-capacity 0 --reward-capacity 64` for reward-only rescoring, or
+`--rollout-capacity 32 --reward-capacity 0` for rollout-only generation. Both
+capacities cannot be zero. Completion considers only the enabled stage, so a
+rollout-only pass may leave `reward_pending` work for a later reward-only pass.
+
+Direct `evaluation_queue.py ... serve` and `evaluation_queue.py ... scale` are
+rejected before queue state is created or changed, with no command-line bypass.
+Queue workers must be direct children registered in the supervisor's live global
+lock; setting its internal environment marker manually is insufficient. For
+incident recovery, restart `global_pool_supervisor.py` with the intended run list
+and capacities.
+
+The legacy top-level pools in `benchmark.py` and `reward_repair.py` are also
+disabled. Reward-only repair uses the same supervisor with
+`--rollout-capacity 0`; live latency-probe request pools are disabled as well
+(`--dry-run` remains available).
+
+The supervisor stays alive in `idle` state when all registered queues are empty,
+so `evaluation_queue.py ... add` can refill it without a restart. It never exits
+because of an empty snapshot; stop it explicitly with `SIGINT`/`SIGTERM` during a
+maintenance window. This removes the shutdown race that could otherwise strand a
+case added immediately after the final empty check.
 
 Append validated tasks at any time, including while the worker is running:
 
@@ -299,7 +334,12 @@ failed case can be intentionally rerun with `retry`; its previous artifacts are
 archived below `_attempts/` before the new rollout starts. Higher-priority cases
 can be inserted with `add --priority N`.
 
-The state machine is `queued → rollout → reward_pending → rewarding → done`.
+The success path is `queued → rollout → reward_pending → rewarding → done`; terminal
+rollout/harness errors and invalid rewards enter `failed`. Retryable rollout
+infrastructure failures are archived and automatically requeued up to
+`--rollout-attempts` attempts (three by default). Only `reward_outcome=scored` with a
+valid numeric score may enter `done`; skipped, pending, or infrastructure rewards never
+become synthetic zero-score completions.
 After a runner restart, an interrupted rollout returns to the queue, while an
 interrupted reward resumes from its persisted rollout artifact. The dashboard
 reads `queue.sqlite3` directly, includes newly appended tasks automatically, and

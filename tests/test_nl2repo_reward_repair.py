@@ -56,6 +56,12 @@ def case_result(task: str, quality: float, *, error: str | None = None) -> dict[
 
 
 class TestRewardRepair(unittest.TestCase):
+    def test_main_always_routes_reward_repairs_through_global_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(SystemExit, "global_pool_supervisor.py"):
+                repair.main(["--run", str(root)])
+
     def test_discovery_selects_only_explicit_infrastructure_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

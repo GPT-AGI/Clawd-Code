@@ -42,6 +42,8 @@ dev = [
 ags = [
     "aiohttp>=3.10",
     "swe-rex>=1.4.0",
+    "tencentcloud-sdk-python-ags>=3.1.132",
+    "tencentcloud-sdk-python-common>=3.1.132",
 ]
 
 [project.scripts]

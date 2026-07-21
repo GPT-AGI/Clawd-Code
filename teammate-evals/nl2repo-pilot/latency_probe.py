@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
+import fcntl
 import json
 import math
 import random
@@ -36,6 +38,7 @@ from src.providers.qwen_provider import QwenProvider  # noqa: E402
 DEFAULT_SEED = 20260715
 DEFAULT_MAX_PROMPT_BYTES = 64 * 1024
 PINNED_REVISION = "781a1da1ee41fb8edb0bed22f586d69111610edf"
+GLOBAL_POOL_LOCK_PATH = Path(__file__).resolve().parent / "runs" / "global-pool.lock"
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,36 @@ class RequestResult:
     error_type: str | None = None
     error_status: int | None = None
     error_message: str | None = None
+
+
+def global_pool_is_active(lock_path: Path | None = None) -> bool:
+    """Probe the persistent global-pool lock without modifying it."""
+    path = (lock_path or GLOBAL_POOL_LOCK_PATH).expanduser().resolve()
+    if not path.is_file():
+        return False
+    try:
+        handle = path.open("r+", encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def reject_if_global_pool_active(lock_path: Path | None = None) -> None:
+    if global_pool_is_active(lock_path):
+        raise SystemExit(
+            "latency_probe.py is disabled while the NL2Repo global pool is active; "
+            "wait for the evaluator to stop so the probe cannot overcommit model capacity."
+        )
 
 
 def find_upstream_root(explicit: str | None = None) -> Path:
@@ -570,6 +603,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not args.dry_run:
+        raise SystemExit(
+            "live latency_probe.py request pools are disabled under the "
+            "global-pool-only policy; --dry-run remains available for planning"
+        )
     upstream = find_upstream_root(args.upstream_root)
     all_tasks = load_tasks(upstream)
     tasks, eligible_count = select_tasks(

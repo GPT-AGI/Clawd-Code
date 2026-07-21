@@ -2,13 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import importlib.util
+import io
+import os
 import sys
+import tarfile
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from src.execution.ags import AGSSettings, AGSWorkspaceBackend, _build_sandbox_command
 from src.execution.backend import CommandOutcome
+
+
+_BENCHMARK_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "teammate-evals"
+    / "nl2repo-pilot"
+    / "benchmark.py"
+)
+_BENCHMARK_SPEC = importlib.util.spec_from_file_location(
+    "nl2repo_pilot_benchmark_ags_test", _BENCHMARK_PATH
+)
+assert _BENCHMARK_SPEC is not None and _BENCHMARK_SPEC.loader is not None
+_BENCHMARK = importlib.util.module_from_spec(_BENCHMARK_SPEC)
+sys.modules[_BENCHMARK_SPEC.name] = _BENCHMARK
+_BENCHMARK_SPEC.loader.exec_module(_BENCHMARK)
 
 
 class _FakeRuntime:
@@ -191,6 +212,190 @@ class TestAGSWorkspaceBackend(unittest.TestCase):
         self.assertIn("rm -rf -- /workspace/*", command)
         self.assertEqual(cwd, "/")
         self.assertEqual(timeout_s, 120)
+
+    @staticmethod
+    def _archive(*members: tuple[tarfile.TarInfo, bytes]) -> tarfile.TarFile:
+        packed = io.BytesIO()
+        with tarfile.open(fileobj=packed, mode="w") as archive:
+            for member, content in members:
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content) if content else None)
+        packed.seek(0)
+        return tarfile.open(fileobj=packed, mode="r")
+
+    def test_safe_extract_accepts_regular_workspace_prefixed_file(self) -> None:
+        member = tarfile.TarInfo("workspace/model.py")
+        content = b"class Model:\n    pass\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "download"
+            with self._archive((member, content)) as archive:
+                AGSWorkspaceBackend._safe_extract(archive, destination)
+
+            self.assertEqual((destination / "workspace/model.py").read_bytes(), content)
+
+    def test_safe_extract_accepts_internal_symbolic_and_hard_links(self) -> None:
+        target = tarfile.TarInfo("workspace/computer/model.py")
+        symbolic = tarfile.TarInfo("workspace/model.py")
+        symbolic.type = tarfile.SYMTYPE
+        symbolic.linkname = "computer/model.py"
+        hard = tarfile.TarInfo("workspace/model-copy.py")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "workspace/computer/model.py"
+        content = b"MODEL = True\n"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "download"
+            with self._archive((target, content), (symbolic, b""), (hard, b"")) as archive:
+                AGSWorkspaceBackend._safe_extract(archive, destination)
+
+            workspace = destination / "workspace"
+            self.assertFalse((workspace / "model.py").is_symlink())
+            self.assertEqual((workspace / "model.py").read_bytes(), content)
+            self.assertEqual((workspace / "model-copy.py").read_bytes(), content)
+            self.assertEqual(
+                os.stat(workspace / "computer/model.py").st_ino,
+                os.stat(workspace / "model-copy.py").st_ino,
+            )
+
+    def test_safe_extract_materializes_internal_directory_symlink(self) -> None:
+        package = tarfile.TarInfo("workspace/implementation")
+        package.type = tarfile.DIRTYPE
+        module = tarfile.TarInfo("workspace/implementation/module.py")
+        alias = tarfile.TarInfo("workspace/package")
+        alias.type = tarfile.SYMTYPE
+        alias.linkname = "implementation"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "download"
+            with self._archive(
+                (package, b""),
+                (module, b"VALUE = 1\n"),
+                (alias, b""),
+            ) as archive:
+                AGSWorkspaceBackend._safe_extract(archive, destination)
+
+            materialized = destination / "workspace/package"
+            self.assertTrue(materialized.is_dir())
+            self.assertFalse(materialized.is_symlink())
+            self.assertEqual(
+                (materialized / "module.py").read_text(encoding="utf-8"),
+                "VALUE = 1\n",
+            )
+
+    def test_materialized_workspace_can_be_staged_for_score_context(self) -> None:
+        target = tarfile.TarInfo("workspace/computer/model.py")
+        symbolic = tarfile.TarInfo("workspace/model.py")
+        symbolic.type = tarfile.SYMTYPE
+        symbolic.linkname = "computer/model.py"
+        hard = tarfile.TarInfo("workspace/model-copy.py")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "workspace/computer/model.py"
+
+        task = {
+            "image": "example.invalid/autorccar:1.0",
+            "hidden_paths": [],
+            "test_commands": ["pytest"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            downloaded = root / "downloaded"
+            with self._archive(
+                (target, b"MODEL = True\n"),
+                (symbolic, b""),
+                (hard, b""),
+            ) as archive:
+                AGSWorkspaceBackend._safe_extract(archive, downloaded)
+
+            metadata = _BENCHMARK.stage_score_context(
+                task,
+                downloaded / "workspace",
+                root / "score",
+            )
+            staged = root / "score/workspace"
+            self.assertEqual(metadata["score_context_stats"]["source"]["file_count"], 3)
+            self.assertEqual((staged / "model.py").read_text(), "MODEL = True\n")
+            self.assertEqual((staged / "model-copy.py").read_text(), "MODEL = True\n")
+            self.assertFalse(any(path.is_symlink() for path in staged.rglob("*")))
+
+    def test_safe_extract_rejects_absolute_and_parent_escape_paths(self) -> None:
+        attacks = ("/tmp/absolute.py", "workspace/../../../escape.py")
+        for name in attacks:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "download"
+                member = tarfile.TarInfo(name)
+                with self._archive((member, b"bad")) as archive:
+                    with self.assertRaisesRegex(ValueError, "unsafe path"):
+                        AGSWorkspaceBackend._safe_extract(archive, destination)
+                self.assertFalse((Path(temporary) / "escape.py").exists())
+
+    def test_safe_extract_rejects_links_that_escape_or_are_not_regular(self) -> None:
+        attacks: list[tuple[tarfile.TarInfo, bytes]] = []
+        symbolic = tarfile.TarInfo("workspace/model.py")
+        symbolic.type = tarfile.SYMTYPE
+        symbolic.linkname = "../../outside.py"
+        attacks.append((symbolic, b""))
+
+        hard = tarfile.TarInfo("workspace/model.py")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "../outside.py"
+        attacks.append((hard, b""))
+
+        dangling = tarfile.TarInfo("workspace/dangling.py")
+        dangling.type = tarfile.SYMTYPE
+        dangling.linkname = "missing.py"
+        attacks.append((dangling, b""))
+
+        for member, content in attacks:
+            with self.subTest(kind=member.type), tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "download"
+                with self._archive((member, content)) as archive:
+                    with self.assertRaisesRegex(ValueError, "unsafe (path|entry)"):
+                        AGSWorkspaceBackend._safe_extract(archive, destination)
+                self.assertFalse((Path(temporary) / "outside.py").exists())
+
+    def test_safe_extract_enforces_archive_and_materialization_limits(self) -> None:
+        first = tarfile.TarInfo("workspace/one.py")
+        second = tarfile.TarInfo("workspace/two.py")
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self._archive((first, b"1"), (second, b"2")) as archive,
+            patch("src.execution.ags.AGS_ARCHIVE_MAX_MEMBERS", 1),
+        ):
+            with self.assertRaisesRegex(ValueError, "member-count limit"):
+                AGSWorkspaceBackend._safe_extract(
+                    archive, Path(temporary) / "download"
+                )
+
+        oversized = tarfile.TarInfo("workspace/large.py")
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self._archive((oversized, b"1234")) as archive,
+            patch("src.execution.ags.AGS_ARCHIVE_MAX_TOTAL_BYTES", 3),
+        ):
+            with self.assertRaisesRegex(ValueError, "expanded-size limit"):
+                AGSWorkspaceBackend._safe_extract(
+                    archive, Path(temporary) / "download"
+                )
+
+        target_dir = tarfile.TarInfo("workspace/implementation")
+        target_dir.type = tarfile.DIRTYPE
+        target = tarfile.TarInfo("workspace/implementation/module.py")
+        alias = tarfile.TarInfo("workspace/package")
+        alias.type = tarfile.SYMTYPE
+        alias.linkname = "implementation"
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            self._archive(
+                (target_dir, b""),
+                (target, b"1234"),
+                (alias, b""),
+            ) as archive,
+            patch("src.execution.ags.AGS_ARCHIVE_MAX_TOTAL_BYTES", 7),
+        ):
+            with self.assertRaisesRegex(ValueError, "expanded-size limit"):
+                AGSWorkspaceBackend._safe_extract(
+                    archive, Path(temporary) / "download"
+                )
 
 
 if __name__ == "__main__":

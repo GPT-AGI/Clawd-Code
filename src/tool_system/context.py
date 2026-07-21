@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -43,6 +44,13 @@ class ToolContext:
     peer_run_id: str | None = None
     peer_id: str | None = None
     peer_control: Any | None = None
+    # All child contexts in a team share this lock. Protocol-v2 mutation tools use
+    # it to make Bash before/after snapshots attributable even while model turns
+    # and read-only tools continue concurrently.
+    mutation_lock: Any = field(default_factory=threading.RLock, repr=False)
+    # Sticky for the lifetime of a worker task. The runtime fails the task even if
+    # the model catches the tool error or attempts to reset its task status.
+    ownership_violations: list[dict[str, Any]] = field(default_factory=list)
     team_store: TeamStore = field(init=False, repr=False)
 
     # Permission handler callback: called when a tool needs user consent.

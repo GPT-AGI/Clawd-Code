@@ -302,18 +302,23 @@ directly with one another using `SendMessage` and poll peer replies with
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
 
-For repository-generation work, enable `quality_gates` on `TeamCreate` and use:
+For repository-generation work, enable `quality_gates` on `TeamCreate` and use the
+protocol-v2 atomic workflow:
 
 ```text
-TeamCreate -> TeamConfigure -> 2+ TeammateCreate/TaskCreate -> TeamRun -> TeamVerify
+TeamCreate -> TeamPlan -> TeamRun
 ```
 
-Strict plans require two independently runnable owners, concrete non-overlapping
-`ownedFiles`, per-task `acceptanceChecks`, and explicit provided/consumed interfaces.
-An interface dependency must be represented in `blockedBy` and acknowledged by a
-direct peer message. Finished workers leave the team in `verification_required`;
-`TeamVerify` creates a fresh virtual environment and runs configured install, import,
-and integration checks before the team can transition to `completed`.
+`TeamPlan` atomically replaces the complete contract, worker set, task DAG, validation
+profile, and execution budget. It requires two independently runnable implementation
+owners, concrete non-overlapping `owned_files`, behavioral `acceptance_checks`, and
+explicit frozen or handoff interfaces. Worker writes are checked against their current
+task ownership. `TeamRun` owns produced-to-accepted transitions and automatically creates
+a fresh environment for install, import, and integration verification before the Team can
+transition to `completed`. A validation or ownership failure enters `repair_required` and
+can continue only after a new `TeamPlan` revision. `TeamAbort` is the explicit terminal
+escape hatch. The incremental `TeamConfigure`/`TeammateCreate`/`TaskCreate` flow remains
+available only for protocol-v1 teams.
 
 Creation tools return structured `next_required_actions`; creating a teammate
 does not start it. A worker runs only after it owns a task and the lead calls
@@ -321,7 +326,7 @@ does not start it. A worker runs only after it owns a task and the lead calls
 the agent loop returns a lifecycle warning and requires the lead to run, resume,
 or explicitly delete the team first.
 
-`TeamRun` accepts `max_workers`, `max_batches`, `max_retries`,
+For protocol v1, `TeamRun` accepts `max_workers`, `max_batches`, `max_retries`,
 `lease_timeout_s`, `timeout_s`, `token_budget`, and `turn_budget`. Use
 `TeamResume` to recover expired leases or
 resume a failed/cancelled team, `TaskRetry` for an explicit task retry, and
@@ -349,6 +354,9 @@ clawd team reassign implementation replacement-coder -C ./project
 clawd team cancel --reason "operator request" -C ./project
 clawd team resume --provider anthropic --model glm-5.2 -C ./project
 ```
+
+The atomic repository-generation protocol, ownership enforcement, repair lifecycle,
+and Q/P/E evaluation policy are documented in `docs/guide/TEAM_PROTOCOL_V2.md`.
 
 Set `workspace_mode: "worktree"` on `TeammateCreate` for git isolation. With
 `auto_integrate: true`, successful changes are committed in the isolated
@@ -830,23 +838,25 @@ planner/coder/reviewer 流水线。Teammate 可通过 `SendMessage` 直接相互
 TeamCreate -> TeammateCreate -> TaskCreate -> TeamRun
 ```
 
-仓库生成任务建议在 `TeamCreate` 开启 `quality_gates`，使用严格链路：
+仓库生成任务建议在 `TeamCreate` 开启 `quality_gates`，使用 protocol v2 原子链路：
 
 ```text
-TeamCreate -> TeamConfigure -> 至少两个 TeammateCreate/TaskCreate -> TeamRun -> TeamVerify
+TeamCreate -> TeamPlan -> TeamRun
 ```
 
-严格模式要求至少两个可立即并行的 owner、明确且不重叠的 `ownedFiles`、每个任务的
-`acceptanceChecks`，以及显式的接口提供/依赖关系。跨任务接口必须加入 `blockedBy`，
-相关 owner 之间至少有一次直接消息确认。Worker 全部结束后 Team 会停在
-`verification_required`；只有 `TeamVerify` 在新虚拟环境中完成安装、import smoke 和
-integration 三段验证，Team 才能进入 `completed`。
+`TeamPlan` 会一次性原子替换完整契约、worker、任务 DAG、验证配置和执行预算。严格
+模式要求至少两个可立即并行的真实实现 owner、明确且不重叠的 `owned_files`、行为级
+`acceptance_checks`，以及 frozen/handoff 接口。worker 的实际写入也会按当前任务所有权
+检查。`TeamRun` 负责从 produced 到 accepted 的转换，并自动在新虚拟环境中完成安装、
+import smoke 和 integration 三段验证；验证或越界写入失败会进入 `repair_required`，只能
+提交新的 `TeamPlan` revision 后继续。`TeamAbort` 是不可恢复的终止操作。增量式
+`TeamConfigure`/`TeammateCreate`/`TaskCreate` 链路仅为 protocol v1 保留。
 
 创建类工具会返回结构化的 `next_required_actions`；创建 teammate 并不等于启动它。
 只有 worker 已拥有任务且 Lead 调用 `TeamRun` 后才会执行。如果 Lead 在 active team
 尚未收敛时尝试结束，agent loop 会返回生命周期警告，要求先运行、恢复或显式删除 team。
 
-`TeamRun` 支持 `max_workers`、`max_batches`、`max_retries`、`lease_timeout_s`、
+protocol v1 的 `TeamRun` 支持 `max_workers`、`max_batches`、`max_retries`、`lease_timeout_s`、
 `timeout_s`、`token_budget` 和 `turn_budget`。`TeamResume` 用于恢复过期 lease 或失败/取消的团队，
 `TaskRetry` 显式重试单个任务，`TeamCancel` 执行协作式取消。所有状态迁移、模型调用、
 工具调用和消息交接都会持久化，可通过 `clawd trace` 查看。
@@ -871,6 +881,9 @@ clawd team reassign implementation replacement-coder -C ./project
 clawd team cancel --reason "operator request" -C ./project
 clawd team resume --provider anthropic --model glm-5.2 -C ./project
 ```
+
+原子仓库生成协议、写入所有权、repair 生命周期和 Q/P/E 评测口径见
+`docs/guide/TEAM_PROTOCOL_V2.md`。
 
 在 `TeammateCreate` 中设置 `workspace_mode: "worktree"` 可启用 Git 隔离；配合
 `auto_integrate: true`，成功改动会在隔离 worktree 中提交并 cherry-pick 回 lead 仓库。

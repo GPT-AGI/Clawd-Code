@@ -108,6 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    raise SystemExit(
+        "direct reward_repair.py scoring pools are disabled. Requeue reusable "
+        "rollouts and run global_pool_supervisor.py with --rollout-capacity 0 "
+        "and the desired --reward-capacity."
+    )
+    # Kept below for import-level migration tooling; the production CLI cannot
+    # reach this legacy private ThreadPoolExecutor path.
     if args.concurrency < 1 or args.max_attempts < 1 or args.poll_interval < 0:
         raise SystemExit("repair concurrency/attempts must be positive")
     run_root = args.run.expanduser().resolve()

@@ -446,6 +446,8 @@ dependencies = [
 ags = [
     { name = "aiohttp" },
     { name = "swe-rex" },
+    { name = "tencentcloud-sdk-python-ags" },
+    { name = "tencentcloud-sdk-python-common" },
 ]
 dev = [
     { name = "build" },
@@ -464,6 +466,8 @@ requires-dist = [
     { name = "python-dotenv" },
     { name = "rich" },
     { name = "swe-rex", marker = "extra == 'ags'", specifier = ">=1.4.0" },
+    { name = "tencentcloud-sdk-python-ags", marker = "extra == 'ags'", specifier = ">=3.1.132" },
+    { name = "tencentcloud-sdk-python-common", marker = "extra == 'ags'", specifier = ">=3.1.132" },
     { name = "tiktoken", specifier = ">=0.7.0" },
     { name = "twine", marker = "extra == 'dev'", specifier = ">=5.0.0" },
     { name = "zhipuai" },
@@ -1799,6 +1803,30 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/94/86/a069f93ec866151a4d476d546e60220e66b3788878b6e248b2df3ab2c5f1/swe_rex-1.4.0.tar.gz", hash = "sha256:14f8a24c49a63f9e251340b1109ac75a4aacbaece410f8599209de9bfca843c0", size = 41755, upload-time = "2025-08-14T01:19:20.22Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/98/0d/d06ab2aa78138055c297490762cd7b4d8ac58a544783f874c869cdb7b534/swe_rex-1.4.0-py3-none-any.whl", hash = "sha256:61261ad03eb23b717b5901cd5d229f24f6e1be2e120aad5c2e5ea3384a1d15ad", size = 47756, upload-time = "2025-08-14T01:19:18.93Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python-ags"
+version = "3.1.135"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tencentcloud-sdk-python-common" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/69/26/ddd0e457c46f232c1d19fa22e3bd7bf38e116142f773f5de2aee1d6842b1/tencentcloud_sdk_python_ags-3.1.135.tar.gz", hash = "sha256:27ee50d4466b17ab361a9d0086b16749d95991ece3684d6a57475bc6fc853399", size = 20287, upload-time = "2026-07-17T04:16:59.604Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/2a/f295811daefd990b4af79c6d03f6892a7460e56ade7e30d7fa366687f6f9/tencentcloud_sdk_python_ags-3.1.135-py2.py3-none-any.whl", hash = "sha256:b5ed10a19402c12e494eb238537f6abcb503d7cb5957622706b6f708bc53217f", size = 23152, upload-time = "2026-07-17T04:16:58.179Z" },
+]
+
+[[package]]
+name = "tencentcloud-sdk-python-common"
+version = "3.1.136"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/36/09/45aef4503c3c8555f7c5577e373775bc28976cc586a066abada8760524a8/tencentcloud_sdk_python_common-3.1.136.tar.gz", hash = "sha256:f9e4922a4477057b9517f1e70f169dadab83b805c1743bba1fb238aac0281276", size = 22674, upload-time = "2026-07-19T20:15:12.543Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/ab/2bd7d3a62646c0ee9424e09d0c34ee7c814ef015366780ad413d9f9f5d4c/tencentcloud_sdk_python_common-3.1.136-py2.py3-none-any.whl", hash = "sha256:106a88c6e89c09bfc8bfc0582fbce84180670611aebae43b71f7bdaa3068da48", size = 34274, upload-time = "2026-07-19T20:15:10.693Z" },
 ]
 
 [[package]]

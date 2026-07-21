@@ -10,9 +10,23 @@ from typing import Any
 from .context import ToolContext
 from .diff_utils import unified_diff_hunks
 from .errors import ToolExecutionError, ToolInputError, ToolPermissionError
+from .ownership import (
+    audit_changed_paths,
+    bash_audit_required,
+    control_state_guard,
+    require_owned_path,
+    snapshot_remote_workspace,
+)
 from .protocol import ToolResult
 from .registry import ToolSpec
-from .tools.bash import _DANGEROUS_PATTERNS, _truncate, _try_extract_cd
+from .tools.bash import (
+    _DANGEROUS_PATTERNS,
+    _destructive_delete_targets,
+    _safe_delete_target,
+    _strict_protocol_v2_team,
+    _truncate,
+    _try_extract_cd,
+)
 from .tools.edit import FileEditTool
 from .tools.glob import GlobTool
 from .tools.grep import GrepTool
@@ -54,6 +68,25 @@ class RemoteBashTool:
         for pattern in _DANGEROUS_PATTERNS:
             if pattern.search(command):
                 raise ToolPermissionError("refusing to run potentially dangerous command")
+        delete_targets = _destructive_delete_targets(command)
+        if any(target.strip().rstrip("/") in {"", "/"} for target in delete_targets):
+            raise ToolPermissionError("refusing to run potentially dangerous command")
+        if _strict_protocol_v2_team(context):
+            delete_target = next(
+                (
+                    target
+                    for target in delete_targets
+                    if not _safe_delete_target(target)
+                ),
+                None,
+            )
+            if delete_target is not None:
+                raise ToolPermissionError(
+                    "strict protocol v2 preserves the best workspace and refuses "
+                    f"recursive deletion of deliverable path {delete_target!r}; edit "
+                    "the owned files in place or use TeamReplan for a recoverable plan "
+                    "replacement. TeamAbort is terminal and is not a restart operation"
+                )
 
         backend = _backend(context)
         explicit_cwd = tool_input.get("cwd")
@@ -91,7 +124,24 @@ class RemoteBashTool:
         timeout_s = tool_input.get("timeout_s", 60)
         if not isinstance(timeout_s, int) or timeout_s < 1 or timeout_s > 600:
             raise ToolInputError("timeout_s must be an integer between 1 and 600")
-        result = backend.exec(command, cwd=cwd, timeout_s=timeout_s)
+        with context.mutation_lock:
+            with control_state_guard(context) as control_backup:
+                before = (
+                    snapshot_remote_workspace(context)
+                    if bash_audit_required(context)
+                    else None
+                )
+                try:
+                    result = backend.exec(command, cwd=cwd, timeout_s=timeout_s)
+                finally:
+                    if before is not None:
+                        audit_changed_paths(
+                            context,
+                            tool_name="Bash",
+                            before=before,
+                            after=snapshot_remote_workspace(context),
+                            control_backup=control_backup,
+                        )
         return ToolResult(
             name="Bash",
             output={
@@ -251,16 +301,22 @@ class RemoteFileWriteTool:
         except ValueError as exc:
             raise ToolPermissionError(str(exc)) from exc
         backend = _backend(context)
-        stat = backend.stat(path)
-        original: str | None = None
-        if stat.exists:
-            if stat.is_dir:
-                raise ToolInputError(f"path is a directory: {path}")
-            if not context.was_remote_file_read_and_unchanged(path):
-                raise ToolInputError("refusing to overwrite: file must be read first and unchanged since last read")
-            original = backend.read_text(path)
-        backend.write_text(path, content)
-        context.mark_remote_file_read(path)
+        with context.mutation_lock:
+            require_owned_path(
+                context, path, tool_name="Write", execution_path=True
+            )
+            stat = backend.stat(path)
+            original: str | None = None
+            if stat.exists:
+                if stat.is_dir:
+                    raise ToolInputError(f"path is a directory: {path}")
+                if not context.was_remote_file_read_and_unchanged(path):
+                    raise ToolInputError(
+                        "refusing to overwrite: file must be read first and unchanged since last read"
+                    )
+                original = backend.read_text(path)
+            backend.write_text(path, content)
+            context.mark_remote_file_read(path)
         diff = list(
             difflib.unified_diff(
                 (original or "").splitlines(keepends=True),
@@ -301,20 +357,28 @@ class RemoteFileEditTool:
         except ValueError as exc:
             raise ToolPermissionError(str(exc)) from exc
         backend = _backend(context)
-        stat = backend.stat(path)
-        if not stat.exists or not stat.is_file:
-            raise ToolInputError(f"file does not exist: {path}")
-        if not context.was_remote_file_read_and_unchanged(path):
-            raise ToolInputError("refusing to edit: file must be read first and unchanged since last read")
-        original = backend.read_text(path)
-        count = original.count(old)
-        if count == 0:
-            raise ToolInputError("old_string not found in file")
-        if count > 1 and not replace_all:
-            raise ToolInputError("old_string is not unique; provide a larger old_string or set replace_all=true")
-        updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
-        backend.write_text(path, updated)
-        context.mark_remote_file_read(path)
+        with context.mutation_lock:
+            require_owned_path(
+                context, path, tool_name="Edit", execution_path=True
+            )
+            stat = backend.stat(path)
+            if not stat.exists or not stat.is_file:
+                raise ToolInputError(f"file does not exist: {path}")
+            if not context.was_remote_file_read_and_unchanged(path):
+                raise ToolInputError(
+                    "refusing to edit: file must be read first and unchanged since last read"
+                )
+            original = backend.read_text(path)
+            count = original.count(old)
+            if count == 0:
+                raise ToolInputError("old_string not found in file")
+            if count > 1 and not replace_all:
+                raise ToolInputError(
+                    "old_string is not unique; provide a larger old_string or set replace_all=true"
+                )
+            updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
+            backend.write_text(path, updated)
+            context.mark_remote_file_read(path)
         diff = list(
             difflib.unified_diff(
                 original.splitlines(keepends=True),

@@ -5,6 +5,7 @@ SCRIPT_DIR=${0:A:h}
 REPO_ROOT=${SCRIPT_DIR:h:h}
 PYTHON="$REPO_ROOT/.venv/bin/python"
 QUEUE="$SCRIPT_DIR/evaluation_queue.py"
+GLOBAL_POOL="$SCRIPT_DIR/global_pool_supervisor.py"
 RUNS_ROOT="$SCRIPT_DIR/runs"
 AGS_ENV="${REPO_ROOT:h}/sandbox/ags/.env"
 GROUP_ID="20260716-qwen104-both-repeat3-pool32"
@@ -20,7 +21,9 @@ if [[ ! -f "$AGS_ENV" ]]; then
 fi
 
 export QWEN_ENABLE_THINKING=1
+export AGS_SCORE_SETUP_CONCURRENCY=8
 
+global_args=()
 for repeat in 1 2 3; do
   run_id="${GROUP_ID}-r${repeat}"
   run_root="$RUNS_ROOT/$run_id"
@@ -45,25 +48,20 @@ SET priority = 100000 - (
 )
 WHERE status = 'queued';
 SQL
-
-  print "[$(date -u +%FT%TZ)] starting $run_id with rollout=32 reward=4"
-  "$PYTHON" "$QUEUE" --run "$run_root" serve \
-    --provider qwen \
-    --model "$MODEL" \
-    --max-turns 300 \
-    --teammate-max-turns 80 \
-    --rollout-concurrency 32 \
-    --reward-concurrency 4 \
-    --max-rollout-concurrency 64 \
-    --max-reward-concurrency 16 \
-    --execution-backend ags \
-    --score-backend ags \
-    --ags-env-file "$AGS_ENV" \
-    --reward-attempts 3 \
-    --reward-retry-delay 5 \
-    --stop-when-empty \
-    2>&1 | tee -a "$run_root/worker.log"
-  print "[$(date -u +%FT%TZ)] completed $run_id"
+  global_args+=(--run "$run_root")
 done
 
-print "[$(date -u +%FT%TZ)] all three repeats completed"
+print "[$(date -u +%FT%TZ)] starting all repeats in shared rollout=32 reward=4 pools"
+exec "$PYTHON" "$GLOBAL_POOL" \
+  "${global_args[@]}" \
+  --provider qwen \
+  --model "$MODEL" \
+  --max-turns 300 \
+  --teammate-max-turns 80 \
+  --rollout-capacity 32 \
+  --reward-capacity 4 \
+  --worker-capacity 64 \
+  --ags-env-file "$AGS_ENV" \
+  --rollout-attempts 3 \
+  --reward-attempts 3 \
+  --reward-retry-delay 5

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +12,7 @@ import random
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,7 +23,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +40,37 @@ PILOT_TASKS = ("jsonlines", "tinydb", "aiofiles", "flask-restful", "fastapi-user
 ROLLOUT32_SEED = 20260715
 ROLLOUT32_SIZE = 32
 ROLLOUT32_MAX_PROMPT_BYTES = 64 * 1024
+RESULT_SCHEMA_VERSION = 2
+SCORE_POLICY_VERSION = "nl2repo-score-v2"
+PROTOCOL_POLICY_VERSION = "team-protocol-v3"
+PROMPT_VERSION = "nl2repo-harness-v3"
+GLOBAL_POOL_LOCK_PATH = ROOT / "runs" / "global-pool.lock"
+GLOBAL_POOL_STATE_PATH = ROOT / "runs" / "global-pool-state.json"
+GLOBAL_POOL_WORKER_ENV = "CLAWD_NL2REPO_GLOBAL_POOL_WORKER"
+GLOBAL_POOL_WORKER_MARKER = "global_pool_supervisor.v1"
+_MISSING = object()
+SCORE_CONTEXT_IGNORED_NAMES = frozenset(
+    {".git", ".clawd", "__pycache__", ".pytest_cache"}
+)
+SCORE_CONTEXT_MAX_FILES = max(
+    1, int(os.environ.get("NL2REPO_SCORE_CONTEXT_MAX_FILES", "50000"))
+)
+SCORE_CONTEXT_MAX_FILE_BYTES = max(
+    1,
+    int(
+        os.environ.get(
+            "NL2REPO_SCORE_CONTEXT_MAX_FILE_BYTES", str(256 * 1024 * 1024)
+        )
+    ),
+)
+SCORE_CONTEXT_MAX_TOTAL_BYTES = max(
+    1,
+    int(
+        os.environ.get(
+            "NL2REPO_SCORE_CONTEXT_MAX_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)
+        )
+    ),
+)
 PACKAGE_FILES = {
     "setup.py",
     "pyproject.toml",
@@ -62,6 +96,173 @@ PYTEST_COMMAND_RE = re.compile(
 )
 
 
+def global_pool_is_active(lock_path: Path | None = None) -> bool:
+    """Return whether the process-wide NL2Repo pool lease is currently held.
+
+    ``global-pool.lock`` is deliberately persistent, so file existence alone is
+    not evidence of an active supervisor.  Probe the kernel lock without
+    deleting or rewriting the diagnostic file.
+    """
+    path = (lock_path or GLOBAL_POOL_LOCK_PATH).expanduser().resolve()
+    if not path.is_file():
+        return False
+    try:
+        handle = path.open("r+", encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            raise
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def reject_if_global_pool_active(
+    operation: str,
+    *,
+    lock_path: Path | None = None,
+) -> None:
+    """Reject auxiliary capacity while the global evaluator owns the GPUs."""
+    if global_pool_is_active(lock_path):
+        raise SystemExit(
+            f"{operation} is disabled while the NL2Repo global pool is active; "
+            "enqueue the work in global_pool_supervisor.py or wait for it to stop."
+        )
+
+
+def enforce_child_launch_policy(
+    argv: Sequence[str],
+    *,
+    environ: Mapping[str, str] | None = None,
+    lock_path: Path | None = None,
+    parent_pid: int | None = None,
+) -> None:
+    """Allow private agent children only from a registered queue worker."""
+    if not argv or argv[0] != "_run-one":
+        return
+    environment = os.environ if environ is None else environ
+    resolved_lock = (lock_path or GLOBAL_POOL_LOCK_PATH).expanduser().resolve()
+    supervised = environment.get(GLOBAL_POOL_WORKER_ENV) == GLOBAL_POOL_WORKER_MARKER
+    supervised = supervised and global_pool_is_active(resolved_lock)
+    metadata: dict[str, Any] = {}
+    if supervised:
+        # The flock inode must remain stable, so its diagnostic metadata is
+        # updated in place. Retry brief partial reads around that update.
+        for _attempt in range(3):
+            try:
+                loaded = json.loads(resolved_lock.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    metadata = loaded
+                    break
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.01)
+    try:
+        owner_pid = int(metadata["pid"])
+    except (KeyError, TypeError, ValueError):
+        supervised = False
+        owner_pid = -1
+    actual_parent = os.getppid() if parent_pid is None else parent_pid
+    if supervised and int(metadata.get("schema_version") or 0) >= 2:
+        registered_pids = metadata.get("worker_pids")
+        state_path = resolved_lock.with_name(GLOBAL_POOL_STATE_PATH.name)
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = None
+        if (
+            isinstance(state, dict)
+            and state.get("pid") == metadata.get("pid")
+            and isinstance(state.get("worker_pids"), list)
+        ):
+            registered_pids = state["worker_pids"]
+        try:
+            allowed = {int(value) for value in registered_pids}
+        except (TypeError, ValueError):
+            allowed = set()
+        supervised = actual_parent in allowed
+    elif supervised:
+        # A supervisor started before schema v2 has no worker registry. Keep
+        # its in-flight queue compatible without accepting a public marker from
+        # arbitrary processes: the agent child's parent must itself be a direct
+        # child of the lock-owning supervisor.
+        supervised = _process_parent_pid(actual_parent) == owner_pid
+    if supervised:
+        return
+    raise SystemExit(
+        "direct 'benchmark.py _run-one' is disabled: agent children must be "
+        "launched by an evaluation_queue worker owned by the live global pool."
+    )
+
+
+def _process_parent_pid(pid: int) -> int | None:
+    """Read a process's parent without relying on Linux-only /proc."""
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        value = completed.stdout.strip()
+        return int(value) if value else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def start_parent_watchdog(
+    expected_parent_pid: int,
+    stop_event: threading.Event,
+    *,
+    interval_s: float = 1.0,
+    on_orphan: Callable[[], Any] | None = None,
+    parent_pid_loader: Callable[[], int] = os.getppid,
+) -> threading.Thread:
+    """Signal an agent child when its queue-worker parent disappears."""
+    if interval_s <= 0:
+        raise ValueError("parent watchdog interval must be positive")
+    notify = (
+        (lambda: os.kill(os.getpid(), signal.SIGTERM))
+        if on_orphan is None
+        else on_orphan
+    )
+
+    def monitor() -> None:
+        while not stop_event.wait(interval_s):
+            if parent_pid_loader() == expected_parent_pid:
+                continue
+            notify()
+            return
+
+    thread = threading.Thread(
+        target=monitor,
+        name="queue-parent-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def enforce_top_level_pool_policy(args: argparse.Namespace) -> None:
+    """Keep metadata-only CLI operations, but disable the legacy local pools."""
+    # Match main's branch order: --list wins before all other actions, while
+    # --rescore performs work before --plan/--validate are considered.
+    if args.list:
+        return
+    if not args.rescore and (args.plan or args.validate):
+        return
+    raise SystemExit(
+        "direct benchmark.py rollout/reward pools are disabled. Prepare a queue "
+        "with evaluation_queue.py and launch it through global_pool_supervisor.py."
+    )
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -77,6 +278,37 @@ def _append_jsonl(path: Path, value: Any) -> None:
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _harness_revision() -> tuple[str | None, bool | None]:
+    """Return the local harness revision without making metadata creation fragile."""
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return revision or None, dirty
+    except (OSError, subprocess.SubprocessError):
+        return None, None
 
 
 def format_ags_image(template: str, task_name: str) -> str:
@@ -236,7 +468,47 @@ def load_task(upstream_root: Path, task_name: str) -> dict[str, Any]:
     }
 
 
-def build_prompt(mode: str) -> str:
+def _team_execution_budget(
+    *,
+    teammate_max_turns: int = 160,
+    max_output_tokens: int = 16_384,
+    team_timeout_s: float = 7_200,
+) -> dict[str, int | float]:
+    # Two initially parallel workers share one rollout-wide budget.  The token cap
+    # leaves headroom for input context while preventing runaway repair loops; the
+    # TeamPlan manifest freezes it so later revisions cannot silently raise it.
+    team_turn_budget = max(2, min(100_000, 2 * int(teammate_max_turns)))
+    team_token_budget = max(
+        1_000_000,
+        min(
+            100_000_000,
+            team_turn_budget * max(1, int(max_output_tokens)) * 4,
+        ),
+    )
+    team_timeout_s = max(1, min(86_400, float(team_timeout_s)))
+    return {
+        "max_workers": 2,
+        "timeout_s": team_timeout_s,
+        "token_budget": team_token_budget,
+        "turn_budget": team_turn_budget,
+    }
+
+
+def build_prompt(
+    mode: str,
+    *,
+    teammate_max_turns: int = 160,
+    max_output_tokens: int = 16_384,
+    team_timeout_s: float = 7_200,
+) -> str:
+    team_budget = _team_execution_budget(
+        teammate_max_turns=teammate_max_turns,
+        max_output_tokens=max_output_tokens,
+        team_timeout_s=team_timeout_s,
+    )
+    team_turn_budget = int(team_budget["turn_budget"])
+    team_token_budget = int(team_budget["token_budget"])
+    team_timeout_s = float(team_budget["timeout_s"])
     common = """Build the complete Python repository described in start.md in this workspace.
 Begin by reading the whole specification and inspecting the initially empty repository.
 The official upstream tests are hidden and will be run only after you finish. You may
@@ -260,49 +532,77 @@ intervene when needed, integrate the work, and personally perform final validati
 The team topology must be your runtime decision, not a predefined role pipeline.
 """
     if mode == "adaptive-team-v2":
-        return common + """
+        return common + f"""
 Adaptive Team v2 protocol: act as the lead and make an explicit collaboration routing
 decision after reading the complete specification. Create a Team when the work contains
-at least two substantially independent implementation, investigation, or validation
+at least two substantially independent implementation
 streams whose parallel progress is likely to exceed coordination cost. Remain solo for
 small, tightly coupled work where delegation would only duplicate context.
 
-When using a Team, start with at most two teammates. Give each teammate a concrete,
-non-overlapping, independently verifiable task and omit the model override so every
-teammate inherits the configured endpoint model. Keep ownership of architecture,
-integration, and final end-to-end validation as the lead. Reserve substantial lead
-budget for integration and tests; inspect teammate output before relying on it, and do
-not repeatedly resume an unproductive task. The topology and Team decision must follow
-from this repository rather than a predefined role pipeline. It is valid to complete
-the rollout without creating a Team when the routing criteria are not met.
+It is valid to complete the rollout without creating a Team when the routing criteria
+are not met. If collaboration is justified, create a Team with quality_gates=true and
+then use only the atomic TeamPlan -> TeamRun protocol; do not assemble a v2 plan with
+TeamConfigure, TeammateCreate, TaskCreate, or TeamVerify. Start with exactly two real
+implementation workers. Omit model, tools, and workspace settings so the harness uses
+the configured endpoint and shared AGS workspace. Give distinct workers substantive,
+initially runnable implementation tasks with concrete repo-relative, non-overlapping
+owned_files and behavioral acceptance_checks. Keep architecture, integration, and final
+end-to-end judgment as the lead. Include persistent project test files in owned_files;
+for non-deliverable checks, prefer inline commands or task-private scratch. A worker may
+create a previously absent, unreserved tests/test_*.py as a local self-test, but it may
+not edit existing/reserved tests; declare every test intended as a deliverable.
 
-If you use a Team, create it with quality_gates=true. Then call TeamConfigure with a
-written architecture contract plus clean-install, import-smoke, and integration
-commands. Create at least two initially runnable tasks owned by distinct teammates.
-Every task must declare concrete non-overlapping ownedFiles and acceptanceChecks;
-declare providesInterfaces/dependsOnInterfaces and blockedBy whenever work crosses a
-module boundary. After TeamRun completes worker tasks, call TeamVerify. Do not finish
-the rollout while the Team status is verification_required or validation has failed.
+In TeamPlan, define clean-install, import-smoke, and integration validation. Freeze a
+shared interface contract when both sides can start from its declared signature; use a
+handoff contract only when a consumer truly cannot begin before its provider artifact.
+TeamRun executes the workers, runs their acceptance checks itself, and performs final
+verification automatically. If TeamPlan returns needs_plan_fix, correct every structured
+issue and replace the whole plan rather than appending compensating tasks. If TeamRun
+returns repair_required, stop active workers, call TeamReplan to checkpoint and preserve
+the best workspace, then submit one complete replacement TeamPlan and run again. Set
+replace_completed_work=true only when the replacement intentionally supersedes produced
+work. TeamAbort is terminal and is never a restart/replan operation. In TeamPlan.execution,
+set max_workers=2, timeout_s={team_timeout_s:g}, token_budget={team_token_budget}, and
+turn_budget={team_turn_budget}; these are rollout-wide caps frozen by the first plan. Call
+TeamRun without execution override fields so the accepted manifest cannot drift. Validation must exercise documented behavior,
+error cases, and cross-module integration; import/hasattr/callable-only smoke checks are not
+acceptance. Do not finish until TeamRun reports completed or TeamAbort records an explicit
+terminal failure.
 """
     if mode == "forced-team":
-        return common + """
-Diagnostic execution protocol: the harness has already created the active strict Team.
-Do not call TeamCreate. After reading start.md, call TeamConfigure with a concrete
-architecture contract and clean-install, import-smoke, and integration commands. You
-must call TeammateCreate at least twice to create at least two teammates, then create
-at least two initially runnable tasks owned by
-distinct teammates. Every TaskCreate must declare concrete non-overlapping ownedFiles
-and acceptanceChecks. Declare providesInterfaces/dependsOnInterfaces plus blockedBy
-for cross-module dependencies; owners on an interface edge must exchange at least one
-substantive peer message. Execute the plan with TeamRun and then call TeamVerify. The
-Team is not complete while verification is pending or failed.
-Choose the number of agents,
-task-specific roles, tool permissions, workspaces, dependencies, concurrency,
-and communication topology from the repository itself. Do not use a predefined role
-pipeline. All teammates must inherit the configured endpoint model; omit the model
-override in TeammateCreate. Observe progress, intervene when needed, integrate the work, and personally
-perform final validation. A rollout without two completed teammate tasks and passed
-TeamVerify validation is invalid.
+        return common + f"""
+Diagnostic execution protocol v2: the harness has already created the active strict
+protocol-v2 Team. Do not call TeamCreate, TeamConfigure, TeammateCreate, TaskCreate, or
+TeamVerify. After reading all of start.md, submit one atomic TeamPlan in replace mode,
+then call TeamRun. Use exactly two real implementation workers initially and omit model,
+tools, and workspace settings so both inherit the configured endpoint and shared AGS
+workspace. Assign at least two substantive implementation tasks to distinct workers.
+Each implementation task needs concrete repo-relative, cross-owner non-overlapping
+owned_files and behavioral acceptance_checks; existence-only checks such as test -e,
+true, echo, or ls are invalid.
+Persistent project test files must be included in the owning task's owned_files. Prefer
+inline behavioral commands or isolated task scratch for non-deliverable checks. A worker
+may create a previously absent, unreserved tests/test_*.py as a local self-test, but it
+may not edit existing/reserved tests; declare every test intended as a deliverable.
+
+The TeamPlan must include a concise architecture contract plus clean-install,
+import-smoke, and integration validation. Use frozen interface contracts for signatures
+both workers can implement against immediately. Use handoff only when a consumer truly
+cannot begin before a provider artifact; both workers must still have substantive
+implementation work ready at the start. TeamRun executes task acceptance and final
+verification automatically. If TeamPlan returns needs_plan_fix, correct every structured
+issue and replace the complete plan; never append compensating legacy tasks. If TeamRun
+returns repair_required, stop active workers, call TeamReplan to checkpoint and preserve
+the best workspace, then submit one complete replacement TeamPlan and run it again. Set
+replace_completed_work=true only when the replacement intentionally supersedes produced
+work. TeamAbort is terminal and is never a restart/replan operation. In TeamPlan.execution,
+set max_workers=2, timeout_s={team_timeout_s:g}, token_budget={team_token_budget}, and
+turn_budget={team_turn_budget}; these are rollout-wide caps frozen by the first plan. Call
+TeamRun without execution override fields so the accepted manifest cannot drift. Acceptance and final validation must exercise
+documented behavior, error cases, and cross-module integration; import/hasattr/callable-only
+smoke checks are insufficient. Do not finish until TeamRun reports completed or TeamAbort
+records an explicit terminal failure. A ceremonial second worker or an unverified worker
+completion is invalid.
 """
     raise ValueError(f"unknown mode: {mode}")
 
@@ -344,6 +644,31 @@ def _install_remote_workspace(downloaded: Path, workspace: Path) -> None:
 def _is_ags_image_preparing_error(error: Exception) -> bool:
     message = str(error).casefold()
     return "resourceunavailable" in message and "image is still preparing" in message
+
+
+def _is_rollout_infrastructure_error(error: BaseException) -> bool:
+    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
+        return True
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "connection reset",
+            "connection refused",
+            "connection error",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "rate limit",
+            "too many requests",
+            "sandbox unavailable",
+            "deployment unavailable",
+            "ags backend",
+            "image is still preparing",
+            "authentication",
+            "api key",
+        )
+    )
 
 
 def start_ags_backend_with_retry(
@@ -421,6 +746,7 @@ def _run_agent_child(
     backend: Any | None = None
     sandbox_id = ""
     payload: dict[str, Any]
+    failure_phase = "harness_setup"
     try:
         if mode == "forced-team":
             from src.teammate.store import TeamStore
@@ -439,21 +765,30 @@ def _run_agent_child(
             quality.update(
                 {
                     "strict": True,
+                    "protocol_version": 2,
                     "configured": bool(quality.get("configured", False)),
+                    "plan_accepted": bool(quality.get("plan_accepted", False)),
                     "validation": quality.get("validation") or {"status": "pending"},
                 }
             )
+            team.protocol_version = 2
+            team.settings["protocol_version"] = 2
             team.settings["quality_gates"] = quality
+            if not isinstance(team.settings.get("team_plan"), dict):
+                team.set_lifecycle_state("draft")
             store.save_team(team)
             _append_jsonl(
                 progress_path,
                 {
                     "kind": "forced_team_precreated",
                     "team_id": team.team_id,
+                    "protocol_version": 2,
+                    "lifecycle_state": team.lifecycle_state,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
         if execution_backend == "ags":
+            failure_phase = "ags_provisioning"
             if not ags_image:
                 raise ValueError("AGS execution requires an image")
             from src.execution.ags import AGSSettings, AGSWorkspaceBackend
@@ -496,8 +831,10 @@ def _run_agent_child(
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
+            failure_phase = "ags_upload"
             backend.reset_workspace()
             backend.upload_tree(workspace, backend.workspace_root)
+        failure_phase = "agent_execution"
         result = run_prompt(
             prompt_path.read_text(encoding="utf-8"),
             workspace=workspace,
@@ -513,8 +850,28 @@ def _run_agent_child(
             workspace_backend=backend,
         )
         payload = {
-            "ok": result.response_text != "[Max tool turns reached]",
+            "ok": bool(
+                result.response_text != "[Max tool turns reached]"
+                and not getattr(result, "failed", False)
+                and not getattr(result, "cancelled", False)
+            ),
             "response_text": result.response_text,
+            "failed": bool(getattr(result, "failed", False)),
+            "failure_reason": getattr(result, "failure_reason", None),
+            "cancelled": bool(getattr(result, "cancelled", False)),
+            "rollout_outcome": (
+                "completed"
+                if not getattr(result, "failed", False)
+                and not getattr(result, "cancelled", False)
+                else "team_aborted"
+                if getattr(result, "failure_reason", None) == "team_aborted"
+                else "budget_exhausted"
+                if getattr(result, "failure_reason", None)
+                == "team_budget_exhausted"
+                else "candidate_failure"
+            ),
+            "rollout_infrastructure": False,
+            "rollout_retryable": False,
             "lead_usage": result.usage or {},
             "lead_turns": result.num_turns,
             "lead_model_calls": sum(event["kind"] == "model_response" for event in events),
@@ -523,6 +880,10 @@ def _run_agent_child(
             "sandbox_id": sandbox_id or None,
         }
     except BaseException as exc:
+        infrastructure = bool(
+            failure_phase in {"harness_setup", "ags_provisioning", "ags_upload"}
+            or _is_rollout_infrastructure_error(exc)
+        )
         terminal = next(
             (
                 event
@@ -541,6 +902,10 @@ def _run_agent_child(
             "ok": False,
             "error": str(exc),
             "traceback": traceback.format_exc(),
+            "failure_phase": failure_phase,
+            "rollout_outcome": "infra_error" if infrastructure else "harness_error",
+            "rollout_infrastructure": True,
+            "rollout_retryable": infrastructure,
             "lead_usage": terminal.get("usage") or {},
             "lead_turns": lead_turns,
             "lead_model_calls": sum(event["kind"] == "model_response" for event in events),
@@ -569,6 +934,10 @@ def _run_agent_child(
             except BaseException as exc:
                 payload["ok"] = False
                 payload["workspace_download_error"] = str(exc)
+                payload["failure_phase"] = "ags_download"
+                payload["rollout_outcome"] = "infra_error"
+                payload["rollout_infrastructure"] = True
+                payload["rollout_retryable"] = True
             finally:
                 try:
                     backend.close()
@@ -584,7 +953,14 @@ def _run_agent_child(
                     },
                 )
     _write_json(result_path, payload)
-    return 0 if payload["ok"] else 1
+    # A model/protocol terminal failure is still a successfully captured rollout:
+    # preserve its generated workspace so code quality can be scored independently
+    # with effective quality/protocol credit set to zero.  Reserve a non-zero child
+    # exit for harness/provider/transfer failures that produced no usable response.
+    captured_rollout = "response_text" in payload and not payload.get(
+        "workspace_download_error"
+    )
+    return 0 if captured_rollout else 1
 
 
 def _team_metrics(workspace: Path) -> dict[str, Any]:
@@ -602,6 +978,14 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
             "agents": [],
             "tasks": 0,
             "completed_tasks": 0,
+            "accepted_tasks": 0,
+            "attempted_tasks": 0,
+            "produced_tasks": 0,
+            "plan_revision": 0,
+            "plan_hash": None,
+            "plan_hash_valid": False,
+            "execution_manifest_valid": False,
+            "manifest_valid": False,
             "messages": 0,
             "peer_messages": 0,
             "worker_usage": {},
@@ -609,6 +993,8 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
             "trace_tool_calls": 0,
             "interventions": {},
             "quality_gates": {},
+            "protocol_version": None,
+            "lifecycle_state": None,
         }
     team = _read_json(team_path)
     team_id = str(team.get("team_id") or team_path.parent.name)
@@ -624,18 +1010,29 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
                 "role": raw.get("role"),
                 "status": raw.get("status"),
                 "model": raw.get("model"),
+                "instructions": raw.get("instructions") or "",
                 "tools": raw.get("tools") or [],
                 "workspace_mode": raw.get("workspace_mode"),
+                "auto_integrate": bool(raw.get("auto_integrate")),
             }
         )
     tasks = _read_json(team_dir / "tasks.json") if (team_dir / "tasks.json").exists() else {}
     messages = [_read_json(path) for path in sorted((team_dir / "messages").glob("*.json"))]
     event_types: list[str] = []
+    events: list[dict[str, Any]] = []
+    produced_task_ids: set[str] = set()
     events_path = team_dir / "events.jsonl"
     if events_path.exists():
         for line in events_path.read_text(encoding="utf-8").splitlines():
             try:
-                event_types.append(str(json.loads(line).get("type") or ""))
+                event = json.loads(line)
+                event_type = str(event.get("type") or "")
+                event_types.append(event_type)
+                events.append(event)
+                if event_type == "task.produced":
+                    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                    if data.get("task_id"):
+                        produced_task_ids.add(str(data["task_id"]))
             except (json.JSONDecodeError, AttributeError):
                 continue
     intervention_types = (
@@ -645,18 +1042,516 @@ def _team_metrics(workspace: Path) -> dict[str, Any]:
         "task.retry_requested",
         "team.resumed",
     )
-    quality_gates = dict((team.get("settings") or {}).get("quality_gates") or {})
+    settings = team.get("settings") if isinstance(team.get("settings"), dict) else {}
+    quality_gates = dict(settings.get("quality_gates") or {})
     validation = dict(quality_gates.get("validation") or {})
+    plan = settings.get("team_plan") if isinstance(settings.get("team_plan"), dict) else {}
+    plan_hash = str(plan.get("hash") or "")
+    try:
+        plan_revision = int(plan.get("revision") or 0)
+    except (TypeError, ValueError):
+        plan_revision = 0
+    task_values = [task for task in tasks.values() if isinstance(task, dict)]
+    canonical_plan = {
+        key: plan.get(key)
+        for key in ("mode", "contract", "workers", "tasks", "validation", "execution")
+    }
+    plan_hash_valid = bool(
+        plan_hash
+        and all(canonical_plan.get(key) is not None for key in canonical_plan)
+        and _stable_hash(canonical_plan) == plan_hash
+    )
+    execution_keys = {
+        "max_workers",
+        "timeout_s",
+        "token_budget",
+        "turn_budget",
+        "max_retries",
+        "lease_timeout_s",
+        "verify_timeout_s",
+        "auto_verify",
+    }
+    expected_execution = (
+        plan.get("execution") if isinstance(plan.get("execution"), dict) else {}
+    )
+    execution_manifest = (
+        settings.get("execution_manifest")
+        if isinstance(settings.get("execution_manifest"), dict)
+        else {}
+    )
+    frozen_execution = (
+        execution_manifest.get("execution")
+        if isinstance(execution_manifest.get("execution"), dict)
+        else {}
+    )
+    effective_execution = (
+        execution_manifest.get("effective_execution")
+        if isinstance(execution_manifest.get("effective_execution"), dict)
+        else frozen_execution
+    )
+
+    # Protocol v2 has one immutable source of truth: execution_manifest.  Runtime
+    # defaults and sanctioned adjustments are persisted inside that manifest rather
+    # than copied into mutable top-level team settings.  Events remain an audit
+    # fallback for manifests written by the immediately preceding schema version.
+    current_plan_event_index = -1
+    for index, event in enumerate(events):
+        if event.get("type") != "team.plan_committed":
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if str(data.get("plan_hash") or "") == plan_hash:
+            current_plan_event_index = index
+    execution_adjustments: dict[str, list[dict[str, Any]]] = {}
+    persisted_adjustments = execution_manifest.get("runtime_adjustments")
+    if isinstance(persisted_adjustments, dict):
+        for key, adjustment in persisted_adjustments.items():
+            if key in execution_keys and isinstance(adjustment, dict):
+                execution_adjustments.setdefault(str(key), []).append(adjustment)
+    if current_plan_event_index >= 0:
+        for event in events[current_plan_event_index + 1 :]:
+            if event.get("type") != "team.options_adjusted":
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            for key, adjustment in data.items():
+                if key in execution_keys and isinstance(adjustment, dict):
+                    execution_adjustments.setdefault(str(key), []).append(adjustment)
+
+    def execution_value_matches(left: Any, right: Any) -> bool:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return type(left) is type(right) and left == right
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return float(left) == float(right)
+        return left == right
+
+    def documented_runtime_adjustment(
+        key: str, expected: Any, actual: Any
+    ) -> bool:
+        # This is the only adjustment currently emitted by TeammateRuntime.  Keep
+        # the check narrow so a forged/generic event cannot excuse plan drift.
+        if key != "timeout_s":
+            return False
+        return any(
+            adjustment.get("reason") == "runtime minimum"
+            and execution_value_matches(adjustment.get("requested"), expected)
+            and execution_value_matches(adjustment.get("effective"), actual)
+            for adjustment in execution_adjustments.get(key, [])
+        )
+
+    execution_manifest_mismatches: list[dict[str, Any]] = []
+    if not execution_manifest:
+        execution_manifest_mismatches.append(
+            {"field": "manifest", "reason": "missing"}
+        )
+    if execution_manifest and execution_manifest.get("schema_version") != 2:
+        execution_manifest_mismatches.append(
+            {
+                "field": "schema_version",
+                "reason": "value_mismatch",
+                "expected": 2,
+                "actual": execution_manifest.get("schema_version"),
+            }
+        )
+    manifest_status = execution_manifest.get("status")
+    if execution_manifest and manifest_status not in {"frozen", "accepted"}:
+        execution_manifest_mismatches.append(
+            {
+                "field": "status",
+                "reason": "invalid_status",
+                "actual": manifest_status,
+            }
+        )
+    if str(team.get("status") or "") == "completed" and manifest_status != "accepted":
+        execution_manifest_mismatches.append(
+            {
+                "field": "status",
+                "reason": "completed_without_accepted_manifest",
+                "expected": "accepted",
+                "actual": manifest_status,
+            }
+        )
+    if str(execution_manifest.get("plan_hash") or "") != plan_hash:
+        execution_manifest_mismatches.append(
+            {
+                "field": "plan_hash",
+                "reason": "value_mismatch",
+                "expected": plan_hash,
+                "actual": execution_manifest.get("plan_hash"),
+            }
+        )
+    try:
+        manifest_revision = int(execution_manifest.get("plan_revision") or 0)
+    except (TypeError, ValueError):
+        manifest_revision = 0
+    if manifest_revision != plan_revision:
+        execution_manifest_mismatches.append(
+            {
+                "field": "plan_revision",
+                "reason": "value_mismatch",
+                "expected": plan_revision,
+                "actual": execution_manifest.get("plan_revision"),
+            }
+        )
+    for key, expected in expected_execution.items():
+        if key not in frozen_execution:
+            execution_manifest_mismatches.append(
+                {
+                    "field": key,
+                    "reason": "missing_frozen_value",
+                    "expected": expected,
+                }
+            )
+            continue
+        frozen = frozen_execution[key]
+        if not execution_value_matches(frozen, expected):
+            execution_manifest_mismatches.append(
+                {
+                    "field": key,
+                    "reason": "frozen_value_mismatch",
+                    "expected": expected,
+                    "actual": frozen,
+                }
+            )
+            continue
+        if key not in effective_execution:
+            execution_manifest_mismatches.append(
+                {
+                    "field": key,
+                    "reason": "missing_effective_value",
+                    "expected": expected,
+                }
+            )
+            continue
+        effective = effective_execution[key]
+        if execution_value_matches(effective, expected):
+            continue
+        if documented_runtime_adjustment(key, expected, effective):
+            continue
+        execution_manifest_mismatches.append(
+            {
+                "field": key,
+                "reason": "effective_value_mismatch",
+                "expected": expected,
+                "actual": effective,
+            }
+        )
+    for key in sorted(set(frozen_execution) - set(expected_execution)):
+        execution_manifest_mismatches.append(
+            {
+                "field": key,
+                "reason": "unexpected_frozen_value",
+                "actual": frozen_execution[key],
+            }
+        )
+
+    def manifest_budget_value(
+        container: Any, field: str, path: str, *, allow_none: bool = True
+    ) -> int | None | object:
+        if not isinstance(container, dict) or field not in container:
+            execution_manifest_mismatches.append(
+                {"field": path, "reason": "missing"}
+            )
+            return _MISSING
+        value = container[field]
+        if value is None:
+            if allow_none:
+                return None
+            execution_manifest_mismatches.append(
+                {"field": path, "reason": "invalid_budget_value", "actual": value}
+            )
+            return _MISSING
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            execution_manifest_mismatches.append(
+                {"field": path, "reason": "invalid_budget_value", "actual": value}
+            )
+            return _MISSING
+        return value
+
+    global_cap = execution_manifest.get("global_cap")
+    budget_window = execution_manifest.get("budget_window")
+    if execution_manifest:
+        if not isinstance(global_cap, dict):
+            execution_manifest_mismatches.append(
+                {"field": "global_cap", "reason": "missing_or_invalid"}
+            )
+            global_cap = {}
+        if not isinstance(budget_window, dict):
+            execution_manifest_mismatches.append(
+                {"field": "budget_window", "reason": "missing_or_invalid"}
+            )
+            budget_window = {}
+        if budget_window.get("scope") != "plan_revision":
+            execution_manifest_mismatches.append(
+                {
+                    "field": "budget_window.scope",
+                    "reason": "value_mismatch",
+                    "expected": "plan_revision",
+                    "actual": budget_window.get("scope"),
+                }
+            )
+        baseline = budget_window.get("baseline")
+        incremental = budget_window.get("incremental_limit")
+        hard_ceiling = budget_window.get("hard_ceiling")
+        usage = team.get("usage") if isinstance(team.get("usage"), dict) else {}
+        for metric, plan_key in (
+            ("total_tokens", "token_budget"),
+            ("turns", "turn_budget"),
+        ):
+            baseline_value = manifest_budget_value(
+                baseline,
+                metric,
+                f"budget_window.baseline.{metric}",
+                allow_none=False,
+            )
+            incremental_value = manifest_budget_value(
+                incremental, metric, f"budget_window.incremental_limit.{metric}"
+            )
+            hard_value = manifest_budget_value(
+                hard_ceiling, metric, f"budget_window.hard_ceiling.{metric}"
+            )
+            global_value = manifest_budget_value(
+                global_cap, metric, f"global_cap.{metric}"
+            )
+            planned_value = expected_execution.get(plan_key)
+            if (
+                incremental_value is not _MISSING
+                and not execution_value_matches(incremental_value, planned_value)
+            ):
+                execution_manifest_mismatches.append(
+                    {
+                        "field": f"budget_window.incremental_limit.{metric}",
+                        "reason": "plan_budget_mismatch",
+                        "expected": planned_value,
+                        "actual": incremental_value,
+                    }
+                )
+            if baseline_value is not _MISSING:
+                current_usage = usage.get(metric, 0)
+                if (
+                    isinstance(current_usage, bool)
+                    or not isinstance(current_usage, int)
+                    or current_usage < baseline_value
+                ):
+                    execution_manifest_mismatches.append(
+                        {
+                            "field": f"budget_window.baseline.{metric}",
+                            "reason": "exceeds_current_usage",
+                            "expected_at_most": current_usage,
+                            "actual": baseline_value,
+                        }
+                    )
+            if (
+                baseline_value is _MISSING
+                or incremental_value is _MISSING
+                or global_value is _MISSING
+                or hard_value is _MISSING
+            ):
+                continue
+            allocated = (
+                None
+                if incremental_value is None
+                else baseline_value + incremental_value
+            )
+            expected_hard = (
+                global_value
+                if allocated is None
+                else allocated
+                if global_value is None
+                else min(allocated, global_value)
+            )
+            if hard_value != expected_hard:
+                execution_manifest_mismatches.append(
+                    {
+                        "field": f"budget_window.hard_ceiling.{metric}",
+                        "reason": "derived_value_mismatch",
+                        "expected": expected_hard,
+                        "actual": hard_value,
+                    }
+                )
+            if plan_revision == 1:
+                expected_global = allocated
+                if global_value != expected_global:
+                    execution_manifest_mismatches.append(
+                        {
+                            "field": f"global_cap.{metric}",
+                            "reason": "initial_cap_mismatch",
+                            "expected": expected_global,
+                            "actual": global_value,
+                        }
+                    )
+        expected_budget_integrity = _stable_hash(
+            {
+                "plan_hash": plan_hash,
+                "plan_revision": plan_revision,
+                "execution": frozen_execution,
+                "global_cap": global_cap,
+                "budget_window": budget_window,
+            }
+        )
+        if execution_manifest.get("budget_integrity_hash") != expected_budget_integrity:
+            execution_manifest_mismatches.append(
+                {
+                    "field": "budget_integrity_hash",
+                    "reason": "value_mismatch",
+                    "expected": expected_budget_integrity,
+                    "actual": execution_manifest.get("budget_integrity_hash"),
+                }
+            )
+    execution_manifest_valid = not execution_manifest_mismatches
+    expected_worker_specs = {
+        str(worker.get("name") or "").casefold(): worker
+        for worker in (plan.get("workers") or [])
+        if isinstance(worker, dict) and worker.get("name")
+    }
+    actual_worker_specs = {
+        str(agent.get("name") or "").casefold(): agent for agent in agents
+    }
+    expected_task_specs = {
+        str(task.get("key") or "").casefold(): task
+        for task in (plan.get("tasks") or [])
+        if isinstance(task, dict) and task.get("key")
+    }
+    actual_task_specs = {
+        str(task.get("key") or "").casefold(): task for task in task_values
+    }
+    agent_name_by_id = {
+        str(agent.get("id") or ""): str(agent.get("name") or "").casefold()
+        for agent in agents
+    }
+    task_key_by_id = {
+        str(task.get("id") or ""): str(task.get("key") or "")
+        for task in task_values
+    }
+    manifest_errors: list[str] = []
+    if not plan_hash_valid:
+        manifest_errors.append("plan_hash_mismatch")
+    if plan_revision < 1:
+        manifest_errors.append("missing_plan_revision")
+    if execution_manifest_mismatches:
+        manifest_errors.extend(
+            f"execution.{item['field']}:{item['reason']}"
+            for item in execution_manifest_mismatches
+        )
+    if len(agents) != len(expected_worker_specs):
+        manifest_errors.append("worker_count_mismatch")
+    if len(task_values) != len(expected_task_specs):
+        manifest_errors.append("task_count_mismatch")
+    if set(expected_worker_specs) != set(actual_worker_specs):
+        manifest_errors.append("worker_identity_mismatch")
+    if set(expected_task_specs) != set(actual_task_specs):
+        manifest_errors.append("task_identity_mismatch")
+    manifest_valid = bool(
+        plan_hash_valid
+        and plan_revision >= 1
+        and execution_manifest_valid
+        and len(agents) == len(expected_worker_specs)
+        and len(task_values) == len(expected_task_specs)
+        and set(expected_worker_specs) == set(actual_worker_specs)
+        and set(expected_task_specs) == set(actual_task_specs)
+    )
+    if manifest_valid:
+        for name, expected in expected_worker_specs.items():
+            actual = actual_worker_specs[name]
+            if not (
+                str(actual.get("name") or "") == str(expected.get("name") or "")
+                and str(actual.get("role") or "") == str(expected.get("role") or "")
+                and str(actual.get("instructions") or "")
+                == str(expected.get("instructions") or "")
+                and list(actual.get("tools") or []) == list(expected.get("tools") or [])
+                and actual.get("model") == expected.get("model")
+                and str(actual.get("workspace_mode") or "")
+                == str(expected.get("workspace_mode") or "")
+                and bool(actual.get("auto_integrate"))
+                == bool(expected.get("auto_integrate"))
+            ):
+                manifest_valid = False
+                manifest_errors.append(f"worker_spec_mismatch:{name}")
+                break
+    if manifest_valid:
+        expected_contract_hash = _stable_hash(plan.get("contract") or {})
+        manifest_valid = bool(
+            quality_gates.get("contract_hash") == expected_contract_hash
+            and quality_gates.get("contract") == plan.get("contract")
+            and str(quality_gates.get("protocol_version") or "") == "2"
+        )
+        if not manifest_valid:
+            manifest_errors.append("quality_gate_contract_mismatch")
+    if manifest_valid:
+        expected_contract_hash = _stable_hash(plan.get("contract") or {})
+        for key, expected in expected_task_specs.items():
+            actual = actual_task_specs[key]
+            metadata = actual.get("metadata") if isinstance(actual.get("metadata"), dict) else {}
+            expected_metadata = (
+                expected.get("metadata")
+                if isinstance(expected.get("metadata"), dict)
+                else {}
+            )
+            actual_dependencies = [
+                task_key_by_id.get(str(task_id), "")
+                for task_id in (actual.get("blockedBy") or [])
+            ]
+            if not (
+                metadata.get("plan_hash") == plan_hash
+                and metadata.get("contract_hash") == expected_contract_hash
+                and all(
+                    metadata.get(metadata_key) == metadata_value
+                    for metadata_key, metadata_value in expected_metadata.items()
+                )
+                and str(actual.get("key") or "") == str(expected.get("key") or "")
+                and str(actual.get("subject") or "") == str(expected.get("subject") or "")
+                and str(actual.get("description") or "")
+                == str(expected.get("description") or "")
+                and str(metadata.get("task_type") or "implementation")
+                == str(expected.get("kind") or "implementation")
+                and agent_name_by_id.get(str(actual.get("owner") or ""), "")
+                == str(expected.get("owner") or "").casefold()
+                and list(actual.get("owned_files") or [])
+                == list(expected.get("owned_files") or [])
+                and list(actual.get("acceptance_checks") or [])
+                == list(expected.get("acceptance_checks") or [])
+                and actual_dependencies == list(expected.get("blocked_by") or [])
+                and list(actual.get("provides_interfaces") or [])
+                == list(expected.get("provides_interfaces") or [])
+                and list(actual.get("depends_on_interfaces") or [])
+                == list(expected.get("depends_on_interfaces") or [])
+            ):
+                manifest_valid = False
+                manifest_errors.append(f"task_spec_mismatch:{key}")
+                break
     return {
         "present": True,
         "active": active,
         "team_id": team_id,
         "status": team.get("status"),
+        "protocol_version": team.get("protocol_version", 1),
+        "lifecycle_state": team.get("lifecycle_state") or team.get("status"),
         "agents": agents,
         "tasks": len(tasks),
         "completed_tasks": sum(
             1 for task in tasks.values() if isinstance(task, dict) and task.get("status") == "completed"
         ),
+        "accepted_tasks": sum(
+            1
+            for task in tasks.values()
+            if isinstance(task, dict)
+            and task.get("status") == "completed"
+            and task.get("lifecycle_state") == "accepted"
+        ),
+        "attempted_tasks": sum(
+            1
+            for task in task_values
+            if str(task.get("attempt") or "0").lstrip("+").isdigit()
+            and int(task.get("attempt") or 0) > 0
+        ),
+        "produced_tasks": sum(
+            1 for task in task_values if str(task.get("id") or "") in produced_task_ids
+        ),
+        "plan_revision": plan_revision,
+        "plan_hash": plan_hash or None,
+        "plan_hash_valid": plan_hash_valid,
+        "execution_manifest_valid": execution_manifest_valid,
+        "execution_manifest_mismatches": execution_manifest_mismatches,
+        "manifest_valid": manifest_valid,
+        "manifest_errors": list(dict.fromkeys(manifest_errors)),
         "messages": len(messages),
         "peer_messages": sum(
             str(message.get("sender_id") or "") != lead_id
@@ -682,6 +1577,33 @@ def _protocol_ok(mode: str, team: dict[str, Any]) -> bool:
     if mode in {"adaptive", "adaptive-team-v2"} and not team["present"]:
         return True
     quality = team.get("quality_gates") or {}
+    try:
+        protocol_version = int(team.get("protocol_version") or 1)
+    except (TypeError, ValueError):
+        protocol_version = 1
+    lifecycle_state = team.get("lifecycle_state") or team.get("status")
+    if mode == "adaptive-team-v2" and protocol_version < 2:
+        return False
+    if protocol_version >= 2:
+        return bool(
+            team["present"]
+            and team.get("status") == "completed"
+            and lifecycle_state == "completed"
+            and quality.get("strict")
+            and quality.get("configured")
+            and quality.get("plan_accepted")
+            and quality.get("validation_status") == "passed"
+            and len(team["agents"]) >= 2
+            and team["tasks"] >= 2
+            and team["completed_tasks"] == team["tasks"]
+            and team.get("attempted_tasks", 0) == team["tasks"]
+            and team.get("produced_tasks", 0) == team["tasks"]
+            and team.get("accepted_tasks", 0) == team["tasks"]
+            and team.get("plan_revision", 0) >= 1
+            and bool(team.get("plan_hash"))
+            and team.get("plan_hash_valid") is True
+            and team.get("manifest_valid") is True
+        )
     strict_ok = not quality.get("strict") or (
         quality.get("configured")
         and quality.get("plan_accepted")
@@ -739,7 +1661,7 @@ def classify_failure(
 ) -> str | None:
     """Assign a stable, dashboard-friendly failure class without changing reward."""
     pytest_result = hidden.get("pytest") if isinstance(hidden.get("pytest"), dict) else {}
-    if hidden.get("error"):
+    if hidden.get("error") or hidden.get("infrastructure_timed_out"):
         return "scorer_infrastructure"
     if hidden.get("timed_out") or pytest_result.get("returncode") == 124:
         return "reward_timeout"
@@ -785,6 +1707,142 @@ def classify_failure(
     return "unknown_failure"
 
 
+def _result_metrics_v2(
+    *,
+    agent_ok: bool,
+    agent_timed_out: bool,
+    integrity_ok: bool,
+    protocol_ok: bool,
+    hidden: dict[str, Any],
+    failure_class: str | None,
+    rollout_infrastructure: bool = False,
+    rollout_retryable: bool = False,
+    rollout_outcome: str | None = None,
+) -> dict[str, Any]:
+    """Build orthogonal delivery, protocol, and reward metrics.
+
+    A protocol failure is not a reward failure.  In particular, a complete
+    workspace can still provide a valid hidden-test measurement even when the
+    Team lifecycle was not completed.  ``quality_score`` remains the legacy
+    hidden-test value; dashboards should use the explicit v2 eligibility flags.
+    """
+    if rollout_infrastructure:
+        return {
+            "result_schema_version": RESULT_SCHEMA_VERSION,
+            "rollout_outcome": rollout_outcome or "infra_error",
+            "code_quality_score": None,
+            "protocol_status": "not_evaluated",
+            "protocol_credit": None,
+            "delivery_valid": False,
+            "effective_quality_score": None,
+            "reward_outcome": "pending",
+            "reward_score_valid": False,
+            "metric_eligibility": {
+                "code_quality": False,
+                "protocol_yield": False,
+                "effective_quality": False,
+            },
+            "failure_domain": "infrastructure",
+            "is_infrastructure": True,
+            "retryable": bool(rollout_retryable),
+            "timeout_scope": "rollout" if agent_timed_out else None,
+            "failure_class": failure_class or "rollout_infrastructure",
+        }
+
+    pytest_result = hidden.get("pytest") if isinstance(hidden.get("pytest"), dict) else {}
+    delivery_valid = bool(agent_ok and integrity_ok)
+    protocol_status = "passed" if protocol_ok else "failed"
+    protocol_credit = 1.0 if protocol_ok else 0.0
+    reward_timed_out = bool(
+        hidden.get("timed_out") or pytest_result.get("returncode") == 124
+    )
+    infrastructure_timed_out = bool(hidden.get("infrastructure_timed_out"))
+    reward_skipped = bool(hidden.get("skipped"))
+    reward_error = bool(hidden.get("error"))
+
+    if infrastructure_timed_out:
+        reward_outcome = "infra_timeout"
+    elif reward_error:
+        reward_outcome = "infra_error"
+    elif reward_timed_out:
+        reward_outcome = "candidate_timeout"
+    elif reward_skipped:
+        reward_outcome = "missing_artifact"
+    elif not isinstance(pytest_result.get("quality_score"), (int, float)):
+        reward_outcome = "pending"
+    else:
+        reward_outcome = "scored"
+    reward_score_valid = bool(
+        reward_outcome == "scored"
+        and isinstance(pytest_result.get("quality_score"), (int, float))
+    )
+    code_quality_score = (
+        float(pytest_result["quality_score"]) if reward_score_valid else None
+    )
+    is_infrastructure = bool(reward_error or infrastructure_timed_out)
+
+    # A scorer infrastructure failure makes Q, P, and E unobservable for this
+    # attempt.  It must take precedence over candidate/protocol zero credit;
+    # otherwise an unavailable scorer is silently counted as E=0 and biases the
+    # aggregate.  With a functioning scorer, invalid delivery or protocol still
+    # deterministically earns zero effective quality.
+    effective_quality_score: float | None
+    if is_infrastructure:
+        effective_quality_score = None
+    elif not delivery_valid or protocol_credit == 0.0:
+        effective_quality_score = 0.0
+    elif reward_score_valid:
+        effective_quality_score = round((code_quality_score or 0.0) * protocol_credit, 2)
+    else:
+        effective_quality_score = None
+    effective_eligible = bool(
+        not is_infrastructure and effective_quality_score is not None
+    )
+
+    timeout_scope: str | None = None
+    if agent_timed_out:
+        timeout_scope = "rollout"
+    elif reward_timed_out or infrastructure_timed_out:
+        timeout_scope = "reward"
+    retryable = is_infrastructure
+    if is_infrastructure:
+        failure_domain: str | None = "infrastructure"
+    elif not delivery_valid or not agent_ok:
+        failure_domain = "candidate"
+    elif not protocol_ok:
+        failure_domain = "protocol"
+    elif not bool(pytest_result.get("all_passed")):
+        failure_domain = "candidate"
+    else:
+        failure_domain = None
+
+    return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "rollout_outcome": rollout_outcome or (
+            "completed" if agent_ok else "candidate_timeout" if agent_timed_out else "candidate_failure"
+        ),
+        "code_quality_score": code_quality_score,
+        "protocol_status": protocol_status,
+        "protocol_credit": protocol_credit,
+        "delivery_valid": delivery_valid,
+        "effective_quality_score": effective_quality_score,
+        "reward_outcome": reward_outcome,
+        "reward_score_valid": reward_score_valid,
+        "metric_eligibility": {
+            "code_quality": reward_score_valid,
+            "protocol_yield": bool(integrity_ok and not is_infrastructure),
+            "effective_quality": effective_eligible,
+        },
+        "failure_domain": failure_domain,
+        "is_infrastructure": is_infrastructure,
+        "retryable": retryable,
+        "timeout_scope": timeout_scope,
+        # Preserve this class as the detailed diagnosis while failure_domain is
+        # the stable top-level attribution used by aggregate metrics.
+        "failure_class": failure_class,
+    }
+
+
 def parse_pytest_output(output: str, expected_tests: int, returncode: int) -> dict[str, Any]:
     def last_count(label: str) -> int:
         matches = re.findall(rf"(?<!\w)(\d+)\s+{label}\b", output, flags=re.IGNORECASE)
@@ -828,15 +1886,96 @@ def _score_shell_command(setup_commands: list[str], test_commands: list[str]) ->
     return "; ".join(f"({command})" for command in commands) or "true"
 
 
+def _validate_score_workspace(workspace: Path) -> dict[str, int]:
+    """Reject unsafe or excessively large trees before they enter a score context."""
+    try:
+        root_stat = workspace.lstat()
+    except OSError as error:
+        raise ValueError(f"cannot inspect score workspace {workspace}: {error}") from error
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ValueError(f"score workspace must not be a symbolic link: {workspace}")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError(f"score workspace is not a directory: {workspace}")
+
+    file_count = 0
+    directory_count = 1
+    total_bytes = 0
+    largest_file_bytes = 0
+    for current, directory_names, file_names in os.walk(
+        workspace, topdown=True, followlinks=False
+    ):
+        current_path = Path(current)
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name not in SCORE_CONTEXT_IGNORED_NAMES
+        )
+        for name in directory_names:
+            path = current_path / name
+            try:
+                entry_stat = path.lstat()
+            except OSError as error:
+                raise ValueError(f"cannot inspect score workspace entry {path}: {error}") from error
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise ValueError(f"symbolic link is not allowed in score workspace: {path}")
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                raise ValueError(f"non-directory workspace entry is not allowed: {path}")
+            directory_count += 1
+
+        for name in sorted(file_names):
+            if name in SCORE_CONTEXT_IGNORED_NAMES:
+                continue
+            path = current_path / name
+            try:
+                entry_stat = path.lstat()
+            except OSError as error:
+                raise ValueError(f"cannot inspect score workspace entry {path}: {error}") from error
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise ValueError(f"symbolic link is not allowed in score workspace: {path}")
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise ValueError(f"non-regular file is not allowed in score workspace: {path}")
+
+            size = int(entry_stat.st_size)
+            file_count += 1
+            total_bytes += size
+            largest_file_bytes = max(largest_file_bytes, size)
+            if file_count > SCORE_CONTEXT_MAX_FILES:
+                raise ValueError(
+                    "score workspace exceeds file-count limit "
+                    f"({file_count} > {SCORE_CONTEXT_MAX_FILES})"
+                )
+            if size > SCORE_CONTEXT_MAX_FILE_BYTES:
+                raise ValueError(
+                    f"score workspace file exceeds size limit: {path} "
+                    f"({size} > {SCORE_CONTEXT_MAX_FILE_BYTES} bytes)"
+                )
+            if total_bytes > SCORE_CONTEXT_MAX_TOTAL_BYTES:
+                raise ValueError(
+                    "score workspace exceeds total-size limit "
+                    f"({total_bytes} > {SCORE_CONTEXT_MAX_TOTAL_BYTES} bytes)"
+                )
+
+    return {
+        "file_count": file_count,
+        "directory_count": directory_count,
+        "total_bytes": total_bytes,
+        "largest_file_bytes": largest_file_bytes,
+    }
+
+
 def stage_score_context(task: dict[str, Any], workspace: Path, destination: Path) -> dict[str, Any]:
+    source_stats = _validate_score_workspace(workspace)
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(
         workspace,
         destination / "workspace",
-        ignore=shutil.ignore_patterns(".git", ".clawd", "__pycache__", ".pytest_cache"),
+        ignore=shutil.ignore_patterns(*sorted(SCORE_CONTEXT_IGNORED_NAMES)),
+        # Never dereference a link introduced between validation and copying.
+        symlinks=True,
     )
     staged_workspace = destination / "workspace"
+    copied_stats = _validate_score_workspace(staged_workspace)
     package_files = sorted(
         path.relative_to(staged_workspace).as_posix()
         for path in staged_workspace.rglob("*")
@@ -867,12 +2006,23 @@ def stage_score_context(task: dict[str, Any], workspace: Path, destination: Path
     ]
     dockerfile = destination / "Dockerfile"
     dockerfile.write_text("\n".join(dockerfile_lines), encoding="utf-8")
+    staged_stats = _validate_score_workspace(staged_workspace)
     return {
         "package_files_present": package_files,
         "generated_hidden_paths": generated_hidden_paths,
         "dockerfile": str(dockerfile),
         "setup_commands": setup_commands,
         "test_commands": test_commands,
+        "score_context_stats": {
+            "source": source_stats,
+            "copied": copied_stats,
+            "staged": staged_stats,
+            "limits": {
+                "max_files": SCORE_CONTEXT_MAX_FILES,
+                "max_file_bytes": SCORE_CONTEXT_MAX_FILE_BYTES,
+                "max_total_bytes": SCORE_CONTEXT_MAX_TOTAL_BYTES,
+            },
+        },
     }
 
 
@@ -997,6 +2147,9 @@ def run_hidden_tests_ags(
     test_output = ""
     returncode = 1
     timed_out = False
+    infrastructure_timed_out = False
+    infrastructure_error: str | None = None
+    tests_started = False
     test_elapsed = 0.0
     cleanup_error: str | None = None
     try:
@@ -1041,6 +2194,7 @@ def run_hidden_tests_ags(
             f"[{task['id']}] ags-score.tests.started · timeout={int(timeout_s)}s",
             flush=True,
         )
+        tests_started = True
         completed = backend.exec(
             test_command,
             cwd=backend.workspace_root,
@@ -1058,11 +2212,16 @@ def run_hidden_tests_ags(
         startup_elapsed = time.monotonic() - started
         test_output = str(exc)
         returncode = 124
-        timed_out = True
+        if tests_started:
+            timed_out = True
+        else:
+            infrastructure_timed_out = True
+            infrastructure_error = str(exc)
     except Exception as exc:
         startup_elapsed = time.monotonic() - started
         test_output = f"{exc}\n{traceback.format_exc()}"
         returncode = 1
+        infrastructure_error = f"{type(exc).__name__}: {exc}"
     finally:
         try:
             if backend is not None:
@@ -1084,6 +2243,8 @@ def run_hidden_tests_ags(
         "startup_elapsed_s": round(startup_elapsed, 3),
         "test_elapsed_s": round(test_elapsed, 3),
         "timed_out": timed_out,
+        "infrastructure_timed_out": infrastructure_timed_out,
+        "error": infrastructure_error,
         "cleanup_error": cleanup_error,
         "pytest": parse_pytest_output(test_output, int(task["expected_tests"]), returncode),
     }
@@ -1155,7 +2316,15 @@ def run_rollout(
     workspace = case_root / "workspace"
     start_hash = prepare_workspace(task, workspace)
     prompt_path = case_root / "PROMPT.md"
-    prompt_path.write_text(build_prompt(mode), encoding="utf-8")
+    prompt_path.write_text(
+        build_prompt(
+            mode,
+            teammate_max_turns=teammate_max_turns,
+            max_output_tokens=max_output_tokens,
+            team_timeout_s=agent_timeout_s,
+        ),
+        encoding="utf-8",
+    )
     result_path = case_root / "agent-result.json"
     progress_path = case_root / "progress.jsonl"
     command = [
@@ -1236,6 +2405,16 @@ def run_rollout(
         timed_out=agent_timed_out,
         stderr=stderr,
     )
+    if agent_timed_out and not agent.get("workspace_download_error"):
+        agent.update(
+            {
+                "ok": False,
+                "rollout_outcome": "candidate_timeout",
+                "rollout_infrastructure": False,
+                "rollout_retryable": False,
+                "failure_phase": "agent_timeout",
+            }
+        )
     return RolloutArtifact(
         task=task,
         mode=mode,
@@ -1277,15 +2456,29 @@ def score_rollout(
         (workspace / "start.md").is_file()
         and _hash_file(workspace / "start.md") == rollout.start_hash
     )
+    rollout_infrastructure = bool(
+        agent.get("rollout_infrastructure") or agent.get("workspace_download_error")
+    )
     rollout_gate_errors: list[str] = []
-    if not bool(agent.get("ok")):
-        rollout_gate_errors.append("agent rollout did not finish successfully")
     if not integrity_ok:
         rollout_gate_errors.append("start.md integrity check failed")
-    if not protocol_ok:
-        rollout_gate_errors.append("team protocol or strict validation is incomplete")
 
-    if rollout_gate_errors:
+    if rollout_infrastructure:
+        reason = str(
+            agent.get("workspace_download_error")
+            or agent.get("error")
+            or "rollout infrastructure failure"
+        )
+        (case_root / "hidden-tests.log").write_text(
+            "Reward pending: rollout infrastructure failure: " + reason + "\n",
+            encoding="utf-8",
+        )
+        hidden = {
+            "skipped": True,
+            "skip_reason": "rollout infrastructure failure: " + reason,
+            "pytest": parse_pytest_output("", int(task["expected_tests"]), 1),
+        }
+    elif rollout_gate_errors:
         reason = "; ".join(rollout_gate_errors)
         (case_root / "hidden-tests.log").write_text(
             "Reward skipped: " + reason + "\n", encoding="utf-8"
@@ -1341,10 +2534,26 @@ def score_rollout(
         hidden=hidden,
         hidden_log=hidden_log,
     )
+    if rollout_infrastructure:
+        failure_class = "rollout_infrastructure"
+    metrics_v2 = _result_metrics_v2(
+        agent_ok=bool(agent.get("ok")),
+        agent_timed_out=rollout.agent_timed_out,
+        integrity_ok=integrity_ok,
+        protocol_ok=protocol_ok,
+        hidden=hidden,
+        failure_class=failure_class,
+        rollout_infrastructure=rollout_infrastructure,
+        rollout_retryable=bool(agent.get("rollout_retryable")),
+        rollout_outcome=str(agent.get("rollout_outcome") or "") or None,
+    )
     result = {
         "task": task["id"],
         "difficulty": task["difficulty"],
         "mode": mode,
+        "prompt_version": PROMPT_VERSION,
+        "protocol_policy_version": PROTOCOL_POLICY_VERSION,
+        "score_policy_version": SCORE_POLICY_VERSION,
         "provider": provider,
         "model": model,
         "execution_backend": execution_backend,
@@ -1353,13 +2562,13 @@ def score_rollout(
         "agent_timed_out": rollout.agent_timed_out,
         "agent_returncode": rollout.agent_returncode,
         "agent_ok": bool(agent.get("ok")),
-        "agent_error": agent.get("error"),
+        "agent_error": agent.get("error") or agent.get("failure_reason"),
         "integrity_ok": integrity_ok,
         "protocol_ok": protocol_ok,
         "used_team": team["present"],
         "quality_score": pytest_result["quality_score"] if integrity_ok else 0.0,
         "success": bool(agent.get("ok") and integrity_ok and protocol_ok and pytest_result["all_passed"]),
-        "failure_class": failure_class,
+        **metrics_v2,
         "usage": usage,
         "calls": {
             "model": team["trace_model_calls"] if team["present"] else agent.get("lead_model_calls", 0),
@@ -1432,13 +2641,17 @@ def rescore_existing_case(
     result["quality_score"] = (
         pytest_result["quality_score"] if result.get("integrity_ok") else 0.0
     )
+    team = _team_metrics(workspace)
+    protocol_ok = _protocol_ok(mode, team)
+    result["team"] = team
+    result["used_team"] = bool(team["present"])
+    result["protocol_ok"] = protocol_ok
     result["success"] = bool(
         result.get("agent_ok")
         and result.get("integrity_ok")
-        and result.get("protocol_ok")
+        and protocol_ok
         and pytest_result["all_passed"]
     )
-    team = _team_metrics(workspace)
     try:
         hidden_log = (case_root / "hidden-tests.log").read_text(
             encoding="utf-8", errors="replace"
@@ -1448,10 +2661,20 @@ def rescore_existing_case(
     result["failure_class"] = classify_failure(
         agent_ok=bool(result.get("agent_ok")),
         integrity_ok=bool(result.get("integrity_ok")),
-        protocol_ok=bool(result.get("protocol_ok")),
+        protocol_ok=protocol_ok,
         team=team,
         hidden=hidden,
         hidden_log=hidden_log,
+    )
+    result.update(
+        _result_metrics_v2(
+            agent_ok=bool(result.get("agent_ok")),
+            agent_timed_out=bool(result.get("agent_timed_out")),
+            integrity_ok=bool(result.get("integrity_ok")),
+            protocol_ok=protocol_ok,
+            hidden=hidden,
+            failure_class=result["failure_class"],
+        )
     )
     result["reward_skipped"] = False
     result["rescored_at"] = datetime.now(timezone.utc).isoformat()
@@ -1568,10 +2791,55 @@ def _failed_case_result(
             "peer_messages": 0,
             "worker_usage": {},
         },
-        "hidden_tests": {"error": message, "pytest": pytest_result},
+        "hidden_tests": (
+            {"error": message, "pytest": pytest_result}
+            if phase in {"reward", "score", "scorer"}
+            else {
+                "skipped": True,
+                "skip_reason": f"{phase} failed before reward: {message}",
+                "pytest": pytest_result,
+            }
+        ),
         "workspace": str(case_root / "workspace"),
         "failure_phase": phase,
     }
+    reward_phase = phase in {"reward", "score", "scorer"}
+    timed_out = isinstance(error, (TimeoutError, subprocess.TimeoutExpired))
+    result.update(
+        {
+            "result_schema_version": RESULT_SCHEMA_VERSION,
+            "code_quality_score": None,
+            "protocol_status": "not_evaluated",
+            "protocol_credit": 0.0,
+            "delivery_valid": False,
+            "effective_quality_score": 0.0,
+            "reward_outcome": (
+                "infra_timeout" if reward_phase and timed_out
+                else "infra_error" if reward_phase
+                else "missing_artifact"
+            ),
+            "reward_score_valid": False,
+            "metric_eligibility": {
+                "code_quality": False,
+                "protocol_yield": False,
+                "effective_quality": not reward_phase,
+            },
+            "failure_domain": "infrastructure" if reward_phase else "candidate",
+            "is_infrastructure": reward_phase,
+            "retryable": reward_phase,
+            "timeout_scope": (
+                "reward" if reward_phase and timed_out
+                else "rollout" if timed_out
+                else None
+            ),
+            "failure_class": (
+                "reward_timeout" if reward_phase and timed_out
+                else "scorer_infrastructure" if reward_phase
+                else "rollout_failure"
+            ),
+            "reward_skipped": True,
+        }
+    )
     _write_json(case_root / "result.json", result)
     return result
 
@@ -1677,17 +2945,43 @@ def run_evaluation_pool(
 
 
 def render_report(results: list[dict[str, Any]], run_id: str, upstream_ref: str) -> str:
+    def code_quality(result: dict[str, Any]) -> float | None:
+        value = result.get("code_quality_score", result.get("quality_score"))
+        hidden = result.get("hidden_tests") or {}
+        return (
+            float(value)
+            if isinstance(value, (int, float)) and not hidden.get("error")
+            else None
+        )
+
+    def effective_quality(result: dict[str, Any]) -> float | None:
+        explicit = result.get("effective_quality_score")
+        if isinstance(explicit, (int, float)):
+            return float(explicit)
+        value = code_quality(result)
+        if value is None:
+            return None
+        return value if result.get("protocol_ok", True) else 0.0
+
+    def protocol_status(result: dict[str, Any]) -> str:
+        return str(
+            result.get("protocol_status")
+            or ("passed" if result.get("protocol_ok", True) else "failed")
+        )
+
     lines = [
         "# NL2Repo Pilot Benchmark",
         "",
         f"Run: `{run_id}`",
         f"Upstream: `{upstream_ref}`",
         "",
-        "| Task | Difficulty | Mode | Quality | Passed | Seconds | Tokens | Agents | Peer messages | Protocol |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|:---:|",
+        "| Task | Difficulty | Mode | Code Q | Effective Q | Passed | Seconds | Tokens | Agents | Peer messages | Protocol |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for result in results:
         tests = result["hidden_tests"]["pytest"]
+        code_score = code_quality(result)
+        effective_score = effective_quality(result)
         lines.append(
             "| "
             + " | ".join(
@@ -1695,24 +2989,60 @@ def render_report(results: list[dict[str, Any]], run_id: str, upstream_ref: str)
                     result["task"],
                     result["difficulty"] or "-",
                     result["mode"],
-                    str(result["quality_score"]),
+                    str(
+                        code_score
+                        if code_score is not None
+                        else "-"
+                    ),
+                    str(effective_score if effective_score is not None else "-"),
                     f"{tests['passed']}/{tests['expected']}",
                     str(result["agent_elapsed_s"]),
                     str(result["usage"]["total_tokens"]),
                     str(len(result["team"]["agents"])),
                     str(result["team"]["peer_messages"]),
-                    "yes" if result["protocol_ok"] else "no",
+                    protocol_status(result),
                 ]
             )
             + " |"
         )
     success = sum(bool(result["success"]) for result in results)
+    code_scores = [
+        score
+        for result in results
+        if (score := code_quality(result)) is not None
+        and result.get("reward_score_valid", True)
+    ]
+    protocol_results = [
+        result
+        for result in results
+        if (result.get("metric_eligibility") or {}).get(
+            "protocol_yield", "protocol_ok" in result
+        )
+    ]
+    effective_scores = [
+        score
+        for result in results
+        if (score := effective_quality(result)) is not None
+        and (result.get("metric_eligibility") or {}).get("effective_quality", True)
+    ]
     lines.extend(
         [
             "",
             f"Strict successful runs: **{success}/{len(results)}**",
+            f"Code quality: **{sum(code_scores) / len(code_scores):.2f}** "
+            f"({len(code_scores)}/{len(results)} reward coverage)"
+            if code_scores
+            else "Code quality: **not measured**",
+            "Protocol yield: **"
+            f"{sum(protocol_status(result) == 'passed' for result in protocol_results) / len(protocol_results):.1%}**"
+            if protocol_results
+            else "Protocol yield: **not measured**",
+            f"Effective quality: **{sum(effective_scores) / len(effective_scores):.2f}**"
+            if effective_scores
+            else "Effective quality: **not measured**",
             "",
-            "Quality is the percentage of hidden upstream pytest cases passed. Strict success",
+            "Code quality is the percentage of hidden upstream pytest cases passed. Effective",
+            "quality additionally applies delivery and protocol credit. Strict success",
             "also requires an intact specification, a valid execution protocol, and a completed",
             "agent run. The upstream data is referenced externally and is not vendored here.",
         ]
@@ -1769,6 +3099,7 @@ def _child_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    enforce_child_launch_policy(sys.argv[1:])
     if len(sys.argv) > 1 and sys.argv[1] == "_run-one":
         args = _child_parser().parse_args()
         def terminate_child(signum: int, frame: Any) -> None:
@@ -1776,26 +3107,32 @@ def main() -> int:
 
         signal.signal(signal.SIGTERM, terminate_child)
         signal.signal(signal.SIGINT, terminate_child)
-        return _run_agent_child(
-            args.workspace.resolve(),
-            args.prompt_file.resolve(),
-            args.result_file.resolve(),
-            args.provider,
-            args.model,
-            args.max_turns,
-            args.teammate_max_turns,
-            args.max_output_tokens,
-            args.stream,
-            args.progress_file.resolve(),
-            teammate_min_timeout_s=args.teammate_min_timeout or None,
-            mode=args.mode,
-            execution_backend=args.execution_backend,
-            ags_image=args.ags_image,
-            ags_env_file=args.ags_env_file.resolve() if args.ags_env_file else None,
-            ags_timeout=args.ags_timeout,
-            ags_cpu=args.ags_cpu,
-            ags_memory=args.ags_memory,
-        )
+        parent_stop = threading.Event()
+        expected_parent = os.getppid()
+        start_parent_watchdog(expected_parent, parent_stop)
+        try:
+            return _run_agent_child(
+                args.workspace.resolve(),
+                args.prompt_file.resolve(),
+                args.result_file.resolve(),
+                args.provider,
+                args.model,
+                args.max_turns,
+                args.teammate_max_turns,
+                args.max_output_tokens,
+                args.stream,
+                args.progress_file.resolve(),
+                teammate_min_timeout_s=args.teammate_min_timeout or None,
+                mode=args.mode,
+                execution_backend=args.execution_backend,
+                ags_image=args.ags_image,
+                ags_env_file=args.ags_env_file.resolve() if args.ags_env_file else None,
+                ags_timeout=args.ags_timeout,
+                ags_cpu=args.ags_cpu,
+                ags_memory=args.ags_memory,
+            )
+        finally:
+            parent_stop.set()
 
     parser = argparse.ArgumentParser(description="Run Clawd against pinned NL2Repo-Bench tasks.")
     parser.add_argument("--list", action="store_true", help="List all upstream tasks")
@@ -1878,6 +3215,7 @@ def main() -> int:
         help="Use structured streaming for model calls (default: enabled)",
     )
     args = parser.parse_args()
+    enforce_top_level_pool_policy(args)
 
     upstream_root = resolve_upstream(args.upstream_root, cache_root=args.cache_root)
     if args.list:
@@ -1959,6 +3297,11 @@ def main() -> int:
                     "modes": list(modes),
                     "cases": len(cases),
                     "max_turns": args.max_turns,
+                    "team_execution_budget": _team_execution_budget(
+                        teammate_max_turns=args.teammate_max_turns,
+                        max_output_tokens=args.max_output_tokens,
+                        team_timeout_s=args.agent_timeout,
+                    ),
                     "rollout_concurrency": rollout_concurrency,
                     "reward_concurrency": args.reward_concurrency,
                     "reward_uses_rollout_slots": False,
@@ -2010,17 +3353,27 @@ def main() -> int:
     run_id = started_at.strftime("%Y%m%dT%H%M%SZ")
     output_root = (args.output or ROOT / "runs" / run_id).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    harness_commit, harness_dirty = _harness_revision()
     _write_json(
         output_root / "run-metadata.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
+            "result_schema_version": RESULT_SCHEMA_VERSION,
             "run_id": run_id,
             "started_at": started_at.isoformat(),
             "upstream_ref": UPSTREAM_REF,
             "task_set": selected_task_set,
+            "task_set_hash": _stable_hash(
+                {"tasks": task_names, "modes": list(modes)}
+            ),
             "tasks": task_names,
             "modes": list(modes),
             "cases": len(cases),
+            "prompt_version": PROMPT_VERSION,
+            "protocol_policy_version": PROTOCOL_POLICY_VERSION,
+            "score_policy_version": SCORE_POLICY_VERSION,
+            "harness_commit": harness_commit,
+            "harness_dirty": harness_dirty,
             "provider": args.provider,
             "model": args.model,
             "execution_backend": args.execution_backend,
@@ -2028,6 +3381,11 @@ def main() -> int:
             "max_turns": args.max_turns,
             "teammate_max_turns": args.teammate_max_turns,
             "teammate_min_timeout_s": args.teammate_min_timeout,
+            "team_execution_budget": _team_execution_budget(
+                teammate_max_turns=args.teammate_max_turns,
+                max_output_tokens=args.max_output_tokens,
+                team_timeout_s=args.agent_timeout,
+            ),
             "rollout_concurrency": rollout_concurrency,
             "reward_concurrency": args.reward_concurrency,
             "reward_uses_rollout_slots": False,

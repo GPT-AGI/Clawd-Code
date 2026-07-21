@@ -15,7 +15,7 @@ import tempfile
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Coroutine, TypeVar
 
 from .backend import CommandOutcome, RemoteStat
@@ -25,6 +25,31 @@ T = TypeVar("T")
 TASK_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 DEFAULT_AGS_IMAGE_REPOSITORY = "swebenchdocker.tencentcloudcr.com/swebench/nl2repo"
 DEFAULT_AGS_RUNTIME_IMAGE = "swebenchdocker.tencentcloudcr.com/swebench/swehub:swerex-runtime"
+AGS_ARCHIVE_MAX_COMPRESSED_BYTES = max(
+    1, int(os.environ.get("CLAWD_AGS_ARCHIVE_MAX_COMPRESSED_BYTES", str(1024**3)))
+)
+AGS_ARCHIVE_MAX_MEMBERS = max(
+    1, int(os.environ.get("CLAWD_AGS_ARCHIVE_MAX_MEMBERS", "100000"))
+)
+AGS_ARCHIVE_MAX_FILES = max(
+    1, int(os.environ.get("CLAWD_AGS_ARCHIVE_MAX_FILES", "50000"))
+)
+AGS_ARCHIVE_MAX_FILE_BYTES = max(
+    1,
+    int(
+        os.environ.get(
+            "CLAWD_AGS_ARCHIVE_MAX_FILE_BYTES", str(256 * 1024 * 1024)
+        )
+    ),
+)
+AGS_ARCHIVE_MAX_TOTAL_BYTES = max(
+    1,
+    int(
+        os.environ.get(
+            "CLAWD_AGS_ARCHIVE_MAX_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024)
+        )
+    ),
+)
 
 
 def _build_sandbox_command(
@@ -529,6 +554,11 @@ class AGSWorkspaceBackend:
             raise RuntimeError(create.stderr or "failed to archive remote workspace")
         try:
             size = self.stat(archive).size
+            if size > AGS_ARCHIVE_MAX_COMPRESSED_BYTES:
+                raise ValueError(
+                    "sandbox workspace archive exceeds compressed-size limit "
+                    f"({size} > {AGS_ARCHIVE_MAX_COMPRESSED_BYTES} bytes)"
+                )
             chunk_size = 384 * 1024
             packed = bytearray()
             for offset in range(0, size, chunk_size):
@@ -561,14 +591,201 @@ class AGSWorkspaceBackend:
 
     @staticmethod
     def _safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
+        """Extract an AGS workspace archive without allowing path escapes.
+
+        GNU tar represents additional names for the same inode as hard links and
+        repositories commonly contain internal symbolic links.  Rejecting every
+        link therefore turns valid workspaces into infrastructure failures.  We
+        validate the complete archive before extracting it instead: links are
+        accepted only when their targets stay inside the archive and hard links
+        resolve to a regular archived file.  Internal symbolic links are then
+        materialized so the downloaded workspace can safely enter the stricter
+        score-context pipeline, which intentionally rejects all live symlinks.
+        """
         root = destination.resolve()
-        for member in archive.getmembers():
-            if member.issym() or member.islnk() or member.isdev():
+        destination.mkdir(parents=True, exist_ok=True)
+        members = archive.getmembers()
+        if len(members) > AGS_ARCHIVE_MAX_MEMBERS:
+            raise ValueError(
+                "sandbox workspace archive exceeds member-count limit "
+                f"({len(members)} > {AGS_ARCHIVE_MAX_MEMBERS})"
+            )
+        entries: dict[PurePosixPath, tarfile.TarInfo] = {}
+        normalized: list[tuple[tarfile.TarInfo, PurePosixPath]] = []
+        logical_file_count = 0
+        logical_total_bytes = 0
+
+        def charge_materialized_file(size: int, *, entry: str) -> None:
+            nonlocal logical_file_count, logical_total_bytes
+            if size < 0 or size > AGS_ARCHIVE_MAX_FILE_BYTES:
+                raise ValueError(
+                    f"sandbox workspace archive entry exceeds file-size limit: {entry} "
+                    f"({size} > {AGS_ARCHIVE_MAX_FILE_BYTES} bytes)"
+                )
+            logical_file_count += 1
+            logical_total_bytes += size
+            if logical_file_count > AGS_ARCHIVE_MAX_FILES:
+                raise ValueError(
+                    "sandbox workspace archive exceeds file-count limit "
+                    f"({logical_file_count} > {AGS_ARCHIVE_MAX_FILES})"
+                )
+            if logical_total_bytes > AGS_ARCHIVE_MAX_TOTAL_BYTES:
+                raise ValueError(
+                    "sandbox workspace archive exceeds expanded-size limit "
+                    f"({logical_total_bytes} > {AGS_ARCHIVE_MAX_TOTAL_BYTES} bytes)"
+                )
+
+        def archive_path(value: str, *, relative_to: PurePosixPath | None = None) -> PurePosixPath:
+            if not value or "\x00" in value or PurePosixPath(value).is_absolute():
+                raise ValueError(f"unsafe path in sandbox archive: {value}")
+
+            parts = list(relative_to.parts if relative_to is not None else ())
+            for part in value.split("/"):
+                if part in {"", "."}:
+                    continue
+                if part == "..":
+                    if not parts:
+                        raise ValueError(f"unsafe path in sandbox archive: {value}")
+                    parts.pop()
+                    continue
+                parts.append(part)
+            if not parts:
+                raise ValueError(f"unsafe path in sandbox archive: {value}")
+            return PurePosixPath(*parts)
+
+        def ensure_local_path(member: tarfile.TarInfo, path: PurePosixPath) -> None:
+            target = root.joinpath(*path.parts)
+            resolved = target.resolve(strict=False)
+            try:
+                resolved.relative_to(root)
+            except ValueError as error:
+                raise ValueError(
+                    f"unsafe path in sandbox archive: {member.name}"
+                ) from error
+
+            # Do not let a pre-existing link in the destination redirect an
+            # otherwise lexical-safe archive member.  The normal caller uses a
+            # fresh temporary directory, but keeping the primitive safe makes it
+            # reusable and closes a subtle overwrite vector.
+            cursor = root
+            for part in path.parts:
+                cursor /= part
+                if cursor.is_symlink():
+                    raise ValueError(f"unsafe path in sandbox archive: {member.name}")
+
+        for member in members:
+            path = archive_path(member.name)
+            ensure_local_path(member, path)
+            if not (member.isdir() or member.isreg() or member.issym() or member.islnk()):
                 raise ValueError(f"unsafe entry in sandbox archive: {member.name}")
-            target = (destination / member.name).resolve()
-            if target != root and root not in target.parents:
-                raise ValueError(f"unsafe path in sandbox archive: {member.name}")
-        archive.extractall(destination)
+            if member.isreg():
+                charge_materialized_file(int(member.size), entry=member.name)
+
+            previous = entries.get(path)
+            if previous is not None and not (previous.isdir() and member.isdir()):
+                raise ValueError(f"unsafe duplicate entry in sandbox archive: {member.name}")
+            entries[path] = member
+            normalized.append((member, path))
+
+        for member, path in normalized:
+            parent = path.parent
+            while parent != PurePosixPath("."):
+                ancestor = entries.get(parent)
+                if ancestor is not None and not ancestor.isdir():
+                    raise ValueError(f"unsafe entry in sandbox archive: {member.name}")
+                parent = parent.parent
+
+            if member.issym():
+                # A symbolic link is relative to the link's containing directory.
+                link_path = archive_path(member.linkname, relative_to=path.parent)
+                target = entries.get(link_path)
+                target_is_implicit_directory = any(
+                    link_path in candidate.parents for candidate in entries
+                )
+                if target is None and not target_is_implicit_directory:
+                    raise ValueError(f"unsafe entry in sandbox archive: {member.name}")
+            elif member.islnk():
+                # Tar hard-link targets are relative to the archive root.  Only a
+                # regular member may be linked: linking to another link or to a
+                # directory makes extraction order/security ambiguous.
+                link_path = archive_path(member.linkname)
+                target = entries.get(link_path)
+                if target is None or not target.isreg():
+                    raise ValueError(f"unsafe entry in sandbox archive: {member.name}")
+                charge_materialized_file(int(target.size), entry=member.name)
+
+        # Python 3.12's data filter performs a second, extraction-time realpath
+        # check and strips unsafe ownership/mode bits.  The complete validation
+        # above is also sufficient for supported Python 3.10/3.11 runtimes where
+        # extraction filters are not available.
+        if hasattr(tarfile, "data_filter"):
+            archive.extractall(destination, filter="data")
+        else:  # pragma: no cover - exercised only on Python < 3.12
+            archive.extractall(destination)
+
+        # Resolve every link before changing any of them.  This catches dangling
+        # links and cycles deterministically, and makes each copy source stable
+        # even when one link targets another link.
+        materializations: list[tuple[Path, Path]] = []
+        for member, path in normalized:
+            if not member.issym():
+                continue
+            link = root.joinpath(*path.parts)
+            try:
+                target = link.resolve(strict=True)
+                target.relative_to(root)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ValueError(
+                    f"unsafe entry in sandbox archive: {member.name}"
+                ) from error
+            if not (target.is_file() or target.is_dir()):
+                raise ValueError(f"unsafe entry in sandbox archive: {member.name}")
+            if target.is_dir():
+                try:
+                    link.relative_to(target)
+                except ValueError:
+                    pass
+                else:
+                    # Copying a directory into one of its own descendants would
+                    # recurse forever (for example ``pkg/link -> ..``).
+                    raise ValueError(f"unsafe entry in sandbox archive: {member.name}")
+            materializations.append((link, target))
+
+        # Children first ensures a copied directory contains no remaining live
+        # symlinks.  Hard links require no conversion: lstat already exposes them
+        # as ordinary regular files to score-context validation.
+        materializations.sort(key=lambda item: len(item[0].parts), reverse=True)
+        for link, target in materializations:
+            if target.is_dir():
+                copied_files: list[Path] = []
+                for current, directory_names, file_names in os.walk(
+                    target, topdown=True, followlinks=False
+                ):
+                    current_path = Path(current)
+                    for name in directory_names:
+                        child = current_path / name
+                        if child.is_symlink():
+                            raise ValueError(
+                                f"unsafe unresolved link in sandbox archive: {child}"
+                            )
+                    for name in file_names:
+                        child = current_path / name
+                        if child.is_symlink() or not child.is_file():
+                            raise ValueError(
+                                f"unsafe unresolved link in sandbox archive: {child}"
+                            )
+                        copied_files.append(child)
+                for child in copied_files:
+                    charge_materialized_file(
+                        int(child.stat().st_size), entry=str(link)
+                    )
+            else:
+                charge_materialized_file(int(target.stat().st_size), entry=str(link))
+            link.unlink()
+            if target.is_dir():
+                shutil.copytree(target, link, symlinks=False)
+            else:
+                shutil.copy2(target, link)
 
     def reset_workspace(self) -> None:
         result = self.exec(

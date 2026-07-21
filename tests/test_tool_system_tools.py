@@ -195,6 +195,15 @@ class TestGrepTool(ToolSystemTests):
 
 
 class TestBashTool(ToolSystemTests):
+    def _enable_strict_team(self) -> None:
+        self.ctx.team = {
+            "protocol_version": 2,
+            "settings": {
+                "protocol_version": 2,
+                "quality_gates": {"strict": True, "protocol_version": 2},
+            },
+        }
+
     def test_bash_echo(self) -> None:
         out = BashTool().run({"command": "echo hello"}, self.ctx).output
         self.assertEqual(out["exit_code"], 0)
@@ -203,6 +212,134 @@ class TestBashTool(ToolSystemTests):
     def test_bash_blocks_sudo(self) -> None:
         with self.assertRaises(Exception):
             BashTool().run({"command": "sudo echo nope"}, self.ctx)
+
+    def test_strict_team_blocks_recursive_source_deletion(self) -> None:
+        self._enable_strict_team()
+
+        with self.assertRaisesRegex(Exception, "preserves the best workspace"):
+            BashTool().run(
+                {"command": "cd /workspace && rm -rf src/package"}, self.ctx
+            )
+
+    def test_strict_team_allows_recursive_generated_cache_cleanup(self) -> None:
+        self._enable_strict_team()
+        cache = self.root / ".pytest_cache"
+        cache.mkdir()
+        (cache / "state").write_text("x", encoding="utf-8")
+
+        result = BashTool().run(
+            {"command": "rm -rf .pytest_cache", "cwd": str(self.root)}, self.ctx
+        )
+
+        self.assertEqual(result.output["exit_code"], 0)
+        self.assertFalse(cache.exists())
+
+    def test_strict_team_blocks_common_nested_destructive_forms(self) -> None:
+        self._enable_strict_team()
+        package = self.root / "pkg"
+        package.mkdir()
+        source = package / "module.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        commands = [
+            "sh -c 'rm -rf pkg'",
+            "find pkg -depth -delete",
+            "git clean -fdx",
+            (
+                f"{sys.executable} -c \"import shutil; "
+                "shutil.rmtree('pkg')\""
+            ),
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(
+                    Exception, "preserves the best workspace"
+                ):
+                    BashTool().run(
+                        {"command": command, "cwd": str(self.root)}, self.ctx
+                    )
+                self.assertEqual(
+                    source.read_text(encoding="utf-8"), "VALUE = 1\n"
+                )
+
+    def test_strict_destructive_guard_ignores_source_text_and_heredoc_data(self) -> None:
+        self._enable_strict_team()
+
+        printf_result = BashTool().run(
+            {
+                "command": "printf '%s' 'rm -rf pkg; git clean -fdx' > note.txt",
+                "cwd": str(self.root),
+            },
+            self.ctx,
+        )
+        heredoc_result = BashTool().run(
+            {
+                "command": (
+                    "cat > cleanup.py <<'PY'\n"
+                    "# example only\n"
+                    "shutil.rmtree('pkg')\n"
+                    "find pkg -delete\n"
+                    "PY"
+                ),
+                "cwd": str(self.root),
+            },
+            self.ctx,
+        )
+        python_result = BashTool().run(
+            {
+                "command": (
+                    f"{sys.executable} -c \"print("
+                    "\\\"shutil.rmtree('pkg')\\\")\""
+                ),
+                "cwd": str(self.root),
+            },
+            self.ctx,
+        )
+
+        self.assertEqual(printf_result.output["exit_code"], 0)
+        self.assertEqual(heredoc_result.output["exit_code"], 0)
+        self.assertEqual(python_result.output["exit_code"], 0)
+        self.assertIn("rm -rf pkg", (self.root / "note.txt").read_text())
+        self.assertIn("find pkg -delete", (self.root / "cleanup.py").read_text())
+
+    def test_strict_lead_cannot_mutate_clawd_with_file_or_bash_tools(self) -> None:
+        self._enable_strict_team()
+        control = self.root / ".clawd"
+        control.mkdir()
+        state = control / "state.json"
+        state.write_text('{"status": "original"}\n', encoding="utf-8")
+        FileReadTool().run({"file_path": str(state)}, self.ctx)
+
+        with self.assertRaisesRegex(Exception, "protects .clawd control state"):
+            FileWriteTool().run(
+                {
+                    "file_path": str(control / "forged.json"),
+                    "content": "{}\n",
+                },
+                self.ctx,
+            )
+        with self.assertRaisesRegex(Exception, "protects .clawd control state"):
+            FileEditTool().run(
+                {
+                    "file_path": str(state),
+                    "old_string": "original",
+                    "new_string": "forged",
+                },
+                self.ctx,
+            )
+        with self.assertRaisesRegex(Exception, "ownership violation"):
+            BashTool().run(
+                {
+                    "command": "printf '{\\\"status\\\": \\\"forged\\\"}\\n' > .clawd/state.json",
+                    "cwd": str(self.root),
+                },
+                self.ctx,
+            )
+
+        self.assertFalse((control / "forged.json").exists())
+        self.assertEqual(
+            state.read_text(encoding="utf-8"), '{"status": "original"}\n'
+        )
 
     def test_bash_runs_a_trailing_command_after_cd(self) -> None:
         nested = self.root / "nested"

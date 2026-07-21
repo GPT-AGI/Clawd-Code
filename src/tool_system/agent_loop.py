@@ -34,9 +34,11 @@ _LOCAL_TOOL_GUIDANCE = """## Local Engineering Tools
 
 _LEADER_TEAM_GUIDANCE = """## Adaptive Team Orchestration
 - You are the lead and remain responsible for the final result. First decide whether delegation is likely to improve quality, latency, or context coverage enough to justify its cost. It is valid to complete the task without creating a team.
+- For a strict quality-gated team, submit the complete contract, workers, tasks, ownership, acceptance, validation, and execution settings in one atomic TeamPlan, then call TeamRun. TeamRun owns task acceptance and final verification. Do not assemble protocol v2 incrementally with TeamConfigure, TeammateCreate, TaskCreate, or TeamVerify.
 - When a team is useful, choose the number of teammates, their roles, tool allowlists, workspace modes, tasks, dependencies, and concurrency from the task itself. Omit a teammate model override unless the runtime explicitly lists it as supported; otherwise inherit the lead model. Do not default to a fixed planner/coder/reviewer pipeline.
 - Teammates may communicate directly with one another through `SendMessage` and receive new peer messages through `ReadMessages`; useful peer coordination does not need to be routed through the lead.
 - Use stable task keys and explicit ownership. Prefer dependencies only when work truly must be sequential, and allow independent tasks to run in parallel.
+- Include persistent project test files in the owning task's owned_files. For behavioral acceptance without a deliverable test file, prefer an inline command; teammates receive a private scratch-test path for additional disposable checks.
 - Observe persisted task, message, and agent state. You may run a bounded number of scheduling batches, then add or reassign tasks, adjust dependencies, stop or resume workers, recover failures, and continue.
 - Treat teammate output as evidence, not authority. Integrate the work, run final verification yourself, and stop unnecessary work when the expected value of more collaboration is low.
 - The resulting communication topology is an execution outcome, not a prescribed shape."""
@@ -178,6 +180,8 @@ class AgentLoopResult:
     usage: dict[str, Any] | None = None  # {"input_tokens": int, "output_tokens": int}
     num_turns: int = 0
     cancelled: bool = False
+    failed: bool = False
+    failure_reason: str | None = None
 
 
 ToolEventHandler = Callable[[ToolEvent], None]
@@ -298,9 +302,31 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
     }
     quality = dict((team.get("settings") or {}).get("quality_gates") or {})
     strict = bool(quality.get("strict"))
+    versions = [1]
+    for raw_version in (
+        team.get("protocol_version"),
+        (team.get("settings") or {}).get("protocol_version"),
+        quality.get("protocol_version"),
+    ):
+        try:
+            versions.append(int(raw_version))
+        except (TypeError, ValueError):
+            continue
+    protocol_version = max(versions)
+    lifecycle_state = str(team.get("lifecycle_state") or status)
     validation_status = (quality.get("validation") or {}).get("status")
 
+    if protocol_version >= 2 and lifecycle_state == "completed":
+        v2_tasks_settled = bool(tasks) and all(
+            task.get("status") == "completed"
+            and task.get("lifecycle_state") == "accepted"
+            for task in tasks
+        )
+        if v2_tasks_settled and validation_status == "passed":
+            return None
     if (
+        protocol_version < 2
+        and
         team.get("status") == "completed"
         and tasks
         and task_counts["completed"] == len(tasks)
@@ -308,12 +334,44 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
     ):
         return None
 
-    if not agents:
+    if protocol_version >= 2 and lifecycle_state == "completed":
+        action = (
+            "The completed state has drifted from its accepted tasks or validation. "
+            "Do not reopen or replace this terminal team; preserve its workspace and "
+            "report the lifecycle inconsistency as a harness failure."
+        )
+    elif protocol_version >= 2 and lifecycle_state == "draft":
+        action = "Submit one atomic TeamPlan before attempting execution."
+    elif protocol_version >= 2 and lifecycle_state == "ready":
+        action = "Call TeamRun to execute the accepted atomic plan."
+    elif protocol_version >= 2 and lifecycle_state == "repair_required":
+        action = (
+            "Stop any active workers, call TeamReplan to checkpoint the current "
+            "workspace, submit one complete replacement TeamPlan, then call TeamRun."
+        )
+    elif protocol_version >= 2 and lifecycle_state == "budget_exhausted":
+        action = (
+            "This rollout is terminal because its frozen execution budget was exhausted. "
+            "Preserve the workspace for scoring; TeamResume and TeamReplan cannot add budget."
+        )
+    elif protocol_version >= 2 and lifecycle_state == "paused":
+        action = "Call TeamRun to continue the persisted protocol v2 lifecycle."
+    elif protocol_version >= 2 and lifecycle_state in {
+        "awaiting_verification",
+        "verifying",
+    }:
+        action = "Call TeamRun; protocol v2 will run or resume verification automatically."
+    elif not agents:
         action = "Call TeammateCreate, create an owned task with TaskCreate, then call TeamRun."
     elif not tasks:
         action = "Call TaskCreate with a teammate owner, then call TeamRun. TeammateCreate did not start the worker."
     elif status in {"failed", "cancelled"} or task_counts["failed"] or task_counts["cancelled"]:
-        action = "Inspect the failed task, then call TeamResume (retry_failed=true) or explicitly abandon it with TeamDelete."
+        action = (
+            "Inspect the failed state, call TeamReplan to preserve the current workspace, "
+            "submit one complete repair TeamPlan revision, and call TeamRun."
+            if protocol_version >= 2
+            else "Inspect the failed task, then call TeamResume (retry_failed=true) or explicitly abandon it with TeamDelete."
+        )
     elif task_counts["pending"] or task_counts["in_progress"]:
         action = "Call TeamRun to execute or continue the pending teammate tasks."
     elif strict and task_counts["completed"] == len(tasks) and validation_status != "passed":
@@ -325,13 +383,21 @@ def _team_lifecycle_warning(tool_context: ToolContext) -> str | None:
         action = "Call TeamRun once more so the runtime records the completed team state."
 
     counts = ", ".join(f"{name}={count}" for name, count in task_counts.items() if count)
-    summary = f"status={status}, agents={len(agents)}, tasks={len(tasks)}"
+    summary = (
+        f"status={status}, lifecycle={lifecycle_state}, "
+        f"agents={len(agents)}, tasks={len(tasks)}"
+    )
     if counts:
         summary += f" ({counts})"
+    ending = (
+        "TeamDelete cannot bypass a strict protocol v2 lifecycle; use TeamAbort only "
+        "when you intend to report an explicit failed/aborted outcome."
+        if strict and protocol_version >= 2
+        else "If the team is no longer needed, call TeamDelete before finishing."
+    )
     return (
         f"Team lifecycle guard: active team `{team.get('team_name') or team_id}` is not settled "
-        f"({summary}). Do not provide the final answer yet. {action} If the team is no longer "
-        "needed, call TeamDelete before finishing."
+        f"({summary}). Do not provide the final answer yet. {action} {ending}"
     )
 
 
@@ -480,6 +546,7 @@ def run_agent_loop(
         *,
         failed: bool = False,
         cancelled: bool = False,
+        failure_reason: str | None = None,
     ) -> AgentLoopResult:
         usage = total_usage if any(total_usage.values()) else None
         emit(ToolEvent(
@@ -496,6 +563,8 @@ def run_agent_loop(
             usage=usage,
             num_turns=turn_count,
             cancelled=cancelled,
+            failed=failed,
+            failure_reason=failure_reason,
         )
 
     emit(ToolEvent(
@@ -611,6 +680,33 @@ def run_agent_loop(
         if not tool_uses:
             lifecycle_warning = _team_lifecycle_warning(tool_context)
             if lifecycle_warning is not None:
+                current_team = tool_context.team or {}
+                if current_team.get("lifecycle_state") in {
+                    "aborted",
+                    "budget_exhausted",
+                }:
+                    budget_exhausted = (
+                        current_team.get("lifecycle_state") == "budget_exhausted"
+                    )
+                    terminal_text = (
+                        final_assistant_content.strip()
+                        or (
+                            "Team execution budget exhausted before successful completion."
+                            if budget_exhausted
+                            else "Team aborted before successful completion."
+                        )
+                    )
+                    if stream and terminal_text and not streamed_live_text:
+                        _emit_text_chunks(on_text_chunk, terminal_text)
+                    return finish(
+                        terminal_text,
+                        failed=True,
+                        failure_reason=(
+                            "team_budget_exhausted"
+                            if budget_exhausted
+                            else "team_aborted"
+                        ),
+                    )
                 emit(
                     ToolEvent(
                         kind="team_lifecycle_warning",
@@ -768,5 +864,31 @@ def run_agent_loop(
         if anthropic_result_blocks:
             conversation.add_message("user", anthropic_result_blocks)
 
-    # Reached max turns
-    return finish("[Max tool turns reached]", failed=True)
+    # Reached max turns.  An unsettled protocol v2 team is a distinct lifecycle
+    # failure, not a successful model stop.  Preserve the historical response text
+    # so existing CLI/evaluation callers continue to recognize max-turn failures.
+    lifecycle_warning = _team_lifecycle_warning(tool_context)
+    if lifecycle_warning is not None:
+        emit(
+            ToolEvent(
+                kind="team_lifecycle_failed",
+                content=lifecycle_warning,
+                model=tool_context.model_override or getattr(provider, "model", None),
+                turn=turn_count,
+                is_error=True,
+                error="maximum turns reached with an unsettled team lifecycle",
+            )
+        )
+        return finish(
+            "[Max tool turns reached]",
+            failed=True,
+            failure_reason=(
+                "team_budget_exhausted"
+                if (tool_context.team or {}).get("lifecycle_state")
+                == "budget_exhausted"
+                else "team_lifecycle_failure"
+            ),
+        )
+    return finish(
+        "[Max tool turns reached]", failed=True, failure_reason="max_turns"
+    )

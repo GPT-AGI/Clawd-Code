@@ -103,6 +103,142 @@ def _average(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _normalize_result_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    """Read v2 metrics or derive them from a legacy result without rewriting it."""
+    hidden = result.get("hidden_tests") if isinstance(result.get("hidden_tests"), dict) else {}
+    pytest = hidden.get("pytest") if isinstance(hidden.get("pytest"), dict) else {}
+    legacy_quality = _number(result.get("quality_score"))
+
+    timeout_scope = result.get("timeout_scope")
+    if timeout_scope not in {"rollout", "reward"}:
+        if result.get("agent_timed_out"):
+            timeout_scope = "rollout"
+        elif hidden.get("timed_out") or pytest.get("returncode") == 124:
+            timeout_scope = "reward"
+        else:
+            timeout_scope = None
+
+    reward_outcome = result.get("reward_outcome")
+    if not isinstance(reward_outcome, str) or not reward_outcome:
+        if hidden.get("infrastructure_timed_out"):
+            reward_outcome = "infra_timeout"
+        elif hidden.get("error"):
+            reward_outcome = "infra_error"
+        elif timeout_scope == "reward":
+            reward_outcome = "candidate_timeout"
+        elif result.get("reward_skipped") or hidden.get("skipped"):
+            reward_outcome = (
+                "protocol_skipped_legacy"
+                if result.get("protocol_ok") is False
+                else "missing_artifact"
+            )
+        elif legacy_quality is not None:
+            reward_outcome = "scored"
+        else:
+            reward_outcome = "pending"
+
+    reward_score_valid = result.get("reward_score_valid")
+    if not isinstance(reward_score_valid, bool):
+        reward_score_valid = bool(
+            reward_outcome == "scored" and legacy_quality is not None
+        )
+    code_quality = _number(result.get("code_quality_score"))
+    if code_quality is None and reward_score_valid:
+        code_quality = legacy_quality
+
+    protocol_status = result.get("protocol_status")
+    if protocol_status not in {"passed", "failed", "not_evaluated"}:
+        # Very old results did not persist protocol_ok.  Treat an otherwise
+        # scoreable result as the historical pass-through protocol, preserving
+        # its prior aggregate meaning.
+        protocol_status = (
+            "passed"
+            if result.get("protocol_ok", True)
+            else "failed"
+        )
+    protocol_credit = _number(result.get("protocol_credit"))
+    if protocol_credit is None and protocol_status != "not_evaluated":
+        protocol_credit = 1.0 if protocol_status == "passed" else 0.0
+
+    delivery_valid = result.get("delivery_valid")
+    if not isinstance(delivery_valid, bool):
+        delivery_valid = bool(
+            result.get("agent_ok", True) and result.get("integrity_ok", True)
+        )
+
+    effective_quality = _number(result.get("effective_quality_score"))
+    has_explicit_effective = (
+        result.get("result_schema_version") == 2
+        and "effective_quality_score" in result
+    )
+    if effective_quality is None and not has_explicit_effective:
+        if not delivery_valid or protocol_credit == 0.0:
+            effective_quality = 0.0
+        elif reward_score_valid and code_quality is not None:
+            effective_quality = code_quality * protocol_credit
+
+    eligibility = result.get("metric_eligibility")
+    if not isinstance(eligibility, dict):
+        eligibility = {}
+    eligibility = {
+        "code_quality": bool(
+            eligibility.get("code_quality", reward_score_valid)
+        ),
+        "protocol_yield": bool(
+            eligibility.get(
+                "protocol_yield",
+                bool(result.get("integrity_ok", True))
+                and protocol_status in {"passed", "failed"},
+            )
+        ),
+        "effective_quality": bool(
+            eligibility.get(
+                "effective_quality",
+                effective_quality is not None
+                and reward_outcome not in {"infra_error", "infra_timeout"},
+            )
+        ),
+    }
+
+    is_infrastructure = result.get("is_infrastructure")
+    if not isinstance(is_infrastructure, bool):
+        is_infrastructure = bool(
+            hidden.get("error")
+            or reward_outcome in {"infra_error", "infra_timeout"}
+            or result.get("failure_class") == "scorer_infrastructure"
+        )
+    failure_domain = result.get("failure_domain")
+    if not isinstance(failure_domain, str) or not failure_domain:
+        if is_infrastructure:
+            failure_domain = "infrastructure"
+        elif not delivery_valid or result.get("agent_ok") is False:
+            failure_domain = "candidate"
+        elif protocol_status == "failed":
+            failure_domain = "protocol"
+        elif reward_score_valid and not bool(pytest.get("all_passed")):
+            failure_domain = "candidate"
+        else:
+            failure_domain = None
+    retryable = result.get("retryable")
+    if not isinstance(retryable, bool):
+        retryable = is_infrastructure
+
+    return {
+        "code_quality_score": code_quality,
+        "protocol_status": protocol_status,
+        "protocol_credit": protocol_credit,
+        "delivery_valid": delivery_valid,
+        "effective_quality_score": effective_quality,
+        "reward_outcome": reward_outcome,
+        "reward_score_valid": reward_score_valid,
+        "metric_eligibility": eligibility,
+        "failure_domain": failure_domain,
+        "is_infrastructure": is_infrastructure,
+        "retryable": retryable,
+        "timeout_scope": timeout_scope,
+    }
+
+
 def _team_directory(case_root: Path) -> Path | None:
     candidates: list[Path] = []
     for teams_root in (
@@ -463,64 +599,12 @@ class DashboardStore:
         rollout: int | None = None,
         reward: int | None = None,
     ) -> dict[str, Any]:
-        """Update desired worker slots for a continuous queue."""
-        if rollout is None and reward is None:
-            raise ValueError("provide rollout or reward concurrency")
-        if rollout is not None and rollout < 0:
-            raise ValueError("rollout concurrency must be non-negative")
-        if reward is not None and reward < 0:
-            raise ValueError("reward concurrency must be non-negative")
-        path = self.run_root / "queue.sqlite3"
-        if not path.is_file():
-            raise RuntimeError("selected run does not have a live queue")
-        connection = sqlite3.connect(path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("PRAGMA busy_timeout=30000")
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM worker_config WHERE id=1"
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("this worker must be restarted once to enable live scaling")
-            desired_rollout = int(row["rollout_concurrency"]) if rollout is None else rollout
-            desired_reward = int(row["reward_concurrency"]) if reward is None else reward
-            max_rollout = int(row["max_rollout_concurrency"])
-            max_reward = int(row["max_reward_concurrency"])
-            if desired_rollout > max_rollout:
-                raise ValueError(f"rollout concurrency cannot exceed {max_rollout}")
-            if desired_reward > max_reward:
-                raise ValueError(f"reward concurrency cannot exceed {max_reward}")
-            connection.execute(
-                """
-                UPDATE worker_config
-                SET rollout_concurrency=?, reward_concurrency=?, updated_at=?
-                WHERE id=1
-                """,
-                (
-                    desired_rollout,
-                    desired_reward,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-        metadata = self._metadata()
-        metadata.update(
-            {
-                "rollout_concurrency": desired_rollout,
-                "reward_concurrency": desired_reward,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
+        """Reject per-run scaling; the global supervisor owns worker allocation."""
+        del rollout, reward
+        raise RuntimeError(
+            "per-run concurrency is read-only; change global capacity through "
+            "global_pool_supervisor.py"
         )
-        _write_json_atomic(self.run_root / "run-metadata.json", metadata)
-        configured = self._queue_concurrency()
-        assert configured is not None
-        return configured
 
     def _case_specs(
         self,
@@ -593,6 +677,7 @@ class DashboardStore:
     def _comparison_case(
         result: dict[str, Any], source_run: str
     ) -> dict[str, Any]:
+        metrics = _normalize_result_metrics(result)
         calls = result.get("calls") if isinstance(result.get("calls"), dict) else {}
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         hidden = (
@@ -609,7 +694,9 @@ class DashboardStore:
             "source_run": source_run,
             "model": result.get("model"),
             "quality_score": (
-                None if hidden.get("error") else _number(result.get("quality_score"))
+                metrics["code_quality_score"]
+                if metrics["metric_eligibility"]["code_quality"]
+                else None
             ),
             "runtime_s": _number(result.get("agent_elapsed_s")),
             "model_calls": _number(calls.get("model")),
@@ -841,10 +928,21 @@ class DashboardStore:
             result = _read_json(case_root / "result.json", {})
             if not isinstance(result, dict):
                 result = {}
+            metrics = _normalize_result_metrics(result) if result else {}
             hidden = result.get("hidden_tests") if isinstance(result.get("hidden_tests"), dict) else {}
             pytest = hidden.get("pytest") if isinstance(hidden.get("pytest"), dict) else {}
             queue_error = str(queued_case.get("error") or "") if queued_case else ""
-            infrastructure_error = str(hidden.get("error") or queue_error or "")
+            infrastructure_error = ""
+            if result and metrics.get("is_infrastructure"):
+                infrastructure_error = str(
+                    hidden.get("error")
+                    or queue_error
+                    or result.get("failure_class")
+                    or metrics.get("reward_outcome")
+                    or "infrastructure failure"
+                )
+            elif not result and queue_error:
+                infrastructure_error = queue_error
 
             if queue_status == "queued":
                 status = "queued"
@@ -855,7 +953,7 @@ class DashboardStore:
             elif queue_status == "rewarding":
                 status = "rewarding"
             elif queue_status == "failed":
-                status = "infra_error"
+                status = "infra_error" if infrastructure_error or not result else "scored"
             elif queue_status == "done" and result:
                 status = "infra_error" if infrastructure_error else (
                     "success" if result.get("success") else "scored"
@@ -951,6 +1049,18 @@ class DashboardStore:
                     "activity_age_s": progress["activity_age_s"],
                     "avg_model_s": progress["avg_model_s"],
                     "quality_score": quality,
+                    "code_quality_score": metrics.get("code_quality_score"),
+                    "protocol_status": metrics.get("protocol_status"),
+                    "protocol_credit": metrics.get("protocol_credit"),
+                    "delivery_valid": metrics.get("delivery_valid"),
+                    "effective_quality_score": metrics.get("effective_quality_score"),
+                    "reward_outcome": metrics.get("reward_outcome"),
+                    "reward_score_valid": metrics.get("reward_score_valid"),
+                    "metric_eligibility": metrics.get("metric_eligibility") or {},
+                    "failure_domain": metrics.get("failure_domain"),
+                    "is_infrastructure": metrics.get("is_infrastructure", False),
+                    "retryable": metrics.get("retryable", False),
+                    "timeout_scope": metrics.get("timeout_scope"),
                     "success": bool(result.get("success")) if result else None,
                     "passed": pytest.get("passed"),
                     "failed": pytest.get("failed"),
@@ -974,10 +1084,24 @@ class DashboardStore:
         active_count = sum(task["status"] == "running" for task in tasks)
         reward_active = sum(task["status"] == "rewarding" for task in tasks)
         infrastructure_errors = sum(task["status"] == "infra_error" for task in tasks)
-        valid_scores = [
-            float(task["quality_score"])
+        code_quality_scores = [
+            float(task["code_quality_score"])
             for task in tasks
-            if task["quality_score"] is not None and not task["infrastructure_error"]
+            if task["code_quality_score"] is not None
+            and task["metric_eligibility"].get("code_quality")
+        ]
+        protocol_cases = [
+            task for task in tasks
+            if task["metric_eligibility"].get("protocol_yield")
+        ]
+        protocol_passes = sum(
+            task["protocol_status"] == "passed" for task in protocol_cases
+        )
+        effective_quality_scores = [
+            float(task["effective_quality_score"])
+            for task in tasks
+            if task["effective_quality_score"] is not None
+            and task["metric_eligibility"].get("effective_quality")
         ]
         strict_successes = sum(task["status"] == "success" for task in tasks)
         passed_total = sum(int(task["passed"] or 0) for task in tasks if not task["infrastructure_error"])
@@ -1066,8 +1190,22 @@ class DashboardStore:
                 "rewards_completed": rewards_done,
                 "strict_successes": strict_successes,
                 "infrastructure_errors": infrastructure_errors,
-                "average_quality": sum(valid_scores) / len(valid_scores) if valid_scores else None,
-                "valid_rewards": len(valid_scores),
+                # average_quality/valid_rewards remain aliases for old clients.
+                "average_quality": _average(code_quality_scores),
+                "valid_rewards": len(code_quality_scores),
+                "code_quality": _average(code_quality_scores),
+                "coverage": (
+                    len(code_quality_scores) / rewards_done if rewards_done else 0.0
+                ),
+                "coverage_count": len(code_quality_scores),
+                "coverage_total": rewards_done,
+                "protocol_yield": (
+                    protocol_passes / len(protocol_cases) if protocol_cases else None
+                ),
+                "protocol_passed": protocol_passes,
+                "protocol_eligible": len(protocol_cases),
+                "effective_quality": _average(effective_quality_scores),
+                "effective_eligible": len(effective_quality_scores),
                 "passed_total": passed_total,
                 "expected_total": expected_total,
                 "model_calls": sum(int(task["model_calls"]) for task in tasks),
@@ -1413,44 +1551,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path != "/api/concurrency":
             self._send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return
-        if self.headers.get_content_type() != "application/json":
-            self._send_json(
-                {"error": "Content-Type must be application/json"},
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-            )
-            return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 16_384:
-                raise ValueError("invalid request size")
-            payload = json.loads(self.rfile.read(length))
-            if not isinstance(payload, dict):
-                raise ValueError("JSON body must be an object")
-            run_id = str(payload.get("run") or "") or None
-            rollout = payload.get("rollout_concurrency")
-            reward = payload.get("reward_concurrency")
-            if rollout is not None and (
-                isinstance(rollout, bool) or not isinstance(rollout, int)
-            ):
-                raise ValueError("rollout_concurrency must be an integer")
-            if reward is not None and (
-                isinstance(reward, bool) or not isinstance(reward, int)
-            ):
-                raise ValueError("reward_concurrency must be an integer")
-            configured = self.registry.get(run_id).set_concurrency(
-                rollout=rollout,
-                reward=reward,
-            )
-        except KeyError:
-            self._send_json({"error": "unknown run"}, HTTPStatus.NOT_FOUND)
-            return
-        except (json.JSONDecodeError, ValueError) as exc:
-            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            return
-        except (RuntimeError, sqlite3.Error, OSError) as exc:
-            self._send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
-            return
-        self._send_json({"ok": True, "concurrency": configured})
+        self._send_json(
+            {
+                "error": (
+                    "per-run concurrency is read-only; change global capacity "
+                    "through global_pool_supervisor.py"
+                ),
+                "code": "global_pool_managed",
+                "global_state_endpoint": "/api/global",
+            },
+            HTTPStatus.CONFLICT,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

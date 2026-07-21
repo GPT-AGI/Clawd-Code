@@ -17,11 +17,12 @@ from typing import Any
 from ..agent.conversation import Conversation
 from ..tool_system.agent_loop import ToolEvent, run_agent_loop
 from ..tool_system.context import ToolContext
+from ..tool_system.ownership import task_test_scratch_prefix_for_id
 from ..tool_system.permissions import ToolPermissionContext
 from ..tool_system.registry import ToolRegistry
 from .control import mark_teammate_stopped
 from .models import AgentRecord, Message, Team, TeamTask, utc_now
-from .store import TeamStore
+from .store import TeamStore, execution_budget_manifest_errors
 from .worktree import TeammateWorktreeManager
 
 
@@ -37,17 +38,28 @@ _FORBIDDEN_TEAMMATE_TOOLS = {
     "Agent",
     "TeamCreate",
     "TeamConfigure",
+    "TeamPlan",
     "TeammateCreate",
     "TeamRun",
     "TeamVerify",
     "TeamResume",
     "TeamCancel",
+    "TeamAbort",
+    "TeamReplan",
     "TeamIntegrate",
     "TeamDelete",
     "TeammateStop",
     "TeammateResume",
     "TaskRetry",
 }
+_FROZEN_RUN_OPTION_KEYS = (
+    "max_workers",
+    "timeout_s",
+    "token_budget",
+    "turn_budget",
+    "max_retries",
+    "lease_timeout_s",
+)
 
 
 @dataclass(frozen=True)
@@ -62,12 +74,16 @@ class TeamRunOptions:
 
     @classmethod
     def build(cls, persisted: dict[str, Any], overrides: dict[str, Any]) -> "TeamRunOptions":
+        source = persisted
+        manifest = persisted.get("execution_manifest")
+        if isinstance(manifest, dict) and isinstance(manifest.get("execution"), dict):
+            source = manifest["execution"]
         values: dict[str, Any] = {}
         for name in cls.__dataclass_fields__:
             if overrides.get(name) is not None:
                 values[name] = overrides[name]
-            elif name != "max_batches" and persisted.get(name) is not None:
-                values[name] = persisted[name]
+            elif name != "max_batches" and source.get(name) is not None:
+                values[name] = source[name]
         return cls(**values)
 
     def to_dict(self) -> dict[str, Any]:
@@ -90,6 +106,8 @@ class TaskOutcome:
     output_tokens: int = 0
     turns: int = 0
     error: str | None = None
+    repair_required: bool = False
+    infrastructure: bool = False
 
 
 class TeammateRuntime:
@@ -161,18 +179,92 @@ class TeammateRuntime:
         team = lead_context.team_store.load_active_team()
         if team is None:
             return {"status": "failed", "error": "no active team"}
+        if self._is_v2(team) and team.lifecycle_state == "aborted":
+            return {
+                "status": "aborted",
+                "team_id": team.team_id,
+                "lifecycle_state": "aborted",
+                "error": (
+                    "protocol v2 abort is terminal; create a new top-level rollout "
+                    "instead of resuming or replacing this team"
+                ),
+                "executed_task_ids": [],
+                "usage": team.usage,
+            }
+        if self._is_v2(team) and team.lifecycle_state == "budget_exhausted":
+            return self._budget_exhausted_result(
+                lead_context,
+                team,
+                "the frozen rollout execution budget was already exhausted",
+                [],
+            )
+        if self._is_v2(team):
+            plan = team.settings.get("team_plan")
+            plan = plan if isinstance(plan, dict) else {}
+            manifest = team.settings.get("execution_manifest")
+            manifest = manifest if isinstance(manifest, dict) else {}
+            if int(plan.get("revision") or 0) > 0:
+                budget_manifest_errors = execution_budget_manifest_errors(
+                    plan, manifest, usage=team.usage
+                )
+                if budget_manifest_errors:
+                    lead_context.team_store.append_event(
+                        team.team_id,
+                        "team.execution_budget_manifest_invalid",
+                        {
+                            "plan_hash": self._active_plan_hash(team),
+                            "errors": budget_manifest_errors,
+                        },
+                    )
+                    blocked = self._blocked_result(
+                        lead_context,
+                        team,
+                        "execution budget manifest failed runtime integrity checks: "
+                        + "; ".join(budget_manifest_errors),
+                        [],
+                    )
+                    blocked.update(
+                        {
+                            "failure_domain": "harness",
+                            "budget_manifest_errors": budget_manifest_errors,
+                            "workspace_preserved": True,
+                            "next_required_action": (
+                                "Do not execute this plan or edit the manifest in place; "
+                                "report the corrupted harness state and preserve the workspace."
+                            ),
+                        }
+                    )
+                    return blocked
         if team.status == "completed":
             lead_context.reload_team_state()
             all_tasks_completed = all(
                 task.get("status") == "completed"
                 for task in lead_context.tasks.values()
             )
+            all_v2_tasks_accepted = bool(lead_context.tasks) and all(
+                task.get("status") == "completed"
+                and task.get("lifecycle_state") == "accepted"
+                for task in lead_context.tasks.values()
+            )
             validation_passed = (
                 (self._quality_policy(team).get("validation") or {}).get("status")
                 == "passed"
             )
-            if all_tasks_completed and (not self._is_strict(team) or validation_passed):
+            if (
+                all_tasks_completed
+                and (not self._is_strict(team) or validation_passed)
+                and (not self._is_v2(team) or all_v2_tasks_accepted)
+            ):
                 return self._result(lead_context, team, [])
+            if self._is_v2(team):
+                return self._blocked_result(
+                    lead_context,
+                    team,
+                    "protocol v2 completed teams cannot be reopened implicitly; "
+                    "preserve this terminal team for scoring and start a new top-level "
+                    "rollout instead of submitting another TeamPlan",
+                    [],
+                )
             team.transition_to("running")
             team.completed_at = None
             lead_context.team_store.save_team(team)
@@ -197,12 +289,55 @@ class TeammateRuntime:
             return {"status": "cancelled", "error": "team is cancelled", "team_id": team.team_id}
 
         lead_context.reload_team_state()
+        requested_execution = {
+            "max_workers": max_workers,
+            "timeout_s": timeout_s,
+            "token_budget": token_budget,
+            "turn_budget": turn_budget,
+            "max_retries": max_retries,
+            "lease_timeout_s": lease_timeout_s,
+        }
+        manifest_mismatches = self._execution_override_mismatches(
+            team, requested_execution
+        )
+        if manifest_mismatches:
+            lead_context.team_store.append_event(
+                team.team_id,
+                "team.execution_manifest_mismatch",
+                {
+                    "plan_hash": self._active_plan_hash(team),
+                    "source": "TeamResume" if resume else "TeamRun",
+                    "mismatches": manifest_mismatches,
+                },
+            )
+            rendered = "; ".join(
+                f"{item['field']}: planned {item['planned']!r}, "
+                f"requested {item['requested']!r}"
+                for item in manifest_mismatches
+            )
+            blocked = self._blocked_result(
+                lead_context,
+                team,
+                "frozen TeamPlan execution manifest mismatch: " + rendered,
+                [],
+            )
+            blocked["execution_manifest_mismatches"] = manifest_mismatches
+            blocked["next_required_action"] = (
+                "Call TeamReplan first to checkpoint the workspace, then submit one "
+                "complete replacement TeamPlan with the new execution settings. Do not "
+                "override the frozen manifest in TeamRun or TeamResume."
+            )
+            return blocked
         strict_errors = self._strict_plan_errors(
             lead_context,
             team,
             require_parallel_start=not self._quality_policy(team).get("plan_accepted", False),
         )
         if strict_errors:
+            if self._is_v2(team) and team.lifecycle_state != "repair_required":
+                team = self._set_lifecycle(
+                    lead_context, team, "draft", event=False
+                )
             lead_context.team_store.append_event(
                 team.team_id,
                 "team.plan_rejected",
@@ -221,12 +356,20 @@ class TeammateRuntime:
                 quality["plan_accepted"] = True
                 quality["plan_accepted_at"] = utc_now()
                 team.settings["quality_gates"] = quality
+                manifest = team.settings.get("execution_manifest")
+                if self._is_v2(team) and isinstance(manifest, dict):
+                    manifest = dict(manifest)
+                    manifest["status"] = "accepted"
+                    manifest["accepted_at"] = utc_now()
+                    team.settings["execution_manifest"] = manifest
                 lead_context.team_store.save_team(team)
                 lead_context.team_store.append_event(
                     team.team_id,
                     "team.plan_accepted",
                     {"task_count": len(lead_context.tasks)},
                 )
+                if self._is_v2(team):
+                    team = self._set_lifecycle(lead_context, team, "ready")
             if any(
                 task.get("status") != "completed"
                 for task in lead_context.tasks.values()
@@ -240,8 +383,11 @@ class TeammateRuntime:
                     team.settings["quality_gates"] = quality
                     lead_context.team_store.save_team(team)
 
+        option_source = (
+            self._frozen_execution(team) if self._is_v2(team) else team.settings
+        )
         options = TeamRunOptions.build(
-            team.settings,
+            option_source,
             {
                 "max_workers": max_workers,
                 "max_batches": max_batches,
@@ -270,15 +416,54 @@ class TeammateRuntime:
             )
         persisted_options = options.to_dict()
         persisted_options.pop("max_batches", None)
-        team.settings.update(persisted_options)
+        reconciliation_reasons = self._execution_setting_mismatches(
+            team, persisted_options
+        )
+        if self._is_v2(team):
+            for key in (
+                *_FROZEN_RUN_OPTION_KEYS,
+                "max_batches",
+                "verify_timeout_s",
+                "auto_verify",
+            ):
+                team.settings.pop(key, None)
+            manifest = team.settings.get("execution_manifest")
+            if isinstance(manifest, dict):
+                manifest = dict(manifest)
+                effective_execution = self._frozen_execution(team)
+                effective_execution.update(persisted_options)
+                manifest["effective_execution"] = effective_execution
+                if requested_timeout_s != options.timeout_s:
+                    adjustments = dict(manifest.get("runtime_adjustments") or {})
+                    adjustments["timeout_s"] = {
+                        "requested": requested_timeout_s,
+                        "effective": options.timeout_s,
+                        "reason": "runtime minimum",
+                    }
+                    manifest["runtime_adjustments"] = adjustments
+                team.settings["execution_manifest"] = manifest
+        else:
+            team.settings.update(persisted_options)
         team.usage = self._normalized_usage(team.usage)
         team.started_at = team.started_at or utc_now()
         if resume:
             team.cancel_requested_at = None
+        if reconciliation_reasons:
+            lead_context.team_store.append_event(
+                team.team_id,
+                "team.execution_manifest_reconciled",
+                {
+                    "plan_hash": self._active_plan_hash(team),
+                    "mismatches": reconciliation_reasons,
+                    "effective_execution": persisted_options,
+                },
+            )
 
         try:
             if team.status in {"created", "failed", "cancelled"}:
                 team.transition_to("running")
+                if self._is_v2(team):
+                    team.set_lifecycle_state("running")
                 lead_context.team_store.save_team(team)
                 lead_context.team_store.append_event(
                     team.team_id,
@@ -286,6 +471,8 @@ class TeammateRuntime:
                     {"settings": options.to_dict()},
                 )
             else:
+                if self._is_v2(team) and team.lifecycle_state != "running":
+                    team.set_lifecycle_state("running")
                 lead_context.team_store.save_team(team)
 
             self._recover_tasks(
@@ -310,7 +497,28 @@ class TeammateRuntime:
                 if not tasks:
                     return self._fail_team(lead_context, current, "team has no tasks", executed)
                 if all(task.get("status") == "completed" for task in tasks.values()):
+                    budget_error = self._budget_error(current, options, run_started)
+                    if (
+                        self._is_v2(current)
+                        and budget_error
+                        and "budget exhausted" in budget_error
+                    ):
+                        return self._budget_exhausted_result(
+                            lead_context, current, budget_error, executed
+                        )
                     if self._is_strict(current):
+                        if self._is_v2(current):
+                            acceptance_failure = self._accept_produced_tasks(
+                                lead_context,
+                                current,
+                                timeout_s=self._validation_timeout(current),
+                                executed=executed,
+                            )
+                            if acceptance_failure is not None:
+                                return acceptance_failure
+                            current = self._set_lifecycle(
+                                lead_context, current, "awaiting_verification"
+                            )
                         coordination_errors = self._coordination_errors(
                             lead_context, current
                         )
@@ -329,24 +537,41 @@ class TeammateRuntime:
                             )
                         quality = self._quality_policy(current)
                         if (quality.get("validation") or {}).get("status") != "passed":
+                            if self._is_v2(current):
+                                verified = self.verify_team(
+                                    lead_context,
+                                    timeout_s=self._validation_timeout(current),
+                                )
+                                verified["executed_task_ids"] = executed
+                                return verified
                             return self._verification_required(
                                 lead_context, current, executed
                             )
-                    budget_warning = self._budget_error(current, options, run_started)
                     completed = self._complete_team(lead_context, current)
                     result = self._result(lead_context, completed, executed)
-                    if budget_warning:
+                    if budget_error:
                         lead_context.team_store.append_event(
                             current.team_id,
                             "team.budget_exceeded_after_completion",
-                            {"warning": budget_warning, "usage": completed.usage},
+                            {"warning": budget_error, "usage": completed.usage},
                         )
-                        result["budget_warning"] = budget_warning
+                        result["budget_warning"] = budget_error
                     return result
 
                 budget_error = self._budget_error(current, options, run_started)
                 if budget_error:
-                    return self._fail_team(lead_context, current, budget_error, executed)
+                    if self._is_v2(current) and "budget exhausted" in budget_error:
+                        return self._budget_exhausted_result(
+                            lead_context, current, budget_error, executed
+                        )
+                    return self._fail_team(
+                        lead_context,
+                        current,
+                        budget_error,
+                        executed,
+                        status="paused" if self._is_v2(current) else "failed",
+                        lifecycle_state="paused" if self._is_v2(current) else None,
+                    )
 
                 failed = [task for task in tasks.values() if task.get("status") == "failed"]
                 if failed:
@@ -390,6 +615,13 @@ class TeammateRuntime:
                 )
                 batch, turn_limits = self._build_batch(ready, current, options)
                 if not batch:
+                    if self._is_v2(current):
+                        return self._budget_exhausted_result(
+                            lead_context,
+                            current,
+                            "team plan-revision turn budget exhausted",
+                            executed,
+                        )
                     return self._fail_team(
                         lead_context, current, "turn budget exhausted", executed
                     )
@@ -399,13 +631,16 @@ class TeammateRuntime:
                 self._record_usage(lead_context.team_store, current.team_id, outcomes)
 
                 terminal_failures: list[TaskOutcome] = []
+                infrastructure_failures: list[TaskOutcome] = []
                 for outcome in outcomes:
                     executed.append(outcome.task_id)
-                    if outcome.status == "failed":
+                    if outcome.infrastructure or outcome.status == "infrastructure":
+                        infrastructure_failures.append(outcome)
+                    elif outcome.status == "failed":
                         task_data = lead_context.team_store.load_tasks(current.team_id).get(
                             outcome.task_id
                         )
-                        if task_data and self._schedule_retry(
+                        if task_data and not outcome.repair_required and self._schedule_retry(
                             lead_context.team_store,
                             current,
                             TeamTask.from_dict(task_data),
@@ -419,13 +654,37 @@ class TeammateRuntime:
                     elif outcome.status == "stopped":
                         continue
 
+                if infrastructure_failures:
+                    first = infrastructure_failures[0]
+                    paused = self._fail_team(
+                        lead_context,
+                        current,
+                        first.error or "teammate infrastructure failure",
+                        executed,
+                        status="paused",
+                        lifecycle_state="paused",
+                    )
+                    paused.update(
+                        {
+                            "failure_domain": "infrastructure",
+                            "retryable": True,
+                            "infrastructure_task_ids": [
+                                outcome.task_id for outcome in infrastructure_failures
+                            ],
+                        }
+                    )
+                    return paused
+
                 if terminal_failures:
                     first = terminal_failures[0]
+                    needs_repair = self._is_v2(current) and first.repair_required
                     return self._fail_team(
                         lead_context,
                         current,
                         first.error or f"task failed: {first.task_id}",
                         executed,
+                        status="repair_required" if needs_repair else "failed",
+                        lifecycle_state="repair_required" if needs_repair else None,
                     )
 
                 completed_batches += 1
@@ -443,10 +702,24 @@ class TeammateRuntime:
                             "executed_task_ids": executed,
                         },
                     )
+                    if self._is_v2(latest):
+                        latest = self._set_lifecycle(
+                            lead_context, latest, "paused"
+                        )
                     return self._result(lead_context, latest, executed)
         except Exception as exc:
+            current = lead_context.team_store.load_team(team.team_id) or team
+            if self._is_v2(current) and self._is_infrastructure_exception(exc):
+                return self._fail_team(
+                    lead_context,
+                    current,
+                    str(exc),
+                    locals().get("executed", []),
+                    status="paused",
+                    lifecycle_state="paused",
+                )
             return self._fail_team(
-                lead_context, team, str(exc), locals().get("executed", [])
+                lead_context, current, str(exc), locals().get("executed", [])
             )
 
     @staticmethod
@@ -457,6 +730,158 @@ class TeammateRuntime:
     @classmethod
     def _is_strict(cls, team: Team) -> bool:
         return bool(cls._quality_policy(team).get("strict"))
+
+    @classmethod
+    def _protocol_version(cls, team: Team) -> int:
+        quality = cls._quality_policy(team)
+        versions = [1]
+        for raw in (
+            getattr(team, "protocol_version", None),
+            team.settings.get("protocol_version"),
+            quality.get("protocol_version"),
+        ):
+            try:
+                versions.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return max(versions)
+
+    @classmethod
+    def _is_v2(cls, team: Team) -> bool:
+        return cls._protocol_version(team) >= 2
+
+    @staticmethod
+    def _active_plan_hash(team: Team) -> str:
+        plan = team.settings.get("team_plan")
+        return str(plan.get("hash") or "") if isinstance(plan, dict) else ""
+
+    @staticmethod
+    def _execution_values_equal(left: Any, right: Any) -> bool:
+        if isinstance(left, bool) or isinstance(right, bool):
+            return type(left) is type(right) and left == right
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return float(left) == float(right)
+        return left == right
+
+    @classmethod
+    def _frozen_execution(cls, team: Team) -> dict[str, Any]:
+        """Return normalized immutable execution values for the active v2 plan."""
+
+        defaults = TeamRunOptions().to_dict()
+        defaults.pop("max_batches", None)
+        defaults.update({"verify_timeout_s": 900, "auto_verify": True})
+        plan = team.settings.get("team_plan")
+        plan = plan if isinstance(plan, dict) else {}
+        manifest = team.settings.get("execution_manifest")
+        manifest = manifest if isinstance(manifest, dict) else {}
+        source: Any = None
+        if (
+            manifest.get("plan_hash") == plan.get("hash")
+            and isinstance(manifest.get("execution"), dict)
+        ):
+            source = manifest["execution"]
+        elif isinstance(plan.get("execution"), dict):
+            source = plan["execution"]
+        if isinstance(source, dict):
+            for key in (*_FROZEN_RUN_OPTION_KEYS, "verify_timeout_s", "auto_verify"):
+                if key in source:
+                    defaults[key] = source[key]
+        return defaults
+
+    @classmethod
+    def _execution_override_mismatches(
+        cls, team: Team, requested: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        if not cls._is_v2(team) or not cls._active_plan_hash(team):
+            return []
+        frozen = cls._frozen_execution(team)
+        mismatches: list[dict[str, Any]] = []
+        for field in _FROZEN_RUN_OPTION_KEYS:
+            value = requested.get(field)
+            if value is None:
+                continue
+            planned = frozen.get(field)
+            if cls._execution_values_equal(value, planned):
+                continue
+            mismatches.append(
+                {
+                    "field": field,
+                    "planned": planned,
+                    "requested": value,
+                    "reason": (
+                        "runtime override differs from the frozen TeamPlan execution "
+                        "manifest"
+                    ),
+                }
+            )
+        return mismatches
+
+    @classmethod
+    def _execution_setting_mismatches(
+        cls, team: Team, effective: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Describe stale top-level settings that the frozen plan will reconcile."""
+
+        if not cls._is_v2(team) or not cls._active_plan_hash(team):
+            return []
+        reasons: list[dict[str, Any]] = []
+        for field in (
+            *_FROZEN_RUN_OPTION_KEYS,
+            "max_batches",
+            "verify_timeout_s",
+            "auto_verify",
+        ):
+            if field not in team.settings:
+                continue
+            reasons.append(
+                {
+                    "field": field,
+                    "planned_effective": effective.get(field),
+                    "persisted": team.settings.get(field),
+                    "reason": (
+                        "legacy top-level execution setting is not authoritative in "
+                        "protocol v2 and was removed"
+                    ),
+                }
+            )
+        return reasons
+
+    @staticmethod
+    def _is_infrastructure_exception(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+            return True
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "ags backend is not started",
+                "sandbox unavailable",
+                "deployment unavailable",
+                "connection reset",
+                "connection refused",
+                "service unavailable",
+                "pending request was cancelled",
+            )
+        )
+
+    @staticmethod
+    def _set_lifecycle(
+        context: ToolContext, team: Team, state: str, *, event: bool = True
+    ) -> Team:
+        current = context.team_store.load_team(team.team_id) or team
+        if current.lifecycle_state == state:
+            return current
+        previous = current.lifecycle_state
+        current.set_lifecycle_state(state)
+        context.team_store.save_team(current)
+        if event:
+            context.team_store.append_event(
+                current.team_id,
+                "team.lifecycle_changed",
+                {"from": previous, "to": state},
+            )
+        context.reload_team_state()
+        return current
 
     @staticmethod
     def _normalize_owned_path(value: str) -> str:
@@ -506,6 +931,81 @@ class TeammateRuntime:
         }
         tasks = list(lead_context.tasks.values())
         teammate_tasks = [task for task in tasks if task.get("owner") in agents]
+        if self._is_v2(team):
+            plan = team.settings.get("team_plan")
+            plan = plan if isinstance(plan, dict) else {}
+            plan_hash = str(plan.get("hash") or "")
+            try:
+                revision = int(plan.get("revision") or 0)
+            except (TypeError, ValueError):
+                revision = 0
+            if not plan_hash or revision < 1:
+                errors.append(
+                    "protocol v2 requires one committed atomic TeamPlan revision"
+                )
+            manifest = team.settings.get("execution_manifest")
+            manifest = manifest if isinstance(manifest, dict) else {}
+            if not manifest:
+                errors.append(
+                    "protocol v2 active plan is missing its frozen execution manifest"
+                )
+            else:
+                if str(manifest.get("plan_hash") or "") != plan_hash:
+                    errors.append(
+                        "frozen execution manifest plan_hash does not match the active TeamPlan"
+                    )
+                try:
+                    manifest_revision = int(manifest.get("plan_revision") or 0)
+                except (TypeError, ValueError):
+                    manifest_revision = 0
+                if manifest_revision != revision:
+                    errors.append(
+                        "frozen execution manifest revision does not match the active TeamPlan"
+                    )
+                manifest_execution = manifest.get("execution")
+                plan_execution = plan.get("execution")
+                if not isinstance(manifest_execution, dict) or (
+                    isinstance(plan_execution, dict)
+                    and manifest_execution != plan_execution
+                ):
+                    errors.append(
+                        "frozen execution manifest values do not match the active TeamPlan"
+                    )
+            validation = quality.get("validation")
+            validation = validation if isinstance(validation, dict) else {}
+            if (
+                validation.get("requires_plan_revision")
+                and validation.get("failed_plan_hash") == plan_hash
+            ):
+                errors.append(
+                    "repair_required state requires a new TeamPlan revision"
+                )
+            for task in teammate_tasks:
+                metadata = (
+                    task.get("metadata")
+                    if isinstance(task.get("metadata"), dict)
+                    else {}
+                )
+                if not plan_hash or metadata.get("plan_hash") != plan_hash:
+                    key = str(task.get("key") or task.get("id"))
+                    errors.append(
+                        f"task {key} is not bound to the active atomic TeamPlan hash"
+                    )
+            implementation_tasks = [
+                task
+                for task in teammate_tasks
+                if (task.get("metadata") or {}).get("task_type")
+                != "validation"
+            ]
+            implementation_owners = {
+                str(task.get("owner"))
+                for task in implementation_tasks
+                if task.get("owned_files") and task.get("acceptance_checks")
+            }
+            if len(implementation_owners) < 2:
+                errors.append(
+                    "protocol v2 requires two distinct owners of real implementation tasks"
+                )
         assigned_owners = {str(task.get("owner")) for task in teammate_tasks}
         if len(assigned_owners) < 2:
             errors.append("strict teams require at least two assigned teammates")
@@ -514,11 +1014,19 @@ class TeammateRuntime:
 
         paths: list[tuple[str, str, str]] = []
         providers: dict[str, list[dict[str, Any]]] = {}
+        contract = quality.get("contract") if isinstance(quality.get("contract"), dict) else {}
+        interface_modes = {
+            str(item.get("name")): str(item.get("mode") or "handoff")
+            for item in (contract.get("interfaces") or [])
+            if isinstance(item, dict) and item.get("name")
+        }
         for task in teammate_tasks:
             key = str(task.get("key") or task.get("id"))
             owned_files = list(task.get("owned_files") or [])
             acceptance_checks = list(task.get("acceptance_checks") or [])
-            if not owned_files:
+            metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+            is_validation_task = metadata.get("task_type") == "validation"
+            if not owned_files and not is_validation_task:
                 errors.append(f"task {key} must declare ownedFiles")
             if not acceptance_checks:
                 errors.append(f"task {key} must declare acceptanceChecks")
@@ -540,7 +1048,9 @@ class TeammateRuntime:
 
         for index, (left_key, left_owner, left_path) in enumerate(paths):
             for right_key, right_owner, right_path in paths[index + 1 :]:
-                if left_key == right_key:
+                # A single worker may intentionally own a directory plus one of its
+                # children.  The write-conflict gate is only meaningful across owners.
+                if left_key == right_key or left_owner == right_owner:
                     continue
                 if self._owned_paths_overlap(left_path, right_path):
                     errors.append(
@@ -563,7 +1073,10 @@ class TeammateRuntime:
                 provider_id = str(provider_task.get("id"))
                 if provider_id == str(task.get("id")):
                     errors.append(f"task {key} cannot depend on its own interface {interface!r}")
-                elif provider_id not in dependencies:
+                elif (
+                    interface_modes.get(str(interface), "handoff") != "frozen"
+                    and provider_id not in dependencies
+                ):
                     provider_key = str(provider_task.get("key") or provider_id)
                     errors.append(
                         f"task {key} must include provider task {provider_key} in blockedBy "
@@ -574,7 +1087,20 @@ class TeammateRuntime:
             ready_owners = {
                 str(task.get("owner"))
                 for task in teammate_tasks
-                if not task.get("blockedBy") and task.get("status") == "pending"
+                if not task.get("blockedBy")
+                and (
+                    task.get("status") == "pending"
+                    or (
+                        task.get("status") == "completed"
+                        and task.get("lifecycle_state") == "produced"
+                        and isinstance(task.get("metadata"), dict)
+                        and isinstance(task["metadata"].get("carry_forward"), dict)
+                        and task["metadata"]["carry_forward"].get(
+                            "requires_acceptance"
+                        )
+                        is True
+                    )
+                )
             }
             if len(ready_owners) < 2:
                 errors.append(
@@ -586,6 +1112,11 @@ class TeammateRuntime:
         self, lead_context: ToolContext, team: Team
     ) -> list[str]:
         if not self._is_strict(team):
+            return []
+        # Protocol v2 freezes shared contracts in TeamPlan and encodes real handoff
+        # dependencies in the DAG.  A ceremonial peer message is not evidence that
+        # the contract is correct, so it is retained only for v1 compatibility.
+        if self._is_v2(team):
             return []
         tasks = list(lead_context.team_store.load_tasks(team.team_id).values())
         providers: dict[str, dict[str, Any]] = {}
@@ -612,6 +1143,124 @@ class TeammateRuntime:
                         )
         return list(dict.fromkeys(errors))
 
+    @classmethod
+    def _validation_timeout(cls, team: Team) -> int:
+        quality = cls._quality_policy(team)
+        frozen = cls._frozen_execution(team) if cls._is_v2(team) else {}
+        raw = (
+            quality.get("verify_timeout_s")
+            or frozen.get("verify_timeout_s")
+            or team.settings.get("verify_timeout_s")
+        )
+        try:
+            return max(1, int(raw or 900))
+        except (TypeError, ValueError):
+            return 900
+
+    def _accept_produced_tasks(
+        self,
+        lead_context: ToolContext,
+        team: Team,
+        *,
+        timeout_s: int,
+        executed: list[str],
+    ) -> dict[str, Any] | None:
+        """Run harness-owned task acceptance between production and integration.
+
+        v1 exposes only the coarse ``completed`` status.  In v2 a worker reaching
+        that status means it produced a candidate; the harness must execute every
+        declared check before the task is accepted.  Results are persisted on the
+        task, making recovery and dashboard inspection deterministic.
+        """
+        if not self._is_v2(team):
+            return None
+        failures: list[dict[str, Any]] = []
+        task_data = lead_context.team_store.load_tasks(team.team_id)
+        for raw in task_data.values():
+            task = TeamTask.from_dict(raw)
+            if task.status != "completed" or task.lifecycle_state == "accepted":
+                continue
+            task.set_lifecycle_state("produced")
+            stages: list[dict[str, Any]] = []
+            for command in task.acceptance_checks:
+                result = self._run_validation_command(
+                    lead_context, str(command), timeout_s=timeout_s
+                )
+                stages.append({"command": str(command), **result})
+                if result["exit_code"] != 0:
+                    break
+            passed = bool(task.acceptance_checks) and all(
+                stage["exit_code"] == 0 for stage in stages
+            )
+            acceptance = {
+                "status": "passed" if passed else "failed",
+                "checked_at": utc_now(),
+                "stages": stages,
+            }
+            task.metadata = dict(task.metadata)
+            task.metadata["acceptance"] = acceptance
+            if passed:
+                task.set_lifecycle_state("accepted")
+                lead_context.team_store.append_event(
+                    team.team_id,
+                    "task.accepted",
+                    {"task_id": task.id, "task_key": task.key, "stages": stages},
+                )
+            else:
+                failure = {
+                    "task_id": task.id,
+                    "task_key": task.key,
+                    "error": (
+                        "task has no acceptance checks"
+                        if not task.acceptance_checks
+                        else "acceptance check failed"
+                    ),
+                    "acceptance": acceptance,
+                }
+                failures.append(failure)
+                task.last_error = failure["error"]
+                lead_context.team_store.append_event(
+                    team.team_id, "task.acceptance_failed", failure
+                )
+            self._save_task(lead_context.team_store, team.team_id, task)
+
+        lead_context.reload_team_state()
+        if not failures:
+            return None
+
+        current = lead_context.team_store.load_team(team.team_id) or team
+        quality = self._quality_policy(current)
+        quality["validation"] = {
+            "status": "pending",
+            "reason": "task acceptance failed",
+            "requires_plan_revision": True,
+            "failed_plan_hash": str(
+                ((current.settings.get("team_plan") or {}).get("hash") or "")
+            ),
+        }
+        current.settings["quality_gates"] = quality
+        current.set_lifecycle_state("repair_required")
+        lead_context.team_store.save_team(current)
+        lead_context.team_store.append_event(
+            current.team_id, "team.repair_required", {"task_failures": failures}
+        )
+        lead_context.reload_team_state()
+        return {
+            "status": "repair_required",
+            "team_id": current.team_id,
+            "lifecycle_state": current.lifecycle_state,
+            "error": "one or more task acceptance checks failed",
+            "task_failures": failures,
+            "executed_task_ids": executed,
+            "tasks": list(lead_context.tasks.values()),
+            "quality_gates": quality,
+            "usage": current.usage,
+            "next_required_action": (
+                "Call TeamReplan first to checkpoint the workspace, then submit one "
+                "complete materially changed TeamPlan revision and call TeamRun again."
+            ),
+        }
+
     def verify_team(
         self, lead_context: ToolContext, *, timeout_s: int = 300
     ) -> dict[str, Any]:
@@ -625,6 +1274,25 @@ class TeammateRuntime:
                 "error": "TeamVerify requires strict quality gates",
             }
         lead_context.reload_team_state()
+        quality = self._quality_policy(team)
+        validation = dict(quality.get("validation") or {})
+        v2_tasks_accepted = bool(lead_context.tasks) and all(
+            task.get("status") == "completed"
+            and task.get("lifecycle_state") == "accepted"
+            for task in lead_context.tasks.values()
+        )
+        if (
+            team.status == "completed"
+            and team.lifecycle_state == "completed"
+            and validation.get("status") == "passed"
+            and (not self._is_v2(team) or v2_tasks_accepted)
+        ):
+            # Verification is deliberately idempotent: repeated tool calls must not
+            # recreate environments, duplicate events, or reopen a settled team.
+            result = self._result(lead_context, team, [])
+            result["validation"] = validation
+            result["verification_reused"] = True
+            return result
         unfinished = [
             str(task.get("key") or task_id)
             for task_id, task in lead_context.tasks.items()
@@ -643,19 +1311,36 @@ class TeammateRuntime:
         errors = plan_errors + coordination_errors
         if errors:
             return {
-                "status": "failed",
+                "status": (
+                    "repair_required"
+                    if self._is_v2(team)
+                    and team.lifecycle_state == "repair_required"
+                    else "failed"
+                ),
                 "team_id": team.team_id,
+                "lifecycle_state": team.lifecycle_state,
                 "error": "; ".join(errors),
             }
+        if self._is_v2(team):
+            acceptance_failure = self._accept_produced_tasks(
+                lead_context, team, timeout_s=timeout_s, executed=[]
+            )
+            if acceptance_failure is not None:
+                return acceptance_failure
+            team = self._set_lifecycle(
+                lead_context, team, "awaiting_verification"
+            )
 
         quality = self._quality_policy(team)
+        if self._is_v2(team):
+            team = self._set_lifecycle(lead_context, team, "verifying")
         commands = [
             ("install", str(quality["install_command"])),
             ("import", str(quality["import_command"])),
             ("integration", str(quality["integration_command"])),
         ]
         validation_root = (
-            f"/tmp/clawd-team-verify-{team.team_id}"
+            f"/tmp/clawd-team-verify-{team.team_id}-{uuid.uuid4().hex[:12]}"
             if lead_context.workspace_backend is not None
             else tempfile.mkdtemp(prefix=f"clawd-team-verify-{team.team_id}-")
         )
@@ -671,24 +1356,80 @@ class TeammateRuntime:
             f"{shlex.quote(validation_root)}"
         )
         stages: list[dict[str, Any]] = []
-        bootstrap_result = self._run_validation_command(
-            lead_context, bootstrap, timeout_s=timeout_s
-        )
-        stages.append({"stage": "bootstrap", "command": bootstrap, **bootstrap_result})
-        if bootstrap_result["exit_code"] == 0:
-            prefix = (
-                f"export VIRTUAL_ENV={shlex.quote(validation_root)}; "
-                f"export PATH={shlex.quote(venv_bin)}:$PATH; "
-                f"export PYTHONPATH={shlex.quote(validation_workspace)}; "
+        verification_error: Exception | None = None
+        cleanup_error: Exception | None = None
+        try:
+            bootstrap_result = self._run_validation_command(
+                lead_context, bootstrap, timeout_s=timeout_s
             )
-            for stage, command in commands:
-                result = self._run_validation_command(
-                    lead_context, prefix + command, timeout_s=timeout_s
+            stages.append(
+                {"stage": "bootstrap", "command": bootstrap, **bootstrap_result}
+            )
+            if bootstrap_result["exit_code"] == 0:
+                prefix = (
+                    f"export VIRTUAL_ENV={shlex.quote(validation_root)}; "
+                    f"export PATH={shlex.quote(venv_bin)}:$PATH; "
+                    f"export PYTHONPATH={shlex.quote(validation_workspace)}; "
                 )
-                stages.append({"stage": stage, "command": command, **result})
-                if result["exit_code"] != 0:
-                    break
-        self._cleanup_validation_root(lead_context, validation_root)
+                for stage, command in commands:
+                    result = self._run_validation_command(
+                        lead_context, prefix + command, timeout_s=timeout_s
+                    )
+                    stages.append({"stage": stage, "command": command, **result})
+                    if result["exit_code"] != 0:
+                        break
+        except Exception as exc:
+            verification_error = exc
+        finally:
+            try:
+                self._cleanup_validation_root(lead_context, validation_root)
+            except Exception as exc:
+                cleanup_error = exc
+
+        infrastructure_error = verification_error or cleanup_error
+        if infrastructure_error is not None:
+            if not self._is_v2(team):
+                raise infrastructure_error
+            current = lead_context.team_store.load_team(team.team_id) or team
+            validation = {
+                "status": "paused",
+                "verified_at": utc_now(),
+                "fresh_virtualenv": True,
+                "stages": stages,
+                "failure_domain": "infrastructure",
+                "retryable": True,
+                "error": f"{type(infrastructure_error).__name__}: {infrastructure_error}",
+                "cleanup_error": (
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    if cleanup_error is not None
+                    else None
+                ),
+            }
+            quality = self._quality_policy(current)
+            quality["validation"] = validation
+            current.settings["quality_gates"] = quality
+            lead_context.team_store.save_team(current)
+            current = self._set_lifecycle(lead_context, current, "paused")
+            lead_context.team_store.append_event(
+                current.team_id,
+                "team.validation_paused",
+                {
+                    "error": validation["error"],
+                    "cleanup_error": validation["cleanup_error"],
+                    "retryable": True,
+                },
+            )
+            return {
+                "status": "paused",
+                "team_id": current.team_id,
+                "lifecycle_state": current.lifecycle_state,
+                "failure_domain": "infrastructure",
+                "retryable": True,
+                "error": validation["error"],
+                "validation": validation,
+                "next_required_action": "Retry TeamRun when infrastructure is healthy.",
+            }
+
         passed = len(stages) == 4 and all(stage["exit_code"] == 0 for stage in stages)
         validation = {
             "status": "passed" if passed else "failed",
@@ -697,6 +1438,15 @@ class TeammateRuntime:
             "stages": stages,
         }
         team = lead_context.team_store.load_team(team.team_id) or team
+        if not passed and self._is_v2(team):
+            plan = team.settings.get("team_plan")
+            plan = plan if isinstance(plan, dict) else {}
+            validation.update(
+                {
+                    "requires_plan_revision": True,
+                    "failed_plan_hash": str(plan.get("hash") or ""),
+                }
+            )
         quality = self._quality_policy(team)
         quality["validation"] = validation
         team.settings["quality_gates"] = quality
@@ -710,13 +1460,26 @@ class TeammateRuntime:
             failed_stage = next(
                 (stage for stage in stages if stage["exit_code"] != 0), stages[-1]
             )
+            if self._is_v2(team):
+                team = self._set_lifecycle(
+                    lead_context, team, "repair_required"
+                )
+                lead_context.team_store.append_event(
+                    team.team_id,
+                    "team.repair_required",
+                    {"failed_stage": failed_stage["stage"]},
+                )
             return {
-                "status": "failed",
+                "status": "repair_required" if self._is_v2(team) else "failed",
                 "team_id": team.team_id,
+                "lifecycle_state": team.lifecycle_state,
                 "error": f"{failed_stage['stage']} validation failed",
                 "validation": validation,
                 "next_required_action": (
-                    "Create a repair task, run TeamRun, then retry TeamVerify."
+                    "Call TeamReplan first to checkpoint the workspace, then submit one "
+                    "complete materially changed TeamPlan revision and call TeamRun again."
+                    if self._is_v2(team)
+                    else "Create a repair task, run TeamRun, then retry TeamVerify."
                 ),
             }
         completed = self._complete_team(lead_context, team)
@@ -740,13 +1503,19 @@ class TeammateRuntime:
                 "stderr": str(outcome.stderr or "")[-20_000:],
             }
         try:
+            environment = os.environ.copy()
+            environment["PATH"] = (
+                str(Path(sys.executable).parent)
+                + os.pathsep
+                + environment.get("PATH", "")
+            )
             completed = subprocess.run(
                 ["bash", "-lc", command],
                 cwd=str(context.workspace_root),
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
-                env=os.environ.copy(),
+                env=environment,
             )
             return {
                 "exit_code": completed.returncode,
@@ -763,11 +1532,16 @@ class TeammateRuntime:
     @staticmethod
     def _cleanup_validation_root(context: ToolContext, path: str) -> None:
         if context.workspace_backend is not None:
-            context.workspace_backend.exec(
+            outcome = context.workspace_backend.exec(
                 f"rm -rf {shlex.quote(path)}",
                 cwd=context.execution_workspace_root or "/workspace",
                 timeout_s=60,
             )
+            if int(outcome.exit_code) != 0:
+                raise OSError(
+                    "failed to remove validation environment "
+                    f"{path}: {str(outcome.stderr or outcome.stdout or '').strip()}"
+                )
         else:
             shutil.rmtree(path, ignore_errors=True)
 
@@ -812,7 +1586,9 @@ class TeammateRuntime:
         usage = TeammateRuntime._normalized_usage(team.usage)
         remaining_turns = None
         if options.turn_budget is not None:
-            remaining_turns = max(0, options.turn_budget - usage["turns"])
+            budget = TeammateRuntime._budget_window(team, options)
+            ceiling = budget["hard_ceiling"]["turns"]
+            remaining_turns = max(0, int(ceiling) - usage["turns"])
             workers = min(workers, remaining_turns)
         if workers <= 0:
             return [], []
@@ -903,6 +1679,7 @@ class TeammateRuntime:
                 lease_id=lease_id,
                 lease_expires_at=self._lease_expiry(options.lease_timeout_s),
                 max_retries=options.max_retries,
+                expected_plan_hash=self._active_plan_hash(team),
             )
             if claimed is None:
                 return TaskOutcome("leased", task.id)
@@ -1004,6 +1781,26 @@ class TeammateRuntime:
                     outcome_usage,
                 )
 
+            if child_context.ownership_violations:
+                error = self._set_ownership_failed(
+                    store,
+                    team,
+                    persisted,
+                    child_context.ownership_violations,
+                )
+                transitioned = self._transition_agent(store, agent, "failed")
+                if transitioned.status in {"stopping", "cancelled"} or transitioned.stop_requested_at:
+                    return self._finalize_worker_stop(
+                        store, transitioned, persisted, outcome_usage
+                    )
+                return TaskOutcome(
+                    "failed",
+                    task.id,
+                    error=error,
+                    repair_required=True,
+                    **outcome_usage,
+                )
+
             if result.response_text == "[Max tool turns reached]":
                 self._set_task_failed(store, team, persisted, result.response_text)
                 transitioned = self._transition_agent(store, agent, "failed")
@@ -1036,6 +1833,8 @@ class TeammateRuntime:
             elif persisted.status == "completed" and not persisted.output:
                 persisted.output = result.response_text
                 persisted.updated_at = utc_now()
+            if self._is_v2(team):
+                persisted.set_lifecycle_state("produced")
             if agent.workspace_mode == "worktree" and agent.auto_integrate:
                 integration = TeammateWorktreeManager(
                     lead_context.workspace_root
@@ -1055,18 +1854,53 @@ class TeammateRuntime:
                 )
             store.append_event(
                 team.team_id,
-                "task.completed",
+                "task.produced" if self._is_v2(team) else "task.completed",
                 {
                     "task_id": task.id,
                     "task_key": task.key,
                     "agent_id": agent.agent_id,
                     "attempt": persisted.attempt,
+                    "lifecycle_state": persisted.lifecycle_state,
                 },
             )
             return TaskOutcome("completed", task.id, **outcome_usage)
         except Exception as exc:
             current_data = store.load_tasks(team.team_id).get(task.id)
             current = TeamTask.from_dict(current_data or task.to_dict())
+            violations = list(
+                getattr(locals().get("child_context"), "ownership_violations", [])
+                or []
+            )
+            if violations:
+                error = self._set_ownership_failed(store, team, current, violations)
+                latest_agent = store.load_agent(team.team_id, agent.agent_id) or agent
+                if latest_agent.status in {"created", "running", "idle"}:
+                    self._transition_agent(store, latest_agent, "failed")
+                return TaskOutcome(
+                    "failed",
+                    task.id,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    turns=turns,
+                    error=error,
+                    repair_required=True,
+                )
+            if self._is_v2(team) and self._is_infrastructure_exception(exc):
+                error = self._set_task_infrastructure_paused(
+                    store, team, current, str(exc)
+                )
+                latest_agent = store.load_agent(team.team_id, agent.agent_id) or agent
+                if latest_agent.status == "running":
+                    self._transition_agent(store, latest_agent, "idle")
+                return TaskOutcome(
+                    "infrastructure",
+                    task.id,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    turns=turns,
+                    error=error,
+                    infrastructure=True,
+                )
             if current.status in {"pending", "in_progress"}:
                 self._set_task_failed(store, team, current, str(exc))
             latest_agent = store.load_agent(team.team_id, agent.agent_id) or agent
@@ -1265,6 +2099,7 @@ class TeammateRuntime:
             execution_cwd=lead_context.execution_workspace_root,
             actor_id=agent.agent_id,
             current_task_id=task.id,
+            mutation_lock=lead_context.mutation_lock,
             model_override=agent.model,
             system_prompt_extra=(
                 "## Teammate Identity\n"
@@ -1275,6 +2110,14 @@ class TeammateRuntime:
                 "use ReadMessages to receive peer replies during parallel work. Communicate useful "
                 "decisions, interfaces, blockers, and handoffs rather than sending ceremonial updates. "
                 "Do not claim another teammate's work. "
+                "Protocol-v2 file ownership is enforced: Write/Edit paths must be inside this "
+                "task's owned_files, and Bash workspace changes are audited after each command. "
+                "Prefer disposable self-tests under `"
+                f"{task_test_scratch_prefix_for_id(task.id)}/`. A new `tests/test_*.py` "
+                "path is also task-local only if it did not exist at plan start and no "
+                "other task declared it. Existing or reserved tests are never writable; "
+                "persistent deliverable tests must be listed in this task's owned_files. "
+                "Any out-of-scope write fails the task and requires a repair plan. "
                 "If the task cannot be completed, set your current task to failed with TaskUpdate and explain why."
             ),
         )
@@ -1310,6 +2153,12 @@ class TeammateRuntime:
                     "Acceptance checks: " + "; ".join(task.acceptance_checks),
                     (
                         "Strict ownership is active: do not modify files owned by another task. "
+                        "Prefer disposable self-tests under `"
+                        + task_test_scratch_prefix_for_id(task.id)
+                        + "/`. A new `tests/test_*.py` is task-local only when it did not "
+                        "exist at plan start and no other task declared it. Existing or "
+                        "reserved tests are forbidden; persistent deliverable tests must "
+                        "be declared in owned_files. "
                         "If you consume another task's interface, exchange a concrete interface "
                         "message with that owner before finishing."
                     ),
@@ -1361,7 +2210,12 @@ class TeammateRuntime:
 
     @staticmethod
     def _save_task(store: TeamStore, team_id: str, task: TeamTask) -> None:
-        store.update_task(team_id, task)
+        store.update_task(
+            team_id,
+            task,
+            expected_plan_hash=str((task.metadata or {}).get("plan_hash") or "")
+            or None,
+        )
 
     @staticmethod
     def _set_task_failed(
@@ -1387,6 +2241,84 @@ class TeammateRuntime:
                 "error": error,
             },
         )
+
+    @staticmethod
+    def _set_ownership_failed(
+        store: TeamStore,
+        team: Team,
+        task: TeamTask,
+        violations: list[dict[str, Any]],
+    ) -> str:
+        """Persist a sticky ownership failure at the scheduler boundary."""
+
+        paths = sorted(
+            {
+                str(path)
+                for violation in violations
+                for path in (violation.get("paths") or [])
+            }
+        )
+        rendered = ", ".join(paths[:8])
+        if len(paths) > 8:
+            rendered += f", ... (+{len(paths) - 8} more)"
+        error = f"protocol v2 task ownership violation: {rendered or 'unknown path'}"
+        # A teammate may catch a tool error and update its own task. Override that
+        # self-reported state so an ownership breach can never become completed.
+        task.status = "failed"
+        task.set_lifecycle_state("failed")
+        TeammateRuntime._clear_lease(task)
+        task.output = error
+        task.last_error = error
+        task.completed_at = utc_now()
+        task.metadata = dict(task.metadata)
+        task.metadata["ownership_audit"] = {
+            "status": "failed",
+            "violations": violations,
+        }
+        TeammateRuntime._save_task(store, team.team_id, task)
+        store.append_event(
+            team.team_id,
+            "task.ownership_failed",
+            {
+                "task_id": task.id,
+                "task_key": task.key,
+                "attempt": task.attempt,
+                "paths": paths,
+                "error": error,
+            },
+        )
+        return error
+
+    @staticmethod
+    def _set_task_infrastructure_paused(
+        store: TeamStore, team: Team, task: TeamTask, error: str
+    ) -> str:
+        """Release a v2 task lease without turning transport failure into a candidate."""
+
+        task.status = "pending"
+        task.set_lifecycle_state("pending")
+        TeammateRuntime._clear_lease(task)
+        task.completed_at = None
+        task.last_error = error
+        task.metadata = dict(task.metadata)
+        task.metadata["infrastructure_failure"] = {
+            "retryable": True,
+            "error": error,
+            "recorded_at": utc_now(),
+        }
+        TeammateRuntime._save_task(store, team.team_id, task)
+        store.append_event(
+            team.team_id,
+            "task.infrastructure_paused",
+            {
+                "task_id": task.id,
+                "task_key": task.key,
+                "attempt": task.attempt,
+                "retryable": True,
+                "error": error,
+            },
+        )
+        return error
 
     @staticmethod
     def _transition_agent(
@@ -1496,13 +2428,146 @@ class TeammateRuntime:
         team: Team, options: TeamRunOptions, run_started: float
     ) -> str | None:
         usage = TeammateRuntime._normalized_usage(team.usage)
+        budget = TeammateRuntime._budget_window(team, options)
         if options.timeout_s is not None and time.monotonic() - run_started >= options.timeout_s:
             return f"team timeout exceeded ({options.timeout_s}s)"
-        if options.token_budget is not None and usage["total_tokens"] >= options.token_budget:
-            return f"team token budget exhausted ({options.token_budget})"
-        if options.turn_budget is not None and usage["turns"] >= options.turn_budget:
-            return f"team turn budget exhausted ({options.turn_budget})"
+        token_ceiling = budget["hard_ceiling"]["total_tokens"]
+        if token_ceiling is not None and usage["total_tokens"] >= int(token_ceiling):
+            return (
+                "team plan-revision token budget exhausted "
+                f"(incremental={options.token_budget}, "
+                f"baseline={budget['baseline']['total_tokens']}, "
+                f"hard_ceiling={token_ceiling})"
+            )
+        turn_ceiling = budget["hard_ceiling"]["turns"]
+        if turn_ceiling is not None and usage["turns"] >= int(turn_ceiling):
+            return (
+                "team plan-revision turn budget exhausted "
+                f"(incremental={options.turn_budget}, "
+                f"baseline={budget['baseline']['turns']}, "
+                f"hard_ceiling={turn_ceiling})"
+            )
         return None
+
+    @staticmethod
+    def _budget_window(
+        team: Team, options: TeamRunOptions
+    ) -> dict[str, dict[str, int | None] | str]:
+        """Resolve the active plan revision's incremental budget window.
+
+        The scheduler still compares against an absolute, team-wide hard ceiling;
+        only the baseline moves when a newly authorized repair plan is committed.
+        """
+
+        baseline = {"total_tokens": 0, "turns": 0}
+        stored_ceiling: dict[str, int | None] | None = None
+        global_cap = {"total_tokens": None, "turns": None}
+        manifest = team.settings.get("execution_manifest")
+        if TeammateRuntime._is_v2(team):
+            plan = team.settings.get("team_plan")
+            plan = plan if isinstance(plan, dict) else {}
+            if not isinstance(manifest, dict):
+                raise ValueError("execution budget manifest is missing")
+            errors = execution_budget_manifest_errors(
+                plan, manifest, usage=team.usage
+            )
+            if errors:
+                raise ValueError(
+                    "invalid execution budget manifest: " + "; ".join(errors)
+                )
+        if isinstance(manifest, dict):
+            plan = team.settings.get("team_plan")
+            plan_hash = str(plan.get("hash") or "") if isinstance(plan, dict) else ""
+            window = manifest.get("budget_window")
+            if manifest.get("plan_hash") == plan_hash and isinstance(window, dict):
+                raw_baseline = window.get("baseline")
+                if isinstance(raw_baseline, dict):
+                    baseline = {
+                        "total_tokens": int(raw_baseline.get("total_tokens", 0) or 0),
+                        "turns": int(raw_baseline.get("turns", 0) or 0),
+                    }
+                raw_ceiling = window.get("hard_ceiling")
+                if isinstance(raw_ceiling, dict):
+                    stored_ceiling = {
+                        "total_tokens": (
+                            int(raw_ceiling["total_tokens"])
+                            if raw_ceiling.get("total_tokens") is not None
+                            else None
+                        ),
+                        "turns": (
+                            int(raw_ceiling["turns"])
+                            if raw_ceiling.get("turns") is not None
+                            else None
+                        ),
+                    }
+                raw_global = manifest.get("global_cap")
+                if isinstance(raw_global, dict):
+                    global_cap = {
+                        "total_tokens": (
+                            int(raw_global["total_tokens"])
+                            if raw_global.get("total_tokens") is not None
+                            else None
+                        ),
+                        "turns": (
+                            int(raw_global["turns"])
+                            if raw_global.get("turns") is not None
+                            else None
+                        ),
+                    }
+        computed_ceiling = {
+            "total_tokens": (
+                baseline["total_tokens"] + options.token_budget
+                if options.token_budget is not None
+                else None
+            ),
+            "turns": (
+                baseline["turns"] + options.turn_budget
+                if options.turn_budget is not None
+                else None
+            ),
+        }
+        return {
+            "scope": "plan_revision",
+            "baseline": baseline,
+            "global_cap": global_cap,
+            "hard_ceiling": stored_ceiling or computed_ceiling,
+        }
+
+    @staticmethod
+    def _budget_exhausted_result(
+        lead_context: ToolContext,
+        team: Team,
+        error: str,
+        executed: list[str],
+    ) -> dict[str, Any]:
+        current = lead_context.team_store.load_team(team.team_id) or team
+        already_terminal = current.lifecycle_state == "budget_exhausted"
+        if not already_terminal:
+            if current.status == "created":
+                current.transition_to("running")
+            if current.status == "running":
+                current.transition_to("failed")
+            current.set_lifecycle_state("budget_exhausted")
+            current.completed_at = utc_now()
+            lead_context.team_store.save_team(current)
+            lead_context.team_store.append_event(
+                current.team_id,
+                "team.budget_exhausted",
+                {"error": error, "usage": current.usage},
+            )
+        lead_context.reload_team_state()
+        return {
+            "status": "budget_exhausted",
+            "team_id": current.team_id,
+            "lifecycle_state": "budget_exhausted",
+            "error": error,
+            "terminal": True,
+            "replan_allowed": False,
+            "resume_allowed": False,
+            "workspace_preserved": True,
+            "executed_task_ids": executed,
+            "usage": current.usage,
+        }
 
     def _complete_team(self, lead_context: ToolContext, team: Team) -> Team:
         store = lead_context.team_store
@@ -1521,6 +2586,10 @@ class TeammateRuntime:
             current.completed_at = utc_now()
             store.save_team(current)
             store.append_event(current.team_id, "team.completed", {"usage": current.usage})
+        elif self._is_v2(current) and current.lifecycle_state != "completed":
+            current.set_lifecycle_state("completed")
+            current.completed_at = current.completed_at or utc_now()
+            store.save_team(current)
         lead_context.reload_team_state()
         return current
 
@@ -1532,9 +2601,18 @@ class TeammateRuntime:
         executed: list[str],
         *,
         status: str = "failed",
+        lifecycle_state: str | None = None,
     ) -> dict[str, Any]:
         current = lead_context.team_store.load_team(team.team_id) or team
-        if current.status == "running":
+        if lifecycle_state is not None:
+            current.set_lifecycle_state(lifecycle_state)
+            lead_context.team_store.save_team(current)
+            lead_context.team_store.append_event(
+                current.team_id,
+                f"team.{lifecycle_state}",
+                {"error": error, "usage": current.usage},
+            )
+        elif current.status == "running":
             current.transition_to("failed")
             lead_context.team_store.save_team(current)
             lead_context.team_store.append_event(
@@ -1544,6 +2622,7 @@ class TeammateRuntime:
         return {
             "status": status,
             "team_id": current.team_id,
+            "lifecycle_state": current.lifecycle_state,
             "error": error,
             "executed_task_ids": executed,
             "usage": current.usage,
@@ -1556,6 +2635,7 @@ class TeammateRuntime:
         return {
             "status": "cancelled",
             "team_id": team.team_id,
+            "lifecycle_state": team.lifecycle_state,
             "error": "team cancellation requested",
             "executed_task_ids": executed,
             "usage": team.usage,
@@ -1569,6 +2649,7 @@ class TeammateRuntime:
         return {
             "status": "blocked",
             "team_id": team.team_id,
+            "lifecycle_state": team.lifecycle_state,
             "error": error,
             "executed_task_ids": executed,
             "usage": team.usage,
@@ -1594,6 +2675,8 @@ class TeammateRuntime:
         return {
             "status": team.status,
             "team_id": team.team_id,
+            "protocol_version": TeammateRuntime._protocol_version(team),
+            "lifecycle_state": team.lifecycle_state,
             "executed_task_ids": executed,
             "tasks": list(lead_context.tasks.values()),
             "messages": messages,

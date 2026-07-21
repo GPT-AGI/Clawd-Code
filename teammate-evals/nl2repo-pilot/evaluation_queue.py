@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import importlib.util
 import json
+import os
 import signal
 import shutil
 import sqlite3
@@ -15,7 +18,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 
 HERE = Path(__file__).resolve().parent
@@ -27,6 +30,9 @@ sys.modules[SPEC.name] = benchmark
 SPEC.loader.exec_module(benchmark)
 
 QUEUE_DB = "queue.sqlite3"
+GLOBAL_POOL_WORKER_ENV = "CLAWD_NL2REPO_GLOBAL_POOL_WORKER"
+GLOBAL_POOL_WORKER_MARKER = "global_pool_supervisor.v1"
+GLOBAL_POOL_LOCK_PATH = HERE / "runs" / "global-pool.lock"
 QUEUE_STATUSES = (
     "queued",
     "rollout",
@@ -37,8 +43,201 @@ QUEUE_STATUSES = (
 )
 
 
+def enforce_serve_launch_policy(
+    args: argparse.Namespace,
+    *,
+    environ: Mapping[str, str] | None = None,
+    lock_path: Path | None = None,
+    parent_pid: int | None = None,
+) -> None:
+    """Prevent direct worker/slot controls from bypassing the global pool.
+
+    A marker environment variable alone is intentionally insufficient: a
+    managed worker must be a direct child of the process recorded in the live
+    pilot-wide flock, and its resolved run directory must be registered there.
+    The check happens before ``QueueStore`` is opened so an unauthorized second
+    worker cannot recover/move another worker's in-flight cases.
+    """
+    if args.command == "scale":
+        raise SystemExit(
+            "direct 'evaluation_queue.py ... scale' is disabled: the global pool "
+            "supervisor exclusively owns rollout/reward slot allocation. Restart "
+            "global_pool_supervisor.py with the desired capacities."
+        )
+    if args.command != "serve":
+        return
+    environment = os.environ if environ is None else environ
+    if _is_authorized_global_pool_worker(
+        args.run,
+        environ=environment,
+        lock_path=GLOBAL_POOL_LOCK_PATH if lock_path is None else lock_path,
+        parent_pid=os.getppid() if parent_pid is None else parent_pid,
+    ):
+        return
+    raise SystemExit(
+        "direct 'evaluation_queue.py ... serve' is disabled: start queue workers "
+        "with global_pool_supervisor.py so rollout/reward capacity is shared. A "
+        "marker environment variable without the matching live supervisor lock, "
+        "parent PID, and registered run is not accepted."
+    )
+
+
+def _global_pool_lock_is_held(path: Path) -> bool:
+    """Return whether another process currently owns the pilot-wide flock."""
+    try:
+        handle = path.open("r", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return True
+            return False
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return False
+    finally:
+        handle.close()
+
+
+def _is_authorized_global_pool_worker(
+    run_root: Path,
+    *,
+    environ: Mapping[str, str],
+    lock_path: Path,
+    parent_pid: int,
+) -> bool:
+    """Validate the supervisor-to-worker launch relationship."""
+    if environ.get(GLOBAL_POOL_WORKER_ENV) != GLOBAL_POOL_WORKER_MARKER:
+        return False
+    try:
+        metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+        owner_pid = int(metadata["pid"])
+        registered_values = {str(value) for value in metadata["runs"]}
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+    if owner_pid != parent_pid:
+        return False
+    resolved_run = run_root.expanduser().resolve()
+    # Name-only metadata is accepted solely for workers whose parent owns the
+    # live lock, allowing a supervisor started before the full-path metadata
+    # migration to restart its children without abandoning in-flight work.
+    if (
+        str(resolved_run) not in registered_values
+        and resolved_run.name not in registered_values
+    ):
+        return False
+    return _global_pool_lock_is_held(lock_path)
+
+
+def start_supervisor_lease_watchdog(
+    run_root: Path,
+    stop_event: threading.Event,
+    *,
+    interval_s: float = 1.0,
+    exit_fn: Callable[[int], Any] | None = None,
+) -> threading.Thread:
+    """Hard-stop an orphan queue worker after its supervisor loses the flock.
+
+    Executor threads cannot be safely cancelled while they are inside model or
+    sandbox clients.  Exiting the child process is therefore intentional: a new
+    supervisor can recover the SQLite in-flight states without an orphan worker
+    continuing to consume global capacity or later committing duplicate output.
+    """
+    if interval_s <= 0:
+        raise ValueError("supervisor watchdog interval must be positive")
+    terminate = _terminate_orphan_worker_tree if exit_fn is None else exit_fn
+
+    def monitor() -> None:
+        consecutive_failures = 0
+        while not stop_event.wait(interval_s):
+            valid = _is_authorized_global_pool_worker(
+                run_root,
+                environ=os.environ,
+                lock_path=GLOBAL_POOL_LOCK_PATH,
+                parent_pid=os.getppid(),
+            )
+            if valid:
+                consecutive_failures = 0
+                continue
+            # Lock metadata is updated in place to preserve the flock inode. A
+            # reader may catch its tiny truncate/write window, so require three
+            # consecutive misses before treating the lease as lost.
+            consecutive_failures += 1
+            if consecutive_failures < 3:
+                continue
+            print(
+                "global pool supervisor lease lost; terminating orphan queue worker",
+                file=sys.stderr,
+                flush=True,
+            )
+            terminate(75)
+            return
+
+    thread = threading.Thread(
+        target=monitor,
+        name="global-pool-lease-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _terminate_orphan_worker_tree(exit_code: int) -> None:
+    """Gracefully stop a managed worker group, then enforce a hard deadline."""
+    process_group = os.getpgrp()
+    if process_group != os.getpid():
+        # New supervisors always launch each worker as a session leader. Avoid
+        # signaling an unrelated shell/process group if an old manual process
+        # somehow reaches this path.
+        os._exit(exit_code)
+
+    def force_kill() -> None:
+        time.sleep(30)
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    threading.Thread(
+        target=force_kill,
+        name="orphan-worker-force-kill",
+        daemon=True,
+    ).start()
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        os._exit(exit_code)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def has_reusable_rollout(run_root: Path, task: str, mode: str) -> bool:
+    """Whether a failed case can be rescored without regenerating its workspace."""
+    case_root = run_root / task / mode
+    artifact_path = case_root / "rollout-artifact.json"
+    agent_path = case_root / "agent-result.json"
+    if not artifact_path.is_file() or not agent_path.is_file():
+        return False
+    if not (case_root / "workspace" / "start.md").is_file():
+        return False
+    try:
+        stored = benchmark._read_json(artifact_path)
+        agent = benchmark._read_json(agent_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(stored, dict) or not isinstance(agent, dict):
+        return False
+    outcome = str(agent.get("rollout_outcome") or "")
+    return not (
+        outcome in {"infra_error", "harness_error"}
+        or agent.get("rollout_infrastructure")
+        or agent.get("workspace_download_error")
+    )
 
 
 class QueueStore:
@@ -227,46 +426,83 @@ class QueueStore:
         return added, skipped
 
     def retry(self, task_names: list[str], mode: str) -> tuple[list[str], list[str]]:
+        """Retry terminal cases without exposing an unarchived rollout as queued.
+
+        SQLite's write transaction is deliberately held across the filesystem
+        rename.  A live worker attempting to claim the case therefore cannot
+        observe ``queued`` until the previous attempt is safely archived.
+        """
         retried: list[str] = []
         missing: list[str] = []
-        attempts: dict[str, int] = {}
-        now = utc_now()
-        with self._connect() as connection:
-            for task in task_names:
+        for task in task_names:
+            connection = self._connect()
+            case_root = self.run_root / task / mode
+            archive: Path | None = None
+            try:
+                connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT attempt FROM cases WHERE task=? AND mode=? "
+                    "SELECT status, attempt FROM cases WHERE task=? AND mode=? "
                     "AND status IN ('done','failed')",
                     (task, mode),
                 ).fetchone()
-                cursor = connection.execute(
-                    """
-                    UPDATE cases
-                    SET status='queued', updated_at=?, started_at=NULL,
-                        rollout_finished_at=NULL, reward_started_at=NULL,
-                        finished_at=NULL, quality_score=NULL, success=NULL, error=NULL
-                    WHERE task=? AND mode=? AND status IN ('done','failed')
-                    """,
-                    (now, task, mode),
-                )
-                if cursor.rowcount:
-                    retried.append(task)
-                    attempts[task] = int(row["attempt"]) if row else 0
-                else:
+                if row is None:
+                    connection.rollback()
                     missing.append(task)
-        archive_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        for task in retried:
-            case_root = self.run_root / task / mode
-            if not case_root.exists():
-                continue
-            archive = (
-                self.run_root
-                / "_attempts"
-                / task
-                / mode
-                / f"attempt-{attempts[task]}-{archive_stamp}"
-            )
-            archive.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(case_root), str(archive))
+                    continue
+                resume_reward = bool(
+                    row["status"] == "failed"
+                    and has_reusable_rollout(self.run_root, task, mode)
+                )
+                if resume_reward:
+                    cursor = connection.execute(
+                        """
+                        UPDATE cases
+                        SET status='reward_pending', updated_at=?, reward_started_at=NULL,
+                            finished_at=NULL, quality_score=NULL, success=NULL, error=NULL
+                        WHERE task=? AND mode=? AND status='failed'
+                        """,
+                        (utc_now(), task, mode),
+                    )
+                else:
+                    if case_root.exists():
+                        archive = rollout_attempt_archive_path(
+                            self.run_root,
+                            {"task": task, "mode": mode, "attempt": row["attempt"]},
+                            label="manual-retry",
+                        )
+                        archive.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(case_root), str(archive))
+                    cursor = connection.execute(
+                        """
+                        UPDATE cases
+                        SET status='queued', updated_at=?, started_at=NULL,
+                            rollout_finished_at=NULL, reward_started_at=NULL,
+                            finished_at=NULL, quality_score=NULL, success=NULL, error=NULL
+                        WHERE task=? AND mode=? AND status IN ('done','failed')
+                        """,
+                        (utc_now(), task, mode),
+                    )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"retry state changed unexpectedly for {task}/{mode}"
+                    )
+                connection.commit()
+                retried.append(task)
+            except Exception:
+                connection.rollback()
+                # A same-filesystem rename is atomic.  If anything after it
+                # fails, restore the terminal attempt before surfacing the
+                # error so a later retry remains safe.
+                if (
+                    archive is not None
+                    and archive.exists()
+                    and not case_root.exists()
+                ):
+                    case_root.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(archive), str(case_root))
+                raise
+            finally:
+                connection.close()
         return retried, missing
 
     def recover_interrupted(self) -> dict[str, int]:
@@ -394,6 +630,12 @@ class QueueStore:
                     f"UPDATE cases SET {assignments} WHERE id IN ({placeholders})",
                     (*values, *ids),
                 )
+                refreshed = connection.execute(
+                    f"SELECT * FROM cases WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                refreshed_by_id = {int(row["id"]): row for row in refreshed}
+                rows = [refreshed_by_id[case_id] for case_id in ids]
             connection.commit()
             return [dict(row) for row in rows]
         except Exception:
@@ -413,7 +655,32 @@ class QueueStore:
                 (now, now, case_id),
             )
 
+    def mark_rollout_retry(self, case_id: int, error: BaseException | str) -> bool:
+        """Return a failed infrastructure rollout to the rollout queue.
+
+        The attempt counter is intentionally retained.  It is incremented only
+        when the case is claimed again, which makes it a durable retry budget
+        across worker restarts.
+        """
+        now = utc_now()
+        message = str(error)
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE cases SET status='queued', updated_at=?, started_at=NULL,
+                    rollout_finished_at=NULL, reward_started_at=NULL,
+                    finished_at=NULL, quality_score=NULL, success=NULL, error=?
+                WHERE id=? AND status IN ('rollout','rewarding')
+                """,
+                (now, message[-4000:], case_id),
+            ).rowcount
+        return bool(updated)
+
     def mark_done(self, case_id: int, result: dict[str, Any]) -> None:
+        if reward_result_error(result) is not None:
+            raise ValueError("cannot mark a case done without a valid reward score")
+        score = reward_numeric_score(result)
+        assert score is not None
         now = utc_now()
         with self._connect() as connection:
             connection.execute(
@@ -424,7 +691,7 @@ class QueueStore:
                 (
                     now,
                     now,
-                    result.get("quality_score"),
+                    score,
                     int(bool(result.get("success"))),
                     case_id,
                 ),
@@ -437,7 +704,7 @@ class QueueStore:
             connection.execute(
                 """
                 UPDATE cases SET status='failed', updated_at=?, finished_at=?,
-                    success=0, error=? WHERE id=?
+                    quality_score=NULL, success=0, error=? WHERE id=?
                 """,
                 (now, now, message[-4000:], case_id),
             )
@@ -502,6 +769,182 @@ def restore_artifact(run_root: Path, task: dict[str, Any], mode: str) -> Any:
     )
 
 
+def rollout_result_error(artifact: Any) -> tuple[str, bool] | None:
+    """Return ``(reason, retryable)`` for non-scorable rollout outcomes."""
+    agent = getattr(artifact, "agent", None)
+    if not isinstance(agent, dict):
+        return None
+    outcome = str(agent.get("rollout_outcome") or "")
+    infrastructure = bool(agent.get("rollout_infrastructure"))
+    if outcome not in {"infra_error", "harness_error"} and not infrastructure:
+        return None
+    reason = str(
+        agent.get("workspace_download_error")
+        or agent.get("error")
+        or agent.get("failure_reason")
+        or outcome
+        or "rollout infrastructure failure"
+    )
+    # Harness failures are terminal even if an older result accidentally set
+    # rollout_infrastructure=true.  Only an explicitly retryable infrastructure
+    # outcome is allowed to consume another rollout attempt.
+    retryable = bool(
+        outcome == "infra_error" and agent.get("rollout_retryable")
+    )
+    return reason, retryable
+
+
+def retryable_rollout_exception(error: BaseException) -> bool:
+    """Conservatively identify transient infrastructure exceptions.
+
+    Explicit structured metadata wins.  Otherwise only network/timeout error
+    types, transient network errno values, and well-known infrastructure
+    messages are accepted.  Broad ``OSError`` and programming exceptions are
+    intentionally not retried.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    transient_errnos = {
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.ENETUNREACH,
+        errno.EPIPE,
+        errno.ETIMEDOUT,
+    }
+    markers = (
+        "connection reset",
+        "connection refused",
+        "connection error",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "too many requests",
+        "sandbox unavailable",
+        "deployment unavailable",
+        "ags backend",
+        "image is still preparing",
+        "pending request was cancelled",
+    )
+
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError)):
+            return True
+        if isinstance(current, OSError) and current.errno in transient_errnos:
+            return True
+
+        metadata: list[Any] = [current]
+        metadata.extend(
+            getattr(current, name, None)
+            for name in ("payload", "details", "metadata", "result")
+        )
+        for value in metadata:
+            if isinstance(value, dict):
+                retryable = value.get("retryable") is True
+                infrastructure = bool(
+                    value.get("is_infrastructure")
+                    or value.get("infrastructure")
+                    or value.get("failure_domain") == "infrastructure"
+                    or value.get("rollout_outcome") == "infra_error"
+                )
+            else:
+                retryable = getattr(value, "retryable", None) is True
+                infrastructure = bool(
+                    getattr(value, "is_infrastructure", False)
+                    or getattr(value, "infrastructure", False)
+                    or getattr(value, "failure_domain", None) == "infrastructure"
+                    or getattr(value, "rollout_outcome", None) == "infra_error"
+                )
+                class_name = type(value).__name__.casefold()
+                infrastructure = infrastructure or (
+                    retryable and "infra" in class_name
+                )
+            if retryable and infrastructure:
+                return True
+
+        if any(marker in str(current).casefold() for marker in markers):
+            return True
+        for nested in (
+            current.__cause__,
+            current.__context__,
+            getattr(current, "cause", None),
+            getattr(current, "original_error", None),
+        ):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+        pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
+    return False
+
+
+def reward_numeric_score(result: dict[str, Any]) -> int | float | None:
+    for key in ("code_quality_score", "quality_score"):
+        value = result.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def reward_result_error(result: Any) -> str | None:
+    """Explain why a reward result cannot be a successful queue terminal state."""
+    if not isinstance(result, dict):
+        return "reward returned a non-object result"
+    score = reward_numeric_score(result)
+    numeric_score = score is not None
+    if "reward_outcome" not in result and "reward_score_valid" not in result:
+        return None if numeric_score else "reward did not return a numeric quality score"
+    outcome = str(result.get("reward_outcome") or "pending")
+    score_valid = result.get("reward_score_valid")
+    if score_valid is None:
+        score_valid = outcome == "scored" and numeric_score
+    if outcome == "scored" and bool(score_valid) and numeric_score:
+        return None
+    hidden = result.get("hidden_tests")
+    detail = ""
+    if isinstance(hidden, dict):
+        detail = str(hidden.get("error") or hidden.get("skip_reason") or "")
+    reason = f"reward_outcome={outcome}; reward_score_valid={bool(score_valid)}"
+    return f"{reason}: {detail}" if detail else reason
+
+
+def rollout_attempt_archive_path(
+    run_root: Path,
+    case: dict[str, Any],
+    *,
+    label: str = "infra-retry",
+) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        run_root
+        / "_attempts"
+        / str(case["task"])
+        / str(case["mode"])
+        / f"attempt-{int(case['attempt'])}-{label}-{stamp}"
+    )
+
+
+def archive_rollout_attempt(
+    run_root: Path,
+    case: dict[str, Any],
+    *,
+    label: str = "infra-retry",
+) -> Path | None:
+    """Archive one rollout attempt before its workspace is generated again."""
+    case_root = run_root / str(case["task"]) / str(case["mode"])
+    if not case_root.exists():
+        return None
+    archive = rollout_attempt_archive_path(run_root, case, label=label)
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(case_root), str(archive))
+    return archive
+
+
 def score_with_infrastructure_retries(
     score_fn: Callable[[], dict[str, Any]],
     *,
@@ -537,17 +980,44 @@ def allocate_global_slots(
     active_key: str,
     pending_key: str,
 ) -> list[int]:
-    """Allocate one global pool across ordered, independently persisted runs."""
+    """Fairly allocate one pool while preserving already-active work.
+
+    Existing active work consumes capacity first because shrinking a desired
+    concurrency does not preempt an in-flight rollout/reward.  Remaining slots
+    water-fill the least-allocated run that still has pending demand, so one
+    large first queue cannot starve every later run.
+    """
     if capacity < 0:
         raise ValueError("global capacity must be non-negative")
-    remaining = capacity
-    allocations: list[int] = []
-    for counts in snapshots:
-        active = max(0, int(counts.get(active_key, 0)))
-        pending = max(0, int(counts.get(pending_key, 0)))
-        allocated = min(remaining, active + pending)
-        allocations.append(allocated)
-        remaining -= allocated
+    active = [max(0, int(counts.get(active_key, 0))) for counts in snapshots]
+    demand = [
+        active[index] + max(0, int(counts.get(pending_key, 0)))
+        for index, counts in enumerate(snapshots)
+    ]
+
+    if sum(active) <= capacity:
+        allocations = active.copy()
+        remaining = capacity - sum(allocations)
+        limits = demand
+    else:
+        # The supervisor may inherit more active work than its new capacity.
+        # It cannot preempt that work, but lower fair desired values prevent any
+        # run from claiming replacements until the aggregate drains.
+        allocations = [0] * len(snapshots)
+        remaining = capacity
+        limits = active
+
+    while remaining:
+        eligible = [
+            index
+            for index, limit in enumerate(limits)
+            if allocations[index] < limit
+        ]
+        if not eligible:
+            break
+        target = min(eligible, key=lambda index: (allocations[index], index))
+        allocations[target] += 1
+        remaining -= 1
     return allocations
 
 
@@ -567,6 +1037,7 @@ def run_queue_loop(
     stop_event: threading.Event,
     poll_interval_s: float = 1.0,
     stop_when_empty: bool = False,
+    rollout_attempts: int = 3,
     failure_fn: Callable[[dict[str, Any], str, str, Exception], dict[str, Any]] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     on_resize: Callable[[dict[str, int]], None] | None = None,
@@ -574,6 +1045,8 @@ def run_queue_loop(
     """Keep both pools full while cases can be appended from another process."""
     if rollout_concurrency < 0 or reward_concurrency < 0:
         raise ValueError("rollout and reward concurrency must be non-negative")
+    if rollout_attempts < 1:
+        raise ValueError("rollout attempts must be positive")
     max_rollout = max_rollout_concurrency or rollout_concurrency
     max_reward = max_reward_concurrency or reward_concurrency
     if max_rollout < 1 or max_reward < 1:
@@ -661,27 +1134,81 @@ def run_queue_loop(
                 try:
                     artifact = future.result()
                     persist_artifact(artifact)
-                    store.mark_rollout_complete(int(case["id"]))
-                    emit("rollout.completed", task, str(case["mode"]), queue_id=case["id"])
+                    rollout_error = rollout_result_error(artifact)
+                    if rollout_error is None:
+                        store.mark_rollout_complete(int(case["id"]))
+                        emit(
+                            "rollout.completed", task, str(case["mode"]),
+                            queue_id=case["id"],
+                        )
+                    else:
+                        reason, retryable = rollout_error
+                        attempt = int(case["attempt"])
+                        if retryable and attempt < rollout_attempts:
+                            archive_rollout_attempt(store.run_root, case)
+                            store.mark_rollout_retry(int(case["id"]), reason)
+                            emit(
+                                "rollout.requeued", task, str(case["mode"]),
+                                queue_id=case["id"], attempt=attempt,
+                                max_attempts=rollout_attempts, error=reason,
+                            )
+                        else:
+                            store.mark_failed(int(case["id"]), reason)
+                            emit(
+                                "rollout.failed", task, str(case["mode"]),
+                                queue_id=case["id"],
+                                error_type=(
+                                    "InfrastructureError" if retryable
+                                    else "HarnessError"
+                                ),
+                                attempt=attempt, max_attempts=rollout_attempts,
+                            )
                 except Exception as exc:
                     if failure_fn is not None:
                         failure_fn(task, str(case["mode"]), "rollout", exc)
-                    store.mark_failed(int(case["id"]), exc)
-                    emit(
-                        "rollout.failed", task, str(case["mode"]),
-                        queue_id=case["id"], error_type=type(exc).__name__,
-                    )
+                    attempt = int(case["attempt"])
+                    if (
+                        retryable_rollout_exception(exc)
+                        and attempt < rollout_attempts
+                    ):
+                        archive_rollout_attempt(
+                            store.run_root, case, label="exception-retry"
+                        )
+                        store.mark_rollout_retry(int(case["id"]), exc)
+                        emit(
+                            "rollout.requeued", task, str(case["mode"]),
+                            queue_id=case["id"], attempt=attempt,
+                            max_attempts=rollout_attempts, error=str(exc),
+                            error_type=type(exc).__name__,
+                        )
+                    else:
+                        store.mark_failed(int(case["id"]), exc)
+                        emit(
+                            "rollout.failed", task, str(case["mode"]),
+                            queue_id=case["id"], error_type=type(exc).__name__,
+                            attempt=attempt, max_attempts=rollout_attempts,
+                        )
 
             for future in [item for item in reward_futures if item.done()]:
                 case, task = reward_futures.pop(future)
                 try:
                     result = future.result()
-                    store.mark_done(int(case["id"]), result)
-                    emit(
-                        "reward.completed", task, str(case["mode"]),
-                        queue_id=case["id"], quality_score=result.get("quality_score"),
-                        success=bool(result.get("success")),
-                    )
+                    invalid_reward = reward_result_error(result)
+                    if invalid_reward is None:
+                        store.mark_done(int(case["id"]), result)
+                        emit(
+                            "reward.completed", task, str(case["mode"]),
+                            queue_id=case["id"], quality_score=result.get("quality_score"),
+                            success=bool(result.get("success")),
+                        )
+                    else:
+                        store.mark_failed(int(case["id"]), invalid_reward)
+                        emit(
+                            "reward.failed", task, str(case["mode"]),
+                            queue_id=case["id"], error_type="InvalidRewardResult",
+                            reward_outcome=result.get("reward_outcome"),
+                            retryable=bool(result.get("retryable")),
+                        )
                 except Exception as exc:
                     if failure_fn is not None:
                         failure_fn(task, str(case["mode"]), "reward", exc)
@@ -836,6 +1363,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--keep-image", action="store_true")
     serve.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     serve.add_argument("--poll-interval", type=float, default=1.0)
+    serve.add_argument("--rollout-attempts", type=int, default=3)
     serve.add_argument("--reward-attempts", type=int, default=3)
     serve.add_argument("--reward-retry-delay", type=float, default=5.0)
     serve.add_argument(
@@ -850,6 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    enforce_serve_launch_policy(args)
     run_root = args.run.resolve()
     store = QueueStore(run_root)
 
@@ -910,6 +1439,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.max_reward_concurrency < args.reward_concurrency
     ):
         raise SystemExit("maximum concurrency must cover initial concurrency")
+    if args.rollout_attempts < 1:
+        raise SystemExit("rollout attempts must be positive")
     if args.reward_attempts < 1 or args.reward_retry_delay < 0:
         raise SystemExit("reward retry settings must be non-negative with positive attempts")
     upstream_root = benchmark.resolve_upstream(args.upstream_root, cache_root=args.cache_root)
@@ -934,6 +1465,8 @@ def main(argv: list[str] | None = None) -> int:
             "reward_concurrency": configured["reward_concurrency"],
             "max_rollout_concurrency": configured["max_rollout_concurrency"],
             "max_reward_concurrency": configured["max_reward_concurrency"],
+            "rollout_attempts": args.rollout_attempts,
+            "reward_attempts": args.reward_attempts,
             "reward_uses_rollout_slots": False,
         },
     )
@@ -1030,6 +1563,7 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    start_supervisor_lease_watchdog(run_root, stop_event)
     if args.start_after:
         marker = args.start_after.expanduser().resolve()
         if marker.suffix != ".json":
@@ -1061,6 +1595,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_event=stop_event,
         poll_interval_s=args.poll_interval,
         stop_when_empty=args.stop_when_empty,
+        rollout_attempts=args.rollout_attempts,
         failure_fn=failed,
         on_event=event,
         on_resize=resized,

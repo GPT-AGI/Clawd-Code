@@ -117,11 +117,8 @@
     .issue-toggle { height: 34px; border: 1px solid var(--line-strong); background: var(--panel); padding: 0 11px; cursor: pointer; font: 700 10px/1 var(--mono); }
     .issue-toggle.active { color: var(--red); border-color: var(--red); background: var(--red-soft); }
     .queue-alert { height: 34px; display: flex; align-items: center; padding: 0 11px; color: var(--orange); border: 1px solid var(--orange); background: var(--orange-soft); font: 700 10px/1 var(--mono); letter-spacing: .04em; }
-    .scale-control { height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 9px; border: 1px solid var(--line-strong); background: var(--panel); font: 700 9px/1 var(--mono); white-space: nowrap; }
-    .scale-control label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
-    .slot-input { width: 42px; height: 24px; box-sizing: border-box; border: 1px solid var(--line); background: #fffefb; color: var(--ink); text-align: center; font: 700 10px/1 var(--mono); }
-    .scale-apply { height: 24px; border: 0; padding: 0 8px; color: #fff; background: var(--night); cursor: pointer; font: 700 9px/1 var(--mono); }
-    .scale-apply:disabled { opacity: .45; cursor: wait; }
+    .scale-control { height: 34px; display: flex; align-items: center; gap: 8px; padding: 0 9px; border: 1px solid var(--line-strong); background: var(--panel); font: 700 9px/1 var(--mono); white-space: nowrap; }
+    .managed-slots { color: var(--muted); font-variant-numeric: tabular-nums; }
     .view { display: none; }
     .view.active { display: block; }
     .global-shell { border: 1px solid var(--line-strong); background: var(--panel); }
@@ -344,9 +341,9 @@
       </div>
       <div class="metric"><div class="metric-label">Overall</div><div class="metric-value" id="overall">—</div><div class="metric-sub" id="overallSub">—</div></div>
       <div class="metric"><div class="metric-label">Rollouts</div><div class="metric-value" id="rollouts">—</div><div class="metric-sub" id="rolloutsSub">—</div></div>
-      <div class="metric"><div class="metric-label">Rewarded</div><div class="metric-value" id="rewarded">—</div><div class="metric-sub" id="rewardedSub">—</div></div>
-      <div class="metric"><div class="metric-label">Avg quality</div><div class="metric-value" id="quality">—</div><div class="metric-sub" id="qualitySub">—</div></div>
-      <div class="metric"><div class="metric-label">ETA</div><div class="metric-value" id="eta">—</div><div class="metric-sub" id="etaSub">—</div></div>
+      <div class="metric"><div class="metric-label">Code quality</div><div class="metric-value" id="codeQuality">—</div><div class="metric-sub" id="codeQualitySub">—</div></div>
+      <div class="metric"><div class="metric-label">Protocol yield</div><div class="metric-value" id="protocolYield">—</div><div class="metric-sub" id="protocolYieldSub">—</div></div>
+      <div class="metric"><div class="metric-label">Effective quality</div><div class="metric-value" id="effectiveQuality">—</div><div class="metric-sub" id="effectiveQualitySub">—</div></div>
     </section>
 
     <section class="progress-rack">
@@ -366,11 +363,9 @@
       <button class="issue-toggle" id="issueToggle">ISSUES ONLY</button>
       <div class="queue-alert" id="queueAlert" hidden>QUEUE LOW</div>
       <div class="toolbar-spacer"></div>
-      <div class="scale-control" id="scaleControl" hidden>
-        <span>SLOTS</span>
-        <label>R <input class="slot-input" id="rolloutSlots" type="number" min="0" step="1" aria-label="Rollout slots"></label>
-        <label>W <input class="slot-input" id="rewardSlots" type="number" min="0" step="1" aria-label="Reward slots"></label>
-        <button class="scale-apply" id="applySlots">APPLY</button>
+      <div class="scale-control" id="scaleControl" title="只读分配；容量由 global_pool_supervisor.py 统一管理" hidden>
+        <span>GLOBAL ALLOCATION</span>
+        <span class="managed-slots" id="managedSlots">R — · W —</span>
       </div>
       <select class="filter" id="statusFilter" aria-label="状态筛选">
         <option value="all">全部状态</option><option value="queued">排队中</option><option value="running">Rollout</option><option value="reward">Reward</option><option value="done">已评分</option><option value="infra_error">基础设施失败</option>
@@ -386,7 +381,7 @@
           <div class="pool-cell"><div class="pool-title">Rollout slots <span id="globalRolloutSlots">—</span></div><div class="slot-track"><div class="slot-fill" id="globalRolloutBar"></div></div></div>
           <div class="pool-cell"><div class="pool-title">Reward slots <span id="globalRewardSlots">—</span></div><div class="slot-track"><div class="slot-fill reward" id="globalRewardBar"></div></div></div>
         </div>
-        <div class="global-table"><table><thead><tr><th>#</th><th>Batch</th><th>Slots R + W</th><th>Queue</th><th>Rollout</th><th>Reward wait / active</th><th>Scored</th><th>Overall progress</th><th>Avg quality</th></tr></thead><tbody id="globalRows"></tbody></table><div class="empty-state" id="globalEmpty" hidden>当前 campaign 没有可展示的队列</div></div>
+        <div class="global-table"><table><thead><tr><th>#</th><th>Batch</th><th>Slots R + W</th><th>Queue</th><th>Rollout</th><th>Reward wait / active</th><th>Scored</th><th>Overall progress</th><th>Legacy quality</th></tr></thead><tbody id="globalRows"></tbody></table><div class="empty-state" id="globalEmpty" hidden>当前 campaign 没有可展示的队列</div></div>
       </div>
     </section>
     <section class="view" id="view-table"><div class="table-shell"><table><thead><tr><th>#</th><th>Task</th><th>Phase</th><th>Turns</th><th>Runtime</th><th>Last activity</th><th>Calls / errors</th><th>Reward</th><th>Signal</th></tr></thead><tbody id="taskRows"></tbody></table><div class="empty-state" id="tableEmpty" hidden>没有匹配的任务</div></div></section>
@@ -428,14 +423,14 @@
     function signed(value,digits=1) { if(value==null||!Number.isFinite(Number(value)))return '—'; const n=Number(value); return `${n>0?'+':''}${n.toFixed(digits)}`; }
     function tokens(value) { const n=Number(value); if(!Number.isFinite(n))return '—'; return n>=1e6?`${(n/1e6).toFixed(2)}M`:n>=1e3?`${(n/1e3).toFixed(1)}K`:String(Math.round(n)); }
     function statusGroup(status) { if(['rewarding','reward_waiting'].includes(status))return 'reward'; if(['scored','success'].includes(status))return 'done'; return status; }
-    function signal(t) { if(t.infrastructure_error)return t.infrastructure_error; if(t.failure_class)return t.failure_class.replaceAll('_',' '); if(t.status==='running')return t.last_tool||t.last_kind||'agent active'; if(t.status==='queued')return 'waiting for slot'; if(t.status==='rewarding')return 'hidden tests running'; if(t.rescored)return 'corrected reward'; return t.agent_ok===false?'agent failed':'reward recorded'; }
+    function signal(t) { if(t.infrastructure_error)return t.infrastructure_error; if(t.protocol_status==='failed')return `protocol failed · code ${score(t.code_quality_score)}`; if(t.failure_class)return t.failure_class.replaceAll('_',' '); if(t.status==='running')return t.last_tool||t.last_kind||'agent active'; if(t.status==='queued')return 'waiting for slot'; if(t.status==='rewarding')return 'hidden tests running'; if(t.rescored)return 'corrected reward'; return t.agent_ok===false?'agent failed':t.reward_outcome||'reward recorded'; }
     function filteredTasks() {
       if(!state.data)return [];
       const q=$('search').value.trim().toLowerCase(), filter=$('statusFilter').value;
       return state.data.tasks.filter(t => {
         const matchesFilter=filter==='all'||statusGroup(t.status)===filter;
-        const matchesIssue=!state.issues||(t.status==='infra_error'||t.tool_errors>0||t.agent_ok===false);
-        const hay=`${t.task} ${t.mode} ${t.last_tool} ${t.last_kind} ${t.infrastructure_error||''} ${t.failure_class||''}`.toLowerCase();
+        const matchesIssue=!state.issues||(t.status==='infra_error'||t.tool_errors>0||t.agent_ok===false||t.protocol_status==='failed');
+        const hay=`${t.task} ${t.mode} ${t.last_tool} ${t.last_kind} ${t.infrastructure_error||''} ${t.failure_class||''} ${t.failure_domain||''} ${t.reward_outcome||''}`.toLowerCase();
         return matchesFilter&&matchesIssue&&(!q||hay.includes(q));
       });
     }
@@ -444,22 +439,15 @@
       $('runId').textContent=r.id;
       $('topRun').textContent=`${r.id} · ${r.provider||'—'}/${r.model||'—'}`;
       $('runMeta').textContent=`${r.execution_backend||'—'} rollout · ${r.score_backend||'—'} reward · pool ${r.rollout_concurrency??'—'} + ${r.reward_concurrency??'—'} · ${duration(r.elapsed_s)}`;
-      const scalable=r.queue_mode&&Number(r.max_rollout_concurrency)>0;
-      $('scaleControl').hidden=!scalable;
-      if(scalable){
-        const rollout=$('rolloutSlots'),reward=$('rewardSlots');
-        rollout.max=String(r.max_rollout_concurrency);reward.max=String(r.max_reward_concurrency);
-        if(document.activeElement!==rollout)rollout.value=String(r.rollout_concurrency);
-        if(document.activeElement!==reward)reward.value=String(r.reward_concurrency);
-        rollout.title=`0–${r.max_rollout_concurrency}; 0 pauses new rollouts`;
-        reward.title=`0–${r.max_reward_concurrency}; 0 pauses new rewards`;
-      }
+      const managed=Boolean(r.queue_mode);
+      $('scaleControl').hidden=!managed;
+      if(managed)$('managedSlots').textContent=`R ${r.rollout_concurrency??'—'} · W ${r.reward_concurrency??'—'}`;
       $('liveDot').className=`live-dot ${r.status}`; $('liveText').textContent=r.status;
       $('overall').textContent=pct(s.overall_progress); $('overallSub').textContent=`${s.started}/${s.total} started · ${s.queued} queued`;
       $('rollouts').textContent=`${s.rollouts_completed}/${s.total}`; $('rolloutsSub').textContent=`${s.active} active · ${s.rollout_rate_h.toFixed(1)}/h`;
-      $('rewarded').textContent=`${s.rewards_completed}/${s.total}`; $('rewardedSub').textContent=`${s.reward_active} active · ${s.infrastructure_errors} infra errors`;
-      $('quality').textContent=s.average_quality==null?'—':Number(s.average_quality).toFixed(1); $('qualitySub').textContent=`${s.valid_rewards} valid rewards · ${s.strict_successes} strict pass`;
-      $('eta').textContent=r.queue_mode&&s.total===0?'waiting':s.rollouts_completed>=s.total?'done':duration(s.eta_s); $('etaSub').textContent=`${s.model_calls.toLocaleString()} model · ${s.tool_calls.toLocaleString()} tools`;
+      $('codeQuality').textContent=s.code_quality==null?'—':Number(s.code_quality).toFixed(1); $('codeQualitySub').textContent=`coverage ${pct(s.coverage)} · ${s.coverage_count}/${s.coverage_total}`;
+      $('protocolYield').textContent=s.protocol_yield==null?'—':pct(s.protocol_yield); $('protocolYieldSub').textContent=`${s.protocol_passed}/${s.protocol_eligible} passed`;
+      $('effectiveQuality').textContent=s.effective_quality==null?'—':Number(s.effective_quality).toFixed(1); $('effectiveQualitySub').textContent=`${s.effective_eligible} eligible · ${s.infrastructure_errors} infra`;
       $('queueAlert').hidden=!r.queue_mode||!s.queue_low; $('queueAlert').textContent=`QUEUE LOW · ${s.queue_depth} waiting / ${r.rollout_concurrency} slots`;
       [['overall',s.overall_progress],['rollout',s.rollout_progress],['reward',s.reward_progress]].forEach(([name,value])=>{$(`${name}Pct`).textContent=pct(value);$(`${name}Bar`).style.width=pct(value);});
       $('footerNote').textContent=`Updated ${new Date(data.generated_at).toLocaleTimeString()} · ${s.tool_errors} tool errors observed · reward worker 不占 rollout 连接池`;
@@ -468,9 +456,9 @@
       $('tableEmpty').hidden=tasks.length>0;
       $('taskRows').innerHTML=tasks.map(t=>{
         const turnPct=Math.min(100,Math.round((t.turns/(t.max_turns||300))*100));
-        const testText=t.expected!=null?`${t.passed||0}/${t.expected} hidden tests`:t.status==='infra_error'?'not scored':'pending';
+        const testText=t.expected!=null?`${t.passed||0}/${t.expected} hidden tests · effective ${score(t.effective_quality_score)}`:t.status==='infra_error'?'not scored':'pending';
         const sig=signal(t);
-        return `<tr data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><td class="index">${t.index}</td><td><div class="task-name">${esc(t.task)}</div><div class="task-mode">${esc(t.mode)}</div></td><td><span class="badge status-${esc(t.status)}">${esc(STATUS_LABEL[t.status]||t.status)}</span>${t.rescored?'<span class="tiny-tag">rescored</span>':''}${t.failure_class?`<span class="tiny-tag">${esc(t.failure_class)}</span>`:''}</td><td class="turn-cell"><div class="turn-top"><b>${t.turns}</b><span class="muted">/ ${t.max_turns}</span></div><div class="micro-track"><div class="micro-fill" style="width:${turnPct}%"></div></div></td><td class="mono">${duration(t.runtime_s)}</td><td><div class="last-action">${esc(t.last_tool||t.last_kind||'—')}</div><div class="task-mode">${age(t.activity_age_s)}</div></td><td class="mono">${t.model_calls}m / ${t.tool_calls}t<br><span class="${t.tool_errors?'status-infra_error':'muted'}">${t.tool_errors} err</span></td><td><div class="score ${t.quality_score==null?'empty':''}">${score(t.quality_score)}</div><div class="tests">${esc(testText)}</div></td><td><div class="${t.infrastructure_error?'error-note':'last-action muted'}" title="${esc(sig)}">${esc(sig)}</div></td></tr>`;
+        return `<tr data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><td class="index">${t.index}</td><td><div class="task-name">${esc(t.task)}</div><div class="task-mode">${esc(t.mode)}</div></td><td><span class="badge status-${esc(t.status)}">${esc(STATUS_LABEL[t.status]||t.status)}</span>${t.rescored?'<span class="tiny-tag">rescored</span>':''}${t.failure_class?`<span class="tiny-tag">${esc(t.failure_class)}</span>`:''}</td><td class="turn-cell"><div class="turn-top"><b>${t.turns}</b><span class="muted">/ ${t.max_turns}</span></div><div class="micro-track"><div class="micro-fill" style="width:${turnPct}%"></div></div></td><td class="mono">${duration(t.runtime_s)}</td><td><div class="last-action">${esc(t.last_tool||t.last_kind||'—')}</div><div class="task-mode">${age(t.activity_age_s)}</div></td><td class="mono">${t.model_calls}m / ${t.tool_calls}t<br><span class="${t.tool_errors?'status-infra_error':'muted'}">${t.tool_errors} err</span></td><td><div class="score ${t.code_quality_score==null?'empty':''}">${score(t.code_quality_score)}</div><div class="tests">${esc(testText)}</div></td><td><div class="${t.infrastructure_error?'error-note':'last-action muted'}" title="${esc(sig)}">${esc(sig)}</div></td></tr>`;
       }).join('');
       $('taskRows').querySelectorAll('tr').forEach(row=>row.addEventListener('click',()=>openTask(row.dataset.task,row.dataset.mode)));
     }
@@ -478,7 +466,7 @@
       const lanes=[['queued','Queue'],['running','Rollout pool'],['reward','Reward pool'],['done','Scored']];
       const groups=Object.fromEntries(lanes.map(([k])=>[k,[]])); groups.done=[];
       tasks.forEach(t=>{let g=statusGroup(t.status); if(g==='infra_error')g='done'; (groups[g]||groups.done).push(t);});
-      $('pipeline').innerHTML=lanes.map(([key,label])=>`<div class="lane"><div class="lane-head"><span>${label}</span><b>${groups[key].length}</b></div><div class="lane-list">${groups[key].map(t=>`<button class="task-card" data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><div class="card-top"><span>${esc(t.task)}</span><span class="${t.status==='infra_error'?'error-note':'muted'}">${t.quality_score==null?t.turns:score(t.quality_score)}</span></div><div class="card-bottom"><span>${esc(t.mode)} · ${esc(STATUS_LABEL[t.status]||t.status)}</span><span>${t.status==='queued'?'slot pending':duration(t.runtime_s)}</span></div></button>`).join('')||'<div class="empty-state">empty</div>'}</div></div>`).join('');
+      $('pipeline').innerHTML=lanes.map(([key,label])=>`<div class="lane"><div class="lane-head"><span>${label}</span><b>${groups[key].length}</b></div><div class="lane-list">${groups[key].map(t=>`<button class="task-card" data-task="${esc(t.task)}" data-mode="${esc(t.mode)}"><div class="card-top"><span>${esc(t.task)}</span><span class="${t.status==='infra_error'?'error-note':'muted'}">${t.code_quality_score==null?t.turns:score(t.code_quality_score)}</span></div><div class="card-bottom"><span>${esc(t.mode)} · ${esc(t.protocol_status||STATUS_LABEL[t.status]||t.status)}</span><span>${t.status==='queued'?'slot pending':duration(t.runtime_s)}</span></div></button>`).join('')||'<div class="empty-state">empty</div>'}</div></div>`).join('');
       $('pipeline').querySelectorAll('[data-task]').forEach(el=>el.addEventListener('click',()=>openTask(el.dataset.task,el.dataset.mode)));
     }
     function renderTimeline() {
@@ -602,7 +590,7 @@
       const ordered=state.detail.order==='desc'?groups.slice().reverse():groups;
       const actorButtons=[`<button class="trace-chip" data-actor="all">ALL · ${groups.length}</button>`,...actors.map(actor=>`<button class="trace-chip" data-actor="${esc(actor)}">${esc(actor)} · ${groups.filter(group=>group.actor===actor).length}</button>`)].join('');
       const rail=ordered.map(group=>`<button class="rail-mark ${actorClass(group.actor)} ${group.isLifecycle?'lifecycle':''} ${group.isError?'is-error':''}" data-group-index="${group.index}" title="${esc(group.actor)} · ${group.turn==null?'lifecycle':`turn ${group.turn}`}"></button>`).join('');
-      $('drawerBody').innerHTML=`<div class="detail-grid"><div class="detail-stat"><label>quality</label><strong>${score(t.quality_score)}</strong></div><div class="detail-stat"><label>hidden</label><strong>${test}</strong></div><div class="detail-stat"><label>lead turns</label><strong>${t.turns}/${t.max_turns}</strong></div><div class="detail-stat"><label>model calls</label><strong>${t.model_calls}</strong></div><div class="detail-stat"><label>tool calls</label><strong>${t.tool_calls}</strong></div><div class="detail-stat"><label>errors</label><strong>${t.tool_errors}</strong></div></div>${t.infrastructure_error?`<div class="error-note">${esc(t.infrastructure_error)}</div>`:''}${renderTeam(d.team)}<section class="trace-section"><div class="trace-toolbar"><span class="trace-title">Trajectory</span>${actorButtons}<button class="trace-action" id="traceError">ERRORS · ${errors}</button><button class="trace-action" id="traceOrder">${state.detail.order==='desc'?'LATEST FIRST':'EARLIEST FIRST'}</button><input class="trace-search" id="traceSearch" value="${esc(state.detail.query)}" placeholder="搜索响应 / 工具 / 输出" aria-label="搜索轨迹"><span class="trace-count" id="traceCount"></span></div><div class="trace-rail">${rail}</div><div class="trace-feed">${ordered.map(renderGroup).join('')}<div class="empty-state" id="traceEmpty" hidden>没有匹配的轨迹分组</div></div></section>${detailBlock('Agent response',d.agent_response||d.recent_text)}${detailBlock('Hidden test log',d.hidden_log)}${detailBlock('Docker build log',d.docker_build_log)}${detailBlock('stderr',d.stderr_log)}${detailBlock('stdout',d.stdout_log)}`;
+      $('drawerBody').innerHTML=`<div class="detail-grid"><div class="detail-stat"><label>code quality</label><strong>${score(t.code_quality_score)}</strong></div><div class="detail-stat"><label>protocol</label><strong>${esc(t.protocol_status||'—')}</strong></div><div class="detail-stat"><label>effective</label><strong>${score(t.effective_quality_score)}</strong></div><div class="detail-stat"><label>hidden</label><strong>${test}</strong></div><div class="detail-stat"><label>lead turns</label><strong>${t.turns}/${t.max_turns}</strong></div><div class="detail-stat"><label>model calls</label><strong>${t.model_calls}</strong></div><div class="detail-stat"><label>tool calls</label><strong>${t.tool_calls}</strong></div><div class="detail-stat"><label>errors</label><strong>${t.tool_errors}</strong></div></div>${t.infrastructure_error?`<div class="error-note">${esc(t.infrastructure_error)}</div>`:''}${renderTeam(d.team)}<section class="trace-section"><div class="trace-toolbar"><span class="trace-title">Trajectory</span>${actorButtons}<button class="trace-action" id="traceError">ERRORS · ${errors}</button><button class="trace-action" id="traceOrder">${state.detail.order==='desc'?'LATEST FIRST':'EARLIEST FIRST'}</button><input class="trace-search" id="traceSearch" value="${esc(state.detail.query)}" placeholder="搜索响应 / 工具 / 输出" aria-label="搜索轨迹"><span class="trace-count" id="traceCount"></span></div><div class="trace-rail">${rail}</div><div class="trace-feed">${ordered.map(renderGroup).join('')}<div class="empty-state" id="traceEmpty" hidden>没有匹配的轨迹分组</div></div></section>${detailBlock('Agent response',d.agent_response||d.recent_text)}${detailBlock('Hidden test log',d.hidden_log)}${detailBlock('Docker build log',d.docker_build_log)}${detailBlock('stderr',d.stderr_log)}${detailBlock('stdout',d.stdout_log)}`;
       wireTraceControls();
     }
     async function openTask(name,mode,{silent=false}={}) {
@@ -624,17 +612,6 @@
     }
     function closeDrawer(){state.selected=null;state.detailRequest++;state.detailLoading=false;document.body.classList.remove('drawer-open');}
     function toast(message){const el=$('toast');el.textContent=message;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2800);}
-    async function applySlots(){
-      if(!state.currentRun)return;
-      const rollout=Number($('rolloutSlots').value),reward=Number($('rewardSlots').value),button=$('applySlots');
-      if(!Number.isInteger(rollout)||!Number.isInteger(reward)||rollout<0||reward<0){toast('槽位必须是非负整数');return;}
-      button.disabled=true;
-      try{
-        const res=await fetch('/api/concurrency',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:state.currentRun,rollout_concurrency:rollout,reward_concurrency:reward})});
-        const payload=await res.json();if(!res.ok)throw new Error(payload.error||`HTTP ${res.status}`);
-        toast(`已调整：rollout ${rollout} · reward ${reward}`);await refresh();
-      }catch(err){toast(`调整失败: ${err.message}`);}finally{button.disabled=false;}
-    }
     async function refresh() {
       if(state.paused||!state.currentRun)return;
       try { const [res,globalRes]=await Promise.all([fetch(`/api/state?run=${encodeURIComponent(state.currentRun)}`,{cache:'no-store'}),fetch(`/api/global?run=${encodeURIComponent(state.currentRun)}`,{cache:'no-store'})]); if(!res.ok||!globalRes.ok)throw new Error(`HTTP ${!res.ok?res.status:globalRes.status}`); state.data=await res.json();state.globalData=await globalRes.json(); render(); if(state.selected)openTask(state.selected.name,state.selected.mode,{silent:true}); }
@@ -652,7 +629,6 @@
     document.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('click',()=>{state.view=btn.dataset.view;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b===btn));document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${state.view}`));updateViewControls();}));
     $('issueToggle').addEventListener('click',()=>{state.issues=!state.issues;$('issueToggle').classList.toggle('active',state.issues);render();});
     $('statusFilter').addEventListener('change',render); $('search').addEventListener('input',render);
-    $('applySlots').addEventListener('click',applySlots);
     $('pauseBtn').addEventListener('click',()=>{state.paused=!state.paused;$('pauseBtn').textContent=state.paused?'▶':'Ⅱ';$('pauseBtn').title=state.paused?'恢复自动刷新':'暂停自动刷新';if(!state.paused)refresh();});
     $('interval').addEventListener('change',schedule); $('closeDrawer').addEventListener('click',closeDrawer); $('backdrop').addEventListener('click',closeDrawer); document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer();});
     $('runSelect').addEventListener('change',()=>{state.currentRun=$('runSelect').value;state.data=null;closeDrawer();localStorage.setItem('nl2repo-dashboard-run',state.currentRun);history.replaceState({},'',`?run=${encodeURIComponent(state.currentRun)}`);refresh();});

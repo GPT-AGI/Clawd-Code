@@ -36,6 +36,117 @@ def write_jsonl(path: Path, values: list[dict[str, object]]) -> None:
 
 
 class TestNL2RepoDashboard(unittest.TestCase):
+    def test_rollout_infrastructure_preserves_null_protocol_and_effective_metrics(self) -> None:
+        metrics = dashboard._normalize_result_metrics(
+            {
+                "result_schema_version": 2,
+                "agent_ok": False,
+                "delivery_valid": False,
+                "protocol_status": "not_evaluated",
+                "protocol_credit": None,
+                "code_quality_score": None,
+                "effective_quality_score": None,
+                "reward_outcome": "pending",
+                "reward_score_valid": False,
+                "metric_eligibility": {
+                    "code_quality": False,
+                    "protocol_yield": False,
+                    "effective_quality": False,
+                },
+                "failure_domain": "infrastructure",
+                "is_infrastructure": True,
+                "retryable": True,
+            }
+        )
+
+        self.assertIsNone(metrics["protocol_credit"])
+        self.assertIsNone(metrics["effective_quality_score"])
+        self.assertFalse(any(metrics["metric_eligibility"].values()))
+
+    def test_reward_infrastructure_is_excluded_from_qpe_aggregates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_json(
+                root / "run-metadata.json",
+                {
+                    "run_id": "infra-precedence",
+                    "tasks": ["scored", "scorer-infra"],
+                    "modes": ["forced-team"],
+                },
+            )
+            common = {
+                "result_schema_version": 2,
+                "agent_ok": True,
+                "integrity_ok": True,
+                "delivery_valid": True,
+                "hidden_tests": {
+                    "pytest": {
+                        "expected": 1,
+                        "passed": 1,
+                        "failed": 0,
+                        "errors": 0,
+                        "returncode": 0,
+                        "all_passed": True,
+                    }
+                },
+            }
+            write_json(
+                root / "scored" / "forced-team" / "result.json",
+                {
+                    **common,
+                    "quality_score": 80.0,
+                    "code_quality_score": 80.0,
+                    "protocol_status": "passed",
+                    "protocol_credit": 1.0,
+                    "effective_quality_score": 80.0,
+                    "reward_outcome": "scored",
+                    "reward_score_valid": True,
+                    "metric_eligibility": {
+                        "code_quality": True,
+                        "protocol_yield": True,
+                        "effective_quality": True,
+                    },
+                },
+            )
+            write_json(
+                root / "scorer-infra" / "forced-team" / "result.json",
+                {
+                    **common,
+                    "quality_score": 0.0,
+                    "code_quality_score": None,
+                    "protocol_status": "failed",
+                    "protocol_credit": 0.0,
+                    "effective_quality_score": None,
+                    "reward_outcome": "infra_error",
+                    "reward_score_valid": False,
+                    "metric_eligibility": {
+                        "code_quality": False,
+                        "protocol_yield": False,
+                        "effective_quality": False,
+                    },
+                    "failure_domain": "infrastructure",
+                    "is_infrastructure": True,
+                    "retryable": True,
+                    "hidden_tests": {
+                        "error": "scorer sandbox unavailable",
+                        "pytest": common["hidden_tests"]["pytest"],
+                    },
+                },
+            )
+
+            state = dashboard.DashboardStore(root).state()
+
+        self.assertEqual(state["summary"]["infrastructure_errors"], 1)
+        self.assertEqual(state["summary"]["code_quality"], 80.0)
+        self.assertEqual(state["summary"]["coverage"], 0.5)
+        self.assertEqual(state["summary"]["protocol_yield"], 1.0)
+        self.assertEqual(state["summary"]["protocol_eligible"], 1)
+        self.assertEqual(state["summary"]["effective_quality"], 80.0)
+        self.assertEqual(state["summary"]["effective_eligible"], 1)
+        infra = next(task for task in state["tasks"] if task["task"] == "scorer-infra")
+        self.assertIsNone(infra["effective_quality_score"])
+        self.assertFalse(any(infra["metric_eligibility"].values()))
+
     def make_queue_run(
         self,
         root: Path,
@@ -191,11 +302,111 @@ class TestNL2RepoDashboard(unittest.TestCase):
         self.assertEqual(first["summary"]["queued"], 1)
         self.assertEqual(first["summary"]["active"], 1)
         self.assertEqual(first["summary"]["rewards_completed"], 1)
+        self.assertEqual(first["summary"]["code_quality"], 81.82)
+        self.assertEqual(first["summary"]["coverage"], 1.0)
+        self.assertEqual(first["summary"]["protocol_yield"], 1.0)
+        self.assertEqual(first["summary"]["effective_quality"], 81.82)
         done = next(task for task in first["tasks"] if task["task"] == "done")
         self.assertEqual(done["quality_score"], 81.82)
+        self.assertEqual(done["code_quality_score"], 81.82)
+        self.assertEqual(done["protocol_status"], "passed")
+        self.assertEqual(done["effective_quality_score"], 81.82)
         self.assertEqual((done["passed"], done["expected"]), (9, 11))
         self.assertTrue(done["rescored"])
         self.assertEqual(second["summary"]["model_calls"], 2)
+
+    def test_v2_summary_separates_code_protocol_and_effective_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_json(
+                root / "run-metadata.json",
+                {
+                    "run_id": "v2-run",
+                    "tasks": ["protocol-pass", "protocol-fail", "legacy-skip"],
+                    "modes": ["forced-team"],
+                },
+            )
+            common = {
+                "agent_ok": True,
+                "integrity_ok": True,
+                "hidden_tests": {
+                    "pytest": {
+                        "expected": 4,
+                        "passed": 3,
+                        "failed": 1,
+                        "errors": 0,
+                        "quality_score": 75.0,
+                        "returncode": 1,
+                        "all_passed": False,
+                    }
+                },
+            }
+            write_json(
+                root / "protocol-pass" / "forced-team" / "result.json",
+                {
+                    **common,
+                    "quality_score": 75.0,
+                    "result_schema_version": 2,
+                    "code_quality_score": 75.0,
+                    "protocol_ok": True,
+                    "protocol_status": "passed",
+                    "protocol_credit": 1.0,
+                    "delivery_valid": True,
+                    "effective_quality_score": 75.0,
+                    "reward_outcome": "scored",
+                    "reward_score_valid": True,
+                    "metric_eligibility": {
+                        "code_quality": True,
+                        "protocol_yield": True,
+                        "effective_quality": True,
+                    },
+                },
+            )
+            write_json(
+                root / "protocol-fail" / "forced-team" / "result.json",
+                {
+                    **common,
+                    "quality_score": 75.0,
+                    "result_schema_version": 2,
+                    "code_quality_score": 75.0,
+                    "protocol_ok": False,
+                    "protocol_status": "failed",
+                    "protocol_credit": 0.0,
+                    "delivery_valid": True,
+                    "effective_quality_score": 0.0,
+                    "reward_outcome": "scored",
+                    "reward_score_valid": True,
+                    "metric_eligibility": {
+                        "code_quality": True,
+                        "protocol_yield": True,
+                        "effective_quality": True,
+                    },
+                },
+            )
+            write_json(
+                root / "legacy-skip" / "forced-team" / "result.json",
+                {
+                    **common,
+                    "quality_score": 0.0,
+                    "protocol_ok": False,
+                    "reward_skipped": True,
+                    "hidden_tests": {
+                        "skipped": True,
+                        "pytest": common["hidden_tests"]["pytest"],
+                    },
+                },
+            )
+
+            state = dashboard.DashboardStore(root).state()
+
+        self.assertEqual(state["summary"]["code_quality"], 75.0)
+        self.assertAlmostEqual(state["summary"]["coverage"], 2 / 3)
+        self.assertAlmostEqual(state["summary"]["protocol_yield"], 1 / 3)
+        self.assertEqual(state["summary"]["effective_quality"], 25.0)
+        legacy = next(task for task in state["tasks"] if task["task"] == "legacy-skip")
+        self.assertEqual(legacy["reward_outcome"], "protocol_skipped_legacy")
+        self.assertIsNone(legacy["code_quality_score"])
+        self.assertEqual(legacy["effective_quality_score"], 0.0)
 
     def test_task_detail_and_infrastructure_error_are_separate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,6 +422,37 @@ class TestNL2RepoDashboard(unittest.TestCase):
         self.assertEqual(detail["task"]["infrastructure_error"], "score image build failed")
         self.assertIn("nine passed", detail["hidden_log"])
         self.assertEqual(len(detail["recent_events"]), 3)
+
+    def test_v2_candidate_failure_is_not_reclassified_by_stale_hidden_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make_run(Path(tmp))
+            result_path = root / "done" / "adaptive" / "result.json"
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result.update(
+                {
+                    "result_schema_version": 2,
+                    "failure_domain": "candidate",
+                    "failure_class": "rollout_failure",
+                    "is_infrastructure": False,
+                    "retryable": False,
+                    "reward_outcome": "missing_artifact",
+                    "reward_score_valid": False,
+                    "metric_eligibility": {
+                        "code_quality": False,
+                        "protocol_yield": True,
+                        "effective_quality": True,
+                    },
+                }
+            )
+            result["hidden_tests"]["error"] = "legacy rollout error"
+            write_json(result_path, result)
+
+            detail = dashboard.DashboardStore(root).task_detail("done")
+
+        self.assertEqual(detail["task"]["status"], "scored")
+        self.assertEqual(detail["task"]["failure_domain"], "candidate")
+        self.assertFalse(detail["task"]["is_infrastructure"])
+        self.assertIsNone(detail["task"]["infrastructure_error"])
 
     def test_task_detail_exposes_actor_aware_team_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,7 +586,7 @@ class TestNL2RepoDashboard(unittest.TestCase):
         self.assertTrue(state["summary"]["queue_low"])
         self.assertEqual(statuses, {"waiting": "queued", "working": "running"})
 
-    def test_dashboard_reads_and_updates_dynamic_concurrency(self) -> None:
+    def test_dashboard_reads_dynamic_concurrency_but_rejects_per_run_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_json(
@@ -384,17 +626,39 @@ class TestNL2RepoDashboard(unittest.TestCase):
                 )
             store = dashboard.DashboardStore(root)
             before = store.state()
-            configured = store.set_concurrency(rollout=16, reward=0)
+            with self.assertRaisesRegex(RuntimeError, "global_pool_supervisor.py"):
+                store.set_concurrency(rollout=16, reward=0)
             after = store.state()
-            with self.assertRaisesRegex(ValueError, "cannot exceed 64"):
-                store.set_concurrency(rollout=65)
+            with sqlite3.connect(root / "queue.sqlite3") as connection:
+                configured = connection.execute(
+                    "SELECT rollout_concurrency, reward_concurrency "
+                    "FROM worker_config WHERE id=1"
+                ).fetchone()
 
         self.assertEqual(before["run"]["rollout_concurrency"], 32)
         self.assertEqual(before["run"]["max_rollout_concurrency"], 64)
-        self.assertEqual(configured["rollout_concurrency"], 16)
-        self.assertEqual(configured["reward_concurrency"], 0)
-        self.assertEqual(after["run"]["rollout_concurrency"], 16)
-        self.assertEqual(after["run"]["reward_concurrency"], 0)
+        self.assertEqual(configured, (32, 4))
+        self.assertEqual(after["run"]["rollout_concurrency"], 32)
+        self.assertEqual(after["run"]["reward_concurrency"], 4)
+
+    def test_concurrency_post_returns_global_pool_conflict(self) -> None:
+        handler = object.__new__(dashboard.DashboardHandler)
+        handler.path = "/api/concurrency"
+        response: dict[str, object] = {}
+
+        def capture(value: object, status: object = dashboard.HTTPStatus.OK) -> None:
+            response.update({"value": value, "status": status})
+
+        handler._send_json = capture
+        handler.do_POST()
+
+        self.assertEqual(response["status"], dashboard.HTTPStatus.CONFLICT)
+        payload = response["value"]
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["code"], "global_pool_managed")
+        self.assertEqual(payload["global_state_endpoint"], "/api/global")
+        self.assertIn("global_pool_supervisor.py", payload["error"])
 
     def test_requeued_case_ignores_scheduler_events_from_previous_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

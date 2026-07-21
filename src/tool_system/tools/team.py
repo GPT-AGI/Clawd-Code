@@ -4,12 +4,77 @@ import uuid
 from typing import Any
 
 from ...teammate.control import cancel_team, resume_teammate, stop_teammate
-from ...teammate.models import AgentRecord
+from ...teammate.models import AgentRecord, utc_now
 from ...teammate.worktree import TeammateWorktreeManager
 from ..context import ToolContext
 from ..errors import ToolInputError
 from ..protocol import ToolResult
 from ..registry import ToolSpec
+
+
+def _team_protocol_version(team: dict[str, Any] | None) -> int:
+    value = team or {}
+    settings = value.get("settings") if isinstance(value.get("settings"), dict) else {}
+    quality = (
+        settings.get("quality_gates")
+        if isinstance(settings.get("quality_gates"), dict)
+        else {}
+    )
+    versions = [1]
+    for raw in (
+        value.get("protocol_version"),
+        settings.get("protocol_version"),
+        quality.get("protocol_version"),
+    ):
+        try:
+            versions.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return max(versions)
+
+
+def _reject_v2_incremental_mutation(context: ToolContext, tool_name: str) -> None:
+    if _team_protocol_version(context.team) >= 2:
+        raise ToolInputError(
+            f"{tool_name} cannot mutate a protocol v2 team; submit a complete "
+            "TeamPlan replacement instead. If the current non-terminal plan must "
+            "be restarted, call TeamReplan first; TeamAbort is terminal and must "
+            "not be used as a restart operation"
+        )
+
+
+def _strict_v2(team: Any) -> bool:
+    settings = team.settings if isinstance(team.settings, dict) else {}
+    quality = (
+        settings.get("quality_gates")
+        if isinstance(settings.get("quality_gates"), dict)
+        else {}
+    )
+    versions = [1]
+    for raw in (
+        getattr(team, "protocol_version", 1),
+        settings.get("protocol_version"),
+        quality.get("protocol_version"),
+    ):
+        try:
+            versions.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return bool(quality.get("strict")) and max(versions) >= 2
+
+
+def _active_team_work(context: ToolContext, team_id: str) -> tuple[list[str], list[str]]:
+    active_tasks = [
+        str(task.get("key") or task_id)
+        for task_id, task in context.team_store.load_tasks(team_id).items()
+        if task.get("status") == "in_progress"
+    ]
+    running_agents = [
+        agent.name
+        for agent in context.team_store.list_agents(team_id)
+        if agent.status in {"running", "stopping"}
+    ]
+    return active_tasks, running_agents
 
 
 class TeamCreateTool:
@@ -19,8 +84,8 @@ class TeamCreateTool:
             description=(
                 "Create a team only when the lead decides delegation is worth its cost. "
                 "The lead chooses the team shape; no fixed roles or topology are required. "
-                "After creation, add teammates and owned tasks, then call TeamRun; creating "
-                "a team does not start any worker."
+                "For quality-gated work, follow creation with one atomic TeamPlan and TeamRun. "
+                "Creating a team does not start any worker."
             ),
             input_schema={
                 "type": "object",
@@ -52,6 +117,20 @@ class TeamCreateTool:
         try:
             team = context.team_store.create_team(team_name.strip(), description, agent_type)
         except ValueError as exc:
+            active = context.team_store.load_active_team()
+            if active is not None and _strict_v2(active):
+                lifecycle = str(active.lifecycle_state or active.status)
+                if lifecycle in {"completed", "aborted", "budget_exhausted"}:
+                    raise ToolInputError(
+                        f"active strict team is terminal (lifecycle={lifecycle}) and "
+                        "cannot be replaced inside this rollout; preserve it for scoring "
+                        "and start a new top-level rollout"
+                    ) from exc
+                raise ToolInputError(
+                    "an active recoverable strict team already exists; call TeamReplan "
+                    "to request a fresh complete TeamPlan while preserving the workspace. "
+                    "Do not call TeamAbort or delete files merely to restart"
+                ) from exc
             raise ToolInputError(str(exc)) from exc
         if bool(tool_input.get("quality_gates", False)):
             team.settings["quality_gates"] = {
@@ -71,41 +150,39 @@ class TeamCreateTool:
                 "lead_agent_id": team.lead_agent_id,
                 "team_started": False,
                 "quality_gates": bool(tool_input.get("quality_gates", False)),
-                "next_required_actions": [
-                    *(
-                        [
-                            {
-                                "tool": "TeamConfigure",
-                                "instruction": (
-                                    "Define the architecture contract and install/import/"
-                                    "integration validation commands before TeamRun."
-                                ),
-                            }
-                        ]
-                        if bool(tool_input.get("quality_gates", False))
-                        else []
-                    ),
-                    {
-                        "tool": "TeammateCreate",
-                        "instruction": (
-                            "Create at least two task-specific workers with distinct owned work."
-                            if bool(tool_input.get("quality_gates", False))
-                            else "Create each task-specific worker with its role and tool allowlist."
-                        ),
-                    },
-                    {
-                        "tool": "TaskCreate",
-                        "instruction": (
-                            "Create at least two initially runnable tasks with ownedFiles and acceptanceChecks."
-                            if bool(tool_input.get("quality_gates", False))
-                            else "Create at least one task owned by a teammate."
-                        ),
-                    },
-                    {
-                        "tool": "TeamRun",
-                        "instruction": "Run the owned tasks; team and teammate creation alone do not start workers.",
-                    },
-                ],
+                "next_required_actions": (
+                    [
+                        {
+                            "tool": "TeamPlan",
+                            "instruction": (
+                                "Atomically define the contract, real workers, owned tasks, "
+                                "acceptance checks, validation, and execution settings."
+                            ),
+                        },
+                        {
+                            "tool": "TeamRun",
+                            "instruction": (
+                                "Run the committed plan; protocol v2 performs acceptance "
+                                "and final verification automatically."
+                            ),
+                        },
+                    ]
+                    if bool(tool_input.get("quality_gates", False))
+                    else [
+                        {
+                            "tool": "TeammateCreate",
+                            "instruction": "Create each task-specific worker with its role and tool allowlist.",
+                        },
+                        {
+                            "tool": "TaskCreate",
+                            "instruction": "Create at least one task owned by a teammate.",
+                        },
+                        {
+                            "tool": "TeamRun",
+                            "instruction": "Run the owned tasks; team creation alone does not start workers.",
+                        },
+                    ]
+                ),
             },
         )
 
@@ -145,6 +222,7 @@ class TeamConfigureTool:
             raise ToolInputError("only the lead may configure team quality gates")
         if context.team is None:
             raise ToolInputError("no active team")
+        _reject_v2_incremental_mutation(context, "TeamConfigure")
         values: dict[str, str] = {}
         for name in (
             "architecture_contract",
@@ -238,6 +316,7 @@ class TeammateCreateTool:
                 "no active team: call TeamCreate first, then retry TeammateCreate; "
                 "afterward create an owned task and call TeamRun"
             )
+        _reject_v2_incremental_mutation(context, "TeammateCreate")
         name = tool_input.get("name")
         role = tool_input.get("role")
         instructions = tool_input.get("instructions")
@@ -371,13 +450,48 @@ def _run_options(tool_input: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def _add_recovery_guidance(output: dict[str, Any]) -> dict[str, Any]:
+    status = str(output.get("status") or "")
+    guided = dict(output)
+    if status == "repair_required":
+        guided["recovery_guidance"] = (
+            "Stop active workers and call TeamReplan first so the current workspace and "
+            "artifacts are checkpointed, then submit one complete replacement TeamPlan "
+            "revision and call TeamRun. Do not use TeamAbort for restart."
+        )
+    elif status in {"failed", "blocked", "cancelled"}:
+        guided["recovery_guidance"] = (
+            "This non-terminal team may be recoverable. After active workers stop, call "
+            "TeamReplan for a fresh complete plan while preserving the workspace. "
+            "TeamAbort is only for an intentional terminal failed outcome."
+        )
+    elif status == "paused":
+        guided["recovery_guidance"] = (
+            "Call TeamResume for a transient pause. If the plan itself must change, call "
+            "TeamReplan; both preserve the workspace. Do not use TeamAbort for restart."
+        )
+    elif status == "aborted":
+        guided["recovery_guidance"] = (
+            "This team is terminal and cannot be resumed or replanned."
+        )
+    elif status == "budget_exhausted":
+        guided["recovery_guidance"] = (
+            "This rollout exhausted its frozen execution budget and is terminal. "
+            "The workspace is preserved for scoring, but TeamResume and TeamReplan "
+            "cannot add budget; start a new top-level rollout if more work is required."
+        )
+    return guided
+
+
 class TeamRunTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TeamRun",
             description=(
                 "Run ready teammate tasks with optional parallelism, retries, leases, budgets, "
-                "and a batch limit so the lead can inspect and adapt the team between batches."
+                "and a batch limit so the lead can inspect and adapt the team between batches. "
+                "For protocol v2, this also runs task acceptance and final Team verification "
+                "automatically, returning completed or repair_required."
             ),
             input_schema={
                 "type": "object",
@@ -394,11 +508,21 @@ class TeamRunTool:
             raise ToolInputError("no active team")
         if context.teammate_runtime is None:
             raise ToolInputError("teammate runtime is not configured")
-        output = context.teammate_runtime.run_team(context, **_run_options(tool_input))
+        output = _add_recovery_guidance(
+            context.teammate_runtime.run_team(context, **_run_options(tool_input))
+        )
         return ToolResult(
             name="TeamRun",
             output=output,
-            is_error=output.get("status") in {"failed", "blocked", "cancelled"},
+            is_error=output.get("status")
+            in {
+                "failed",
+                "blocked",
+                "cancelled",
+                "aborted",
+                "budget_exhausted",
+                "repair_required",
+            },
         )
 
 
@@ -408,7 +532,9 @@ class TeamVerifyTool:
             name="TeamVerify",
             description=(
                 "Run the configured clean-install, import-smoke, and integration checks. "
-                "A strict team cannot become completed until all three checks pass."
+                "A strict team cannot become completed until all three checks pass. Protocol "
+                "v2 normally invokes this automatically through TeamRun; repeated calls after "
+                "success are idempotent."
             ),
             input_schema={
                 "type": "object",
@@ -463,17 +589,27 @@ class TeamResumeTool:
             raise ToolInputError("no active team")
         if context.teammate_runtime is None:
             raise ToolInputError("teammate runtime is not configured")
-        output = context.teammate_runtime.run_team(
-            context,
-            resume=True,
-            retry_failed=bool(tool_input.get("retry_failed", True)),
-            retry_cancelled=bool(tool_input.get("retry_cancelled", True)),
-            **_run_options(tool_input),
+        output = _add_recovery_guidance(
+            context.teammate_runtime.run_team(
+                context,
+                resume=True,
+                retry_failed=bool(tool_input.get("retry_failed", True)),
+                retry_cancelled=bool(tool_input.get("retry_cancelled", True)),
+                **_run_options(tool_input),
+            )
         )
         return ToolResult(
             name="TeamResume",
             output=output,
-            is_error=output.get("status") in {"failed", "blocked", "cancelled"},
+            is_error=output.get("status")
+            in {
+                "failed",
+                "blocked",
+                "cancelled",
+                "aborted",
+                "budget_exhausted",
+                "repair_required",
+            },
         )
 
 
@@ -481,7 +617,11 @@ class TeamCancelTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TeamCancel",
-            description="Request cooperative cancellation of the active team without deleting its state.",
+            description=(
+                "Request cooperative cancellation of active workers without deleting team "
+                "state or workspace artifacts. For a strict-team restart, wait for workers "
+                "to stop and then call TeamReplan; TeamAbort is terminal."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -501,6 +641,16 @@ class TeamCancelTool:
         except ValueError as exc:
             raise ToolInputError(str(exc)) from exc
         context.reload_team_state()
+        if _team_protocol_version(context.team) >= 2:
+            output = {
+                **output,
+                "terminal": False,
+                "artifacts_preserved": True,
+                "next_required_action": (
+                    "Wait for active workers to stop, then call TeamReplan for a "
+                    "recoverable restart or TeamResume to continue the same plan."
+                ),
+            }
         return ToolResult(name="TeamCancel", output=output)
 
 
@@ -621,11 +771,189 @@ class TeamIntegrateTool:
         return ToolResult(name="TeamIntegrate", output=result)
 
 
+class TeamReplanTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TeamReplan",
+            description=(
+                "Request a recoverable replacement of a non-terminal strict protocol v2 "
+                "plan. This preserves the current workspace, artifacts, usage, and history; "
+                "it never deletes files or terminates the rollout. Use it before a fresh "
+                "TeamPlan when ownership, contracts, or task partitioning must change. "
+                "TeamAbort is terminal and must not be used for restart/replan."
+            ),
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "reason": {"type": "string"},
+                    "replace_completed_work": {"type": "boolean"},
+                },
+                "required": ["reason"],
+            },
+            aliases=("TeamReset",),
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may request a team replan")
+        reason = tool_input.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ToolInputError("reason must be a non-empty string")
+        replace_completed_work = tool_input.get("replace_completed_work", False)
+        if not isinstance(replace_completed_work, bool):
+            raise ToolInputError("replace_completed_work must be a boolean")
+
+        team = context.team_store.load_active_team()
+        if team is None:
+            raise ToolInputError("no active team")
+        if not _strict_v2(team):
+            raise ToolInputError(
+                "TeamReplan is only available to strict protocol v2 teams"
+            )
+        try:
+            team, checkpoint = context.team_store.request_team_replan(
+                team.team_id,
+                reason=reason.strip(),
+                replace_completed_work=replace_completed_work,
+            )
+        except ValueError as exc:
+            raise ToolInputError(str(exc)) from exc
+        context.reload_team_state()
+        return ToolResult(
+            name="TeamReplan",
+            output={
+                "status": "replan_required",
+                "team_id": team.team_id,
+                "lifecycle_state": "repair_required",
+                "reason": reason.strip(),
+                "artifacts_preserved": True,
+                "workspace_preserved": True,
+                "workspace_action": "none",
+                "checkpoint": checkpoint,
+                "next_required_action": {
+                    "tool": "TeamPlan",
+                    "instruction": (
+                        "Submit one complete replacement plan against the checkpointed "
+                        "revision. Reuse the existing workspace; do not delete or recreate it."
+                    ),
+                },
+            },
+        )
+
+
+class TeamAbortTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="TeamAbort",
+            description=(
+                "Explicitly terminate an unrecoverable strict protocol v2 team while "
+                "preserving its active state and artifacts for scoring and diagnosis. "
+                "This is a terminal failure outcome: it cannot be resumed or replanned. "
+                "For restart or a fresh plan, use TeamReplan instead."
+            ),
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"reason": {"type": "string"}},
+                "required": ["reason"],
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.actor_id is not None:
+            raise ToolInputError("only the lead may abort a team")
+        reason = tool_input.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ToolInputError("reason must be a non-empty string")
+        team = context.team_store.load_active_team()
+        if team is None:
+            raise ToolInputError("no active team")
+        if not _strict_v2(team):
+            raise ToolInputError("TeamAbort is only available to strict protocol v2 teams")
+        if team.lifecycle_state == "completed":
+            raise ToolInputError(
+                "a completed team cannot be aborted or reopened; preserve it for scoring"
+            )
+        if team.lifecycle_state == "budget_exhausted":
+            return ToolResult(
+                name="TeamAbort",
+                output={
+                    "status": "budget_exhausted",
+                    "team_id": team.team_id,
+                    "lifecycle_state": "budget_exhausted",
+                    "artifacts_preserved": True,
+                    "terminal": True,
+                    "already_terminal": True,
+                },
+                is_error=True,
+            )
+        if team.lifecycle_state == "aborted":
+            return ToolResult(
+                name="TeamAbort",
+                output={
+                    "status": "aborted",
+                    "team_id": team.team_id,
+                    "lifecycle_state": "aborted",
+                    "artifacts_preserved": True,
+                    "terminal": True,
+                    "already_aborted": True,
+                },
+            )
+        active_tasks, running_agents = _active_team_work(context, team.team_id)
+        if active_tasks or running_agents:
+            details = []
+            if active_tasks:
+                details.append("active tasks: " + ", ".join(active_tasks))
+            if running_agents:
+                details.append("running teammates: " + ", ".join(running_agents))
+            raise ToolInputError(
+                "cannot abort while workers are active. For recovery, call TeamCancel, "
+                "wait for cooperative shutdown, then call TeamReplan. Call TeamAbort "
+                "after shutdown only when a terminal failed outcome is intended ("
+                + "; ".join(details)
+                + ")"
+            )
+        if team.status != "cancelled":
+            team.transition_to("cancelled")
+        team.set_lifecycle_state("aborted")
+        team.cancel_requested_at = team.cancel_requested_at or utc_now()
+        context.team_store.save_team(team)
+        context.team_store.append_event(
+            team.team_id,
+            "team.aborted",
+            {"reason": reason.strip(), "usage": team.usage},
+        )
+        context.reload_team_state()
+        return ToolResult(
+            name="TeamAbort",
+            output={
+                "status": "aborted",
+                "team_id": team.team_id,
+                "lifecycle_state": "aborted",
+                "reason": reason.strip(),
+                "artifacts_preserved": True,
+                "terminal": True,
+                "replan_allowed": False,
+            },
+        )
+
+
 class TeamDeleteTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="TeamDelete",
-            description="Disband the current team context.",
+            description=(
+                "Disband a legacy team context. Strict protocol v2 teams retain their state "
+                "for scoring. Recoverable strict teams use TeamReplan; TeamAbort is only "
+                "for an intentional terminal failed outcome."
+            ),
             input_schema={"type": "object", "additionalProperties": False, "properties": {}},
             is_read_only=False,
             max_result_size_chars=100_000,
@@ -635,6 +963,51 @@ class TeamDeleteTool:
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
         if context.team is None:
             return ToolResult(name="TeamDelete", output={"success": False, "message": "No active team"})
+        team_settings = context.team.get("settings") or {}
+        quality = dict(team_settings.get("quality_gates") or {})
+        versions = [1]
+        for raw_version in (
+            context.team.get("protocol_version"),
+            team_settings.get("protocol_version"),
+            quality.get("protocol_version"),
+        ):
+            try:
+                versions.append(int(raw_version))
+            except (TypeError, ValueError):
+                continue
+        protocol_version = max(versions)
+        lifecycle_state = str(context.team.get("lifecycle_state") or "draft")
+        if (
+            bool(quality.get("strict"))
+            and protocol_version >= 2
+        ):
+            terminal = lifecycle_state in {
+                "completed",
+                "aborted",
+                "budget_exhausted",
+            }
+            return ToolResult(
+                name="TeamDelete",
+                output={
+                    "success": False,
+                    "status": "blocked",
+                    "message": (
+                        "TeamDelete is disabled for strict protocol v2 because its active "
+                        "state, workspace, and artifacts must remain available for scoring. "
+                        + (
+                            "This team is terminal and cannot be reopened."
+                            if terminal
+                            else "Call TeamReplan for a recoverable fresh plan; do not use "
+                            "TeamAbort as a restart operation."
+                        )
+                    ),
+                    "team_id": context.team.get("team_id"),
+                    "lifecycle_state": lifecycle_state,
+                    "artifacts_preserved": True,
+                    "next_required_action": None if terminal else "TeamReplan",
+                },
+                is_error=True,
+            )
         team_name = context.team.get("team_name")
         retained_worktrees: list[str] = []
         for agent in context.team_store.list_agents(str(context.team["team_id"])):

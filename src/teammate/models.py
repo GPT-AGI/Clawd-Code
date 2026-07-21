@@ -34,6 +34,11 @@ class Team:
     description: str | None = None
     agent_type: str | None = None
     status: str = "created"
+    protocol_version: int = 1
+    # ``status`` is the original coarse-grained state and remains the compatibility
+    # surface for v1 callers.  Protocol v2 persists its finer state machine here so
+    # a process restart cannot accidentally turn verification/repair into success.
+    lifecycle_state: str | None = None
     settings: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, int] = field(default_factory=dict)
     cancel_requested_at: str | None = None
@@ -41,16 +46,60 @@ class Team:
     completed_at: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 2
+    schema_version: int = 3
+
+    LIFECYCLE_STATES: ClassVar[set[str]] = {
+        "draft",
+        "ready",
+        "running",
+        "awaiting_verification",
+        "verifying",
+        "repair_required",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "aborted",
+        "budget_exhausted",
+    }
+    STATUS_LIFECYCLE: ClassVar[dict[str, str]] = {
+        "created": "draft",
+        "running": "running",
+        "completed": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "team")
+        if self.protocol_version < 1:
+            raise ValueError("team protocol_version must be at least 1")
+        if self.lifecycle_state is None:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[self.status]
+        elif self.lifecycle_state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid team lifecycle state {self.lifecycle_state!r}; "
+                f"expected one of: {choices}"
+            )
 
     def transition_to(self, status: str) -> None:
         _require_status(status, self.STATUSES, "team")
         if status != self.status and status not in self.TRANSITIONS[self.status]:
             raise ValueError(f"cannot transition team from {self.status!r} to {status!r}")
+        changed = status != self.status
         self.status = status
+        if changed:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[status]
+        self.updated_at = utc_now()
+
+    def set_lifecycle_state(self, state: str) -> None:
+        if state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid team lifecycle state {state!r}; expected one of: {choices}"
+            )
+        self.lifecycle_state = state
         self.updated_at = utc_now()
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,7 +107,13 @@ class Team:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Team":
-        return cls(**{key: data[key] for key in cls.__dataclass_fields__ if key in data})
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        if "lifecycle_state" not in values:
+            values["lifecycle_state"] = cls.STATUS_LIFECYCLE.get(
+                str(values.get("status") or "created"), "draft"
+            )
+        values["schema_version"] = 3
+        return cls(**values)
 
 
 @dataclass
@@ -145,6 +200,10 @@ class TeamTask:
     key: str | None = None
     activeForm: str = ""
     status: str = "pending"
+    # v2 distinguishes a worker's delivery (produced) from harness acceptance.
+    # The legacy status remains ``completed`` for both states so v1 tools and task
+    # dependency stores continue to round-trip unchanged.
+    lifecycle_state: str | None = None
     owner: str | None = None
     blocks: list[str] = field(default_factory=list)
     blockedBy: list[str] = field(default_factory=list)
@@ -163,16 +222,52 @@ class TeamTask:
     last_error: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
-    schema_version: int = 3
+    schema_version: int = 4
+
+    LIFECYCLE_STATES: ClassVar[set[str]] = {
+        "pending",
+        "in_progress",
+        "produced",
+        "accepted",
+        "failed",
+        "cancelled",
+    }
+    STATUS_LIFECYCLE: ClassVar[dict[str, str]] = {
+        "pending": "pending",
+        "in_progress": "in_progress",
+        "completed": "produced",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }
 
     def __post_init__(self) -> None:
         _require_status(self.status, self.STATUSES, "task")
+        if self.lifecycle_state is None:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[self.status]
+        elif self.lifecycle_state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid task lifecycle state {self.lifecycle_state!r}; "
+                f"expected one of: {choices}"
+            )
 
     def transition_to(self, status: str) -> None:
         _require_status(status, self.STATUSES, "task")
         if status != self.status and status not in self.TRANSITIONS[self.status]:
             raise ValueError(f"cannot transition task from {self.status!r} to {status!r}")
+        changed = status != self.status
         self.status = status
+        if changed:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[status]
+        self.updated_at = utc_now()
+
+    def set_lifecycle_state(self, state: str) -> None:
+        if state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid task lifecycle state {state!r}; expected one of: {choices}"
+            )
+        self.lifecycle_state = state
         self.updated_at = utc_now()
 
     def to_dict(self) -> dict[str, Any]:
@@ -181,7 +276,11 @@ class TeamTask:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TeamTask":
         values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
-        values["schema_version"] = 3
+        if "lifecycle_state" not in values:
+            values["lifecycle_state"] = cls.STATUS_LIFECYCLE.get(
+                str(values.get("status") or "pending"), "pending"
+            )
+        values["schema_version"] = 4
         return cls(**values)
 
 

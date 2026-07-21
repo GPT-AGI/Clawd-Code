@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
+import fcntl
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -10,7 +14,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.execution.backend import CommandOutcome
+from src.teammate.models import TeamTask
 from src.tool_system.agent_loop import AgentLoopResult, ToolEvent
+from src.tool_system.context import ToolContext
+from src.tool_system.tools import TeamCreateTool, TeamPlanTool
 
 
 MODULE_PATH = (
@@ -40,6 +47,149 @@ class TestNL2RepoPilot(unittest.TestCase):
         )
         (task_dir / "test_files.json").write_text(json.dumps(["tests"]), encoding="utf-8")
         return root
+
+    def test_legacy_pool_cli_is_disabled_before_upstream_resolution(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(MODULE_PATH)],
+            cwd=MODULE_PATH.parents[2],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("direct benchmark.py rollout/reward pools are disabled", completed.stderr)
+        self.assertNotIn("NL2Repo checkout", completed.stderr)
+
+        child = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "_run-one"],
+            cwd=MODULE_PATH.parents[2],
+            capture_output=True,
+            text=True,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key != benchmark.GLOBAL_POOL_WORKER_ENV
+            },
+        )
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn("direct 'benchmark.py _run-one' is disabled", child.stderr)
+
+    def test_private_child_requires_supervisor_marker_and_live_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "global-pool.lock"
+            lock_path.write_text(json.dumps({"pid": 31337}), encoding="utf-8")
+            with lock_path.open("r+", encoding="utf-8") as owner:
+                fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(SystemExit, "must be launched"):
+                    benchmark.enforce_child_launch_policy(
+                        ["_run-one"], environ={}, lock_path=lock_path
+                    )
+                with patch.object(
+                    benchmark, "_process_parent_pid", return_value=31337
+                ):
+                    benchmark.enforce_child_launch_policy(
+                        ["_run-one"],
+                        environ={
+                            benchmark.GLOBAL_POOL_WORKER_ENV:
+                                benchmark.GLOBAL_POOL_WORKER_MARKER
+                        },
+                        lock_path=lock_path,
+                        parent_pid=4242,
+                    )
+                with patch.object(
+                    benchmark, "_process_parent_pid", return_value=99999
+                ):
+                    with self.assertRaisesRegex(SystemExit, "must be launched"):
+                        benchmark.enforce_child_launch_policy(
+                            ["_run-one"],
+                            environ={
+                                benchmark.GLOBAL_POOL_WORKER_ENV:
+                                    benchmark.GLOBAL_POOL_WORKER_MARKER
+                            },
+                            lock_path=lock_path,
+                            parent_pid=4242,
+                        )
+                fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
+
+            with self.assertRaisesRegex(SystemExit, "must be launched"):
+                benchmark.enforce_child_launch_policy(
+                    ["_run-one"],
+                    environ={
+                        benchmark.GLOBAL_POOL_WORKER_ENV:
+                            benchmark.GLOBAL_POOL_WORKER_MARKER
+                    },
+                    lock_path=lock_path,
+                )
+
+    def test_agent_child_watchdog_signals_when_queue_parent_disappears(self) -> None:
+        stop_event = threading.Event()
+        orphaned = threading.Event()
+        thread = benchmark.start_parent_watchdog(
+            4242,
+            stop_event,
+            interval_s=0.001,
+            on_orphan=orphaned.set,
+            parent_pid_loader=lambda: 9999,
+        )
+        self.assertTrue(orphaned.wait(1))
+        stop_event.set()
+        thread.join(timeout=1)
+
+    def test_private_child_parent_must_be_a_registered_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "global-pool.lock"
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "pid": 100,
+                        "runs": ["/tmp/run"],
+                        "worker_pids": [4242],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with lock_path.open("r+", encoding="utf-8") as owner:
+                fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                environment = {
+                    benchmark.GLOBAL_POOL_WORKER_ENV:
+                        benchmark.GLOBAL_POOL_WORKER_MARKER
+                }
+                benchmark.enforce_child_launch_policy(
+                    ["_run-one"],
+                    environ=environment,
+                    lock_path=lock_path,
+                    parent_pid=4242,
+                )
+                with self.assertRaisesRegex(SystemExit, "must be launched"):
+                    benchmark.enforce_child_launch_policy(
+                        ["_run-one"],
+                        environ=environment,
+                        lock_path=lock_path,
+                        parent_pid=9999,
+                    )
+
+    def test_metadata_only_cli_actions_do_not_use_legacy_pool(self) -> None:
+        for action in ("list", "plan", "validate"):
+            args = type(
+                "Args",
+                (),
+                {
+                    "list": action == "list",
+                    "plan": action == "plan",
+                    "validate": action == "validate",
+                    "rescore": False,
+                },
+            )()
+            benchmark.enforce_top_level_pool_policy(args)
+
+        rescore = type(
+            "Args",
+            (),
+            {"list": False, "plan": False, "validate": False, "rescore": True},
+        )()
+        with self.assertRaisesRegex(SystemExit, "global_pool_supervisor.py"):
+            benchmark.enforce_top_level_pool_policy(rescore)
 
     def test_load_task_reads_external_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -73,14 +223,15 @@ class TestNL2RepoPilot(unittest.TestCase):
     def test_forced_team_prompt_uses_the_harness_precreated_team(self) -> None:
         prompt = benchmark.build_prompt("forced-team")
 
-        self.assertIn("harness has already created the active strict Team", prompt)
+        self.assertIn("harness has already created the active strict", prompt)
+        self.assertIn("protocol-v2 Team", prompt)
         self.assertIn("Do not call TeamCreate", prompt)
-        self.assertIn("must call TeammateCreate", prompt)
-        self.assertIn("TaskCreate", prompt)
+        self.assertIn("one atomic TeamPlan", prompt)
         self.assertIn("TeamRun", prompt)
-        self.assertIn("TeamConfigure", prompt)
-        self.assertIn("TeamVerify", prompt)
-        self.assertIn("at least two teammates", prompt)
+        self.assertIn("exactly two real implementation workers", prompt)
+        self.assertIn("acceptance_checks", prompt)
+        self.assertIn("verification automatically", prompt)
+        self.assertIn("TeamAbort", prompt)
 
     def test_failure_classifier_distinguishes_dependency_and_team_contract_failures(self) -> None:
         base = {
@@ -239,13 +390,23 @@ class TestNL2RepoPilot(unittest.TestCase):
     def test_prompt_leaves_topology_to_the_lead(self) -> None:
         adaptive = benchmark.build_prompt("adaptive")
         adaptive_v2 = benchmark.build_prompt("adaptive-team-v2")
-        forced = benchmark.build_prompt("forced-team")
+        forced = benchmark.build_prompt(
+            "forced-team",
+            teammate_max_turns=40,
+            max_output_tokens=4_096,
+            team_timeout_s=1_800,
+        )
 
         self.assertIn("valid to remain solo", adaptive)
         self.assertIn("at least two substantially independent", adaptive_v2)
-        self.assertIn("at most two teammates", adaptive_v2)
+        self.assertIn("exactly two real", adaptive_v2)
+        self.assertIn("TeamPlan -> TeamRun", adaptive_v2)
         self.assertIn("valid to complete", adaptive_v2)
-        self.assertIn("at least two teammates", forced)
+        self.assertIn("exactly two real implementation workers", forced)
+        self.assertIn("timeout_s=1800", forced)
+        self.assertIn("token_budget=1310720", forced)
+        self.assertIn("turn_budget=80", forced)
+        self.assertIn("rollout-wide caps", forced)
         self.assertIn("must be your runtime decision", adaptive)
         self.assertNotIn("planner", adaptive.lower())
 
@@ -256,6 +417,102 @@ class TestNL2RepoPilot(unittest.TestCase):
                 {"present": False},
             )
         )
+
+    def test_adaptive_team_v2_rejects_a_legacy_incremental_team(self) -> None:
+        self.assertFalse(
+            benchmark._protocol_ok(
+                "adaptive-team-v2",
+                {
+                    "present": True,
+                    "protocol_version": 1,
+                    "status": "completed",
+                    "agents": [{}, {}],
+                    "tasks": 2,
+                    "completed_tasks": 2,
+                    "quality_gates": {
+                        "strict": True,
+                        "configured": True,
+                        "plan_accepted": True,
+                        "validation_status": "passed",
+                    },
+                },
+            )
+        )
+
+    def test_protocol_v2_requires_every_task_to_be_harness_accepted(self) -> None:
+        team = {
+            "present": True,
+            "protocol_version": 2,
+            "status": "completed",
+            "lifecycle_state": "completed",
+            "agents": [{}, {}],
+            "tasks": 3,
+            "completed_tasks": 3,
+            "accepted_tasks": 2,
+            "attempted_tasks": 3,
+            "produced_tasks": 3,
+            "plan_revision": 1,
+            "plan_hash": "sha256",
+            "plan_hash_valid": True,
+            "manifest_valid": True,
+            "quality_gates": {
+                "strict": True,
+                "configured": True,
+                "plan_accepted": True,
+                "validation_status": "passed",
+            },
+        }
+
+        self.assertFalse(benchmark._protocol_ok("forced-team", team))
+        team["accepted_tasks"] = 3
+        self.assertTrue(benchmark._protocol_ok("forced-team", team))
+
+    def test_team_metrics_counts_only_accepted_completed_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            team_id = "team-v2"
+            team = {
+                "team_id": team_id,
+                "lead_agent_id": "lead",
+                "status": "completed",
+                "protocol_version": 2,
+                "lifecycle_state": "completed",
+                "settings": {
+                    "quality_gates": {
+                        "strict": True,
+                        "validation": {"status": "passed"},
+                    }
+                },
+            }
+            team_dir = workspace / ".clawd" / "teams" / team_id
+            (team_dir / "agents").mkdir(parents=True)
+            (team_dir / "messages").mkdir()
+            (workspace / ".clawd").mkdir(exist_ok=True)
+            (workspace / ".clawd" / "team.json").write_text(
+                json.dumps(team), encoding="utf-8"
+            )
+            (team_dir / "team.json").write_text(json.dumps(team), encoding="utf-8")
+            (team_dir / "tasks.json").write_text(
+                json.dumps(
+                    {
+                        "accepted": {
+                            "status": "completed",
+                            "lifecycle_state": "accepted",
+                        },
+                        "produced": {
+                            "status": "completed",
+                            "lifecycle_state": "produced",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            metrics = benchmark._team_metrics(workspace)
+
+        self.assertEqual(metrics["tasks"], 2)
+        self.assertEqual(metrics["completed_tasks"], 2)
+        self.assertEqual(metrics["accepted_tasks"], 1)
 
     def test_missing_agent_result_is_rejected_before_reward(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,6 +586,94 @@ class TestNL2RepoPilot(unittest.TestCase):
             self.assertNotIn("pip install -e .", dockerfile)
             self.assertEqual(metadata["setup_commands"], ["pip install -e ."])
             self.assertEqual(metadata["test_commands"], ["pytest tests"])
+            stats = metadata["score_context_stats"]
+            self.assertEqual(stats["source"]["file_count"], 3)
+            self.assertEqual(stats["copied"]["file_count"], 3)
+            self.assertEqual(stats["staged"]["file_count"], 1)
+            self.assertEqual(stats["staged"]["directory_count"], 1)
+            self.assertGreater(stats["limits"]["max_total_bytes"], 0)
+
+    def test_stage_score_context_rejects_symlink_before_touching_destination(self) -> None:
+        task = {
+            "image": "example.invalid/sample:1.0",
+            "hidden_paths": [],
+            "test_commands": ["pytest"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside-secret.txt"
+            outside.write_text("secret\n", encoding="utf-8")
+            (workspace / "leak.txt").symlink_to(outside)
+            destination = root / "score"
+            destination.mkdir()
+            sentinel = destination / "keep.txt"
+            sentinel.write_text("untouched\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                benchmark.stage_score_context(task, workspace, destination)
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "untouched\n")
+
+    def test_stage_score_context_ignores_cache_directories(self) -> None:
+        task = {
+            "image": "example.invalid/sample:1.0",
+            "hidden_paths": [],
+            "test_commands": ["pytest"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "package.py").write_text("VALUE = 1\n", encoding="utf-8")
+            outside = root / "outside"
+            outside.mkdir()
+            (workspace / ".git").symlink_to(outside, target_is_directory=True)
+
+            metadata = benchmark.stage_score_context(task, workspace, root / "score")
+
+            self.assertEqual(metadata["score_context_stats"]["source"]["file_count"], 1)
+            self.assertFalse((root / "score" / "workspace" / ".git").exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO unsupported")
+    def test_stage_score_context_rejects_non_regular_file(self) -> None:
+        task = {
+            "image": "example.invalid/sample:1.0",
+            "hidden_paths": [],
+            "test_commands": ["pytest"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            os.mkfifo(workspace / "unsafe.pipe")
+
+            with self.assertRaisesRegex(ValueError, "non-regular file"):
+                benchmark.stage_score_context(task, workspace, root / "score")
+
+    def test_stage_score_context_enforces_size_limits(self) -> None:
+        task = {
+            "image": "example.invalid/sample:1.0",
+            "hidden_paths": [],
+            "test_commands": ["pytest"],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "one.txt").write_bytes(b"abc")
+            (workspace / "two.txt").write_bytes(b"def")
+
+            with patch.object(benchmark, "SCORE_CONTEXT_MAX_FILES", 1):
+                with self.assertRaisesRegex(ValueError, "file-count limit"):
+                    benchmark.stage_score_context(task, workspace, root / "score-files")
+            with patch.object(benchmark, "SCORE_CONTEXT_MAX_FILE_BYTES", 2):
+                with self.assertRaisesRegex(ValueError, "file exceeds size limit"):
+                    benchmark.stage_score_context(task, workspace, root / "score-file-size")
+            with patch.object(benchmark, "SCORE_CONTEXT_MAX_TOTAL_BYTES", 5):
+                with self.assertRaisesRegex(ValueError, "total-size limit"):
+                    benchmark.stage_score_context(task, workspace, root / "score-total")
 
     def test_score_commands_continue_to_pytest_when_setup_fails(self) -> None:
         command = benchmark._score_shell_command(
@@ -339,7 +684,19 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertEqual(command, "(pip install -e .); (pytest tests)")
         self.assertNotIn("&&", command)
 
-    def test_reward_is_skipped_when_forced_team_protocol_is_incomplete(self) -> None:
+    def test_protocol_failure_still_scores_a_complete_workspace(self) -> None:
+        hidden = {
+            "pytest": {
+                "expected": 3,
+                "passed": 2,
+                "failed": 1,
+                "errors": 0,
+                "skipped": 0,
+                "returncode": 1,
+                "quality_score": 66.67,
+                "all_passed": False,
+            }
+        }
         with tempfile.TemporaryDirectory() as tmp:
             case_root = Path(tmp) / "sample" / "forced-team"
             workspace = case_root / "workspace"
@@ -357,6 +714,200 @@ class TestNL2RepoPilot(unittest.TestCase):
                 agent_timed_out=False,
                 agent_returncode=0,
             )
+            with patch.object(benchmark, "run_hidden_tests", return_value=hidden) as scorer:
+                result = benchmark.score_rollout(
+                    rollout,
+                    provider="qwen",
+                    model="test",
+                    score_timeout_s=60,
+                    keep_image=False,
+                )
+
+        scorer.assert_called_once()
+        self.assertFalse(result["reward_skipped"])
+        self.assertEqual(result["failure_class"], "team_protocol")
+        self.assertFalse(result["protocol_ok"])
+        self.assertEqual(result["result_schema_version"], 2)
+        self.assertEqual(result["code_quality_score"], 66.67)
+        self.assertEqual(result["quality_score"], 66.67)
+        self.assertEqual(result["protocol_status"], "failed")
+        self.assertEqual(result["protocol_credit"], 0.0)
+        self.assertTrue(result["delivery_valid"])
+        self.assertEqual(result["effective_quality_score"], 0.0)
+        self.assertEqual(result["reward_outcome"], "scored")
+        self.assertTrue(result["reward_score_valid"])
+        self.assertEqual(result["failure_domain"], "protocol")
+        self.assertFalse(result["is_infrastructure"])
+        self.assertFalse(result["retryable"])
+        self.assertIsNone(result["timeout_scope"])
+
+    def test_protocol_v2_requires_exact_manifest_and_real_task_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            context = ToolContext(workspace_root=workspace)
+            TeamCreateTool().run(
+                {"team_name": "metric-v2", "quality_gates": True}, context
+            )
+            planned = TeamPlanTool().run(
+                {
+                    "contract": {"summary": "two independent modules", "interfaces": []},
+                    "workers": [
+                        {"name": "worker-a", "instructions": "Implement module A."},
+                        {"name": "worker-b", "instructions": "Implement module B."},
+                    ],
+                    "tasks": [
+                        {
+                            "key": "module-a",
+                            "owner": "worker-a",
+                            "instructions": "Implement a.py.",
+                            "owned_files": ["a.py"],
+                            "acceptance_checks": ["python -m py_compile a.py"],
+                        },
+                        {
+                            "key": "module-b",
+                            "owner": "worker-b",
+                            "instructions": "Implement b.py.",
+                            "owned_files": ["b.py"],
+                            "acceptance_checks": ["python -m py_compile b.py"],
+                        },
+                    ],
+                    "validation": {
+                        "profile": "generic",
+                        "integration_command": "python -m compileall -q .",
+                    },
+                    "execution": {"timeout_s": 300},
+                },
+                context,
+            )
+            self.assertFalse(planned.is_error, planned.output)
+            team = context.team_store.load_active_team()
+            assert team is not None
+            for raw in context.team_store.load_tasks(team.team_id).values():
+                task = TeamTask.from_dict(raw)
+                task.transition_to("in_progress")
+                task.attempt = 1
+                task.transition_to("completed")
+                task.set_lifecycle_state("accepted")
+                context.team_store.update_task(team.team_id, task)
+                context.team_store.append_event(
+                    team.team_id, "task.produced", {"task_id": task.id}
+                )
+            quality = dict(team.settings["quality_gates"])
+            quality["plan_accepted"] = True
+            quality["validation"] = {"status": "passed"}
+            team.settings["quality_gates"] = quality
+            # Protocol v2 keeps frozen and effective execution values in one
+            # immutable manifest.  A runtime-enforced minimum is valid only when
+            # the same manifest records its exact requested/effective adjustment.
+            manifest = dict(team.settings["execution_manifest"])
+            manifest["status"] = "accepted"
+            manifest["effective_execution"] = dict(manifest["execution"])
+            manifest["effective_execution"]["timeout_s"] = 900.0
+            manifest["runtime_adjustments"] = {
+                "timeout_s": {
+                    "requested": 300,
+                    "effective": 900.0,
+                    "reason": "runtime minimum",
+                }
+            }
+            team.settings["execution_manifest"] = manifest
+            team.transition_to("running")
+            team.transition_to("completed")
+            context.team_store.save_team(team)
+            context.team_store.append_event(
+                team.team_id,
+                "team.options_adjusted",
+                {
+                    "timeout_s": {
+                        "requested": 300,
+                        "effective": 900.0,
+                        "reason": "runtime minimum",
+                    }
+                },
+            )
+
+            metrics = benchmark._team_metrics(workspace)
+
+            self.assertTrue(metrics["plan_hash_valid"])
+            self.assertTrue(metrics["execution_manifest_valid"])
+            self.assertTrue(metrics["manifest_valid"])
+            self.assertEqual(metrics["execution_manifest_mismatches"], [])
+            self.assertEqual(metrics["manifest_errors"], [])
+            self.assertEqual(metrics["attempted_tasks"], metrics["tasks"])
+            self.assertEqual(metrics["produced_tasks"], metrics["tasks"])
+            self.assertTrue(benchmark._protocol_ok("forced-team", metrics))
+
+            missing_evidence = dict(metrics)
+            missing_evidence["produced_tasks"] -= 1
+            self.assertFalse(benchmark._protocol_ok("forced-team", missing_evidence))
+
+            manifest = dict(team.settings["execution_manifest"])
+            manifest["effective_execution"] = dict(
+                manifest["effective_execution"]
+            )
+            manifest["effective_execution"]["timeout_s"] = 901
+            team.settings["execution_manifest"] = manifest
+            context.team_store.save_team(team)
+            undocumented_execution = benchmark._team_metrics(workspace)
+            self.assertFalse(undocumented_execution["execution_manifest_valid"])
+            self.assertFalse(undocumented_execution["manifest_valid"])
+            self.assertIn(
+                "execution.timeout_s:effective_value_mismatch",
+                undocumented_execution["manifest_errors"],
+            )
+            self.assertEqual(
+                undocumented_execution["execution_manifest_mismatches"][0]["field"],
+                "timeout_s",
+            )
+            manifest["effective_execution"]["timeout_s"] = 900.0
+            team.settings["execution_manifest"] = manifest
+            context.team_store.save_team(team)
+
+            tampered_budget_manifest = copy.deepcopy(manifest)
+            tampered_budget_manifest["budget_window"]["hard_ceiling"]["turns"] = 1
+            team.settings["execution_manifest"] = tampered_budget_manifest
+            context.team_store.save_team(team)
+            tampered_budget = benchmark._team_metrics(workspace)
+            self.assertFalse(tampered_budget["execution_manifest_valid"])
+            self.assertIn(
+                "execution.budget_window.hard_ceiling.turns:derived_value_mismatch",
+                tampered_budget["manifest_errors"],
+            )
+            team.settings["execution_manifest"] = manifest
+            context.team_store.save_team(team)
+
+            tasks = context.team_store.load_tasks(team.team_id)
+            first = next(iter(tasks.values()))
+            first["acceptance_checks"] = ["python -m compileall -q ."]
+            context.team_store.save_tasks(team.team_id, tasks)
+            tampered = benchmark._team_metrics(workspace)
+            self.assertFalse(tampered["manifest_valid"])
+            self.assertTrue(
+                any(
+                    reason.startswith("task_spec_mismatch:")
+                    for reason in tampered["manifest_errors"]
+                )
+            )
+            self.assertFalse(benchmark._protocol_ok("forced-team", tampered))
+
+    def test_invalid_delivery_skips_reward_and_is_not_code_quality_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case_root = Path(tmp) / "sample" / "adaptive"
+            workspace = case_root / "workspace"
+            workspace.mkdir(parents=True)
+            start = workspace / "start.md"
+            start.write_text("mutated spec\n", encoding="utf-8")
+            rollout = benchmark.RolloutArtifact(
+                task={"id": "sample", "difficulty": "Easy", "expected_tests": 1},
+                mode="adaptive",
+                case_root=case_root,
+                workspace=workspace,
+                start_hash="different",
+                agent={"ok": True, "lead_usage": {}, "lead_turns": 1},
+                agent_elapsed_s=1.0,
+                agent_timed_out=False,
+                agent_returncode=0,
+            )
             with patch.object(benchmark, "run_hidden_tests") as scorer:
                 result = benchmark.score_rollout(
                     rollout,
@@ -367,9 +918,206 @@ class TestNL2RepoPilot(unittest.TestCase):
                 )
 
         scorer.assert_not_called()
-        self.assertTrue(result["reward_skipped"])
-        self.assertEqual(result["failure_class"], "team_protocol")
-        self.assertFalse(result["protocol_ok"])
+        self.assertEqual(result["reward_outcome"], "missing_artifact")
+        self.assertFalse(result["reward_score_valid"])
+        self.assertIsNone(result["code_quality_score"])
+        self.assertFalse(result["metric_eligibility"]["code_quality"])
+
+    def test_agent_failure_keeps_valid_code_score_but_zeroes_effective_quality(self) -> None:
+        hidden = {
+            "pytest": {
+                "quality_score": 75.0,
+                "returncode": 1,
+                "all_passed": False,
+            }
+        }
+
+        metrics = benchmark._result_metrics_v2(
+            agent_ok=False,
+            agent_timed_out=False,
+            integrity_ok=True,
+            protocol_ok=True,
+            hidden=hidden,
+            failure_class="rollout_failure",
+        )
+
+        self.assertFalse(metrics["delivery_valid"])
+        self.assertTrue(metrics["reward_score_valid"])
+        self.assertEqual(metrics["code_quality_score"], 75.0)
+        self.assertEqual(metrics["effective_quality_score"], 0.0)
+        self.assertEqual(metrics["failure_domain"], "candidate")
+
+    def test_rollout_infrastructure_is_excluded_from_all_quality_metrics(self) -> None:
+        metrics = benchmark._result_metrics_v2(
+            agent_ok=False,
+            agent_timed_out=False,
+            integrity_ok=True,
+            protocol_ok=False,
+            hidden={
+                "skipped": True,
+                "pytest": {"quality_score": 0.0, "returncode": 1},
+            },
+            failure_class="rollout_infrastructure",
+            rollout_infrastructure=True,
+            rollout_retryable=True,
+            rollout_outcome="infra_error",
+        )
+
+        self.assertEqual(metrics["rollout_outcome"], "infra_error")
+        self.assertEqual(metrics["protocol_status"], "not_evaluated")
+        self.assertIsNone(metrics["protocol_credit"])
+        self.assertIsNone(metrics["code_quality_score"])
+        self.assertIsNone(metrics["effective_quality_score"])
+        self.assertFalse(any(metrics["metric_eligibility"].values()))
+        self.assertTrue(metrics["is_infrastructure"])
+        self.assertTrue(metrics["retryable"])
+
+    def test_rollout_infrastructure_skips_reward_for_stale_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case_root = Path(tmp) / "sample" / "adaptive"
+            workspace = case_root / "workspace"
+            workspace.mkdir(parents=True)
+            start = workspace / "start.md"
+            start.write_text("spec\n", encoding="utf-8")
+            rollout = benchmark.RolloutArtifact(
+                task={"id": "sample", "difficulty": "Easy", "expected_tests": 1},
+                mode="adaptive",
+                case_root=case_root,
+                workspace=workspace,
+                start_hash=benchmark._hash_file(start),
+                agent={
+                    "ok": False,
+                    "error": "AGS upload failed",
+                    "rollout_outcome": "infra_error",
+                    "rollout_infrastructure": True,
+                    "rollout_retryable": True,
+                    "lead_usage": {},
+                },
+                agent_elapsed_s=1.0,
+                agent_timed_out=False,
+                agent_returncode=1,
+            )
+            with patch.object(benchmark, "run_hidden_tests") as scorer:
+                result = benchmark.score_rollout(
+                    rollout,
+                    provider="qwen",
+                    model="test",
+                    score_timeout_s=60,
+                    keep_image=False,
+                )
+
+        scorer.assert_not_called()
+        self.assertEqual(result["failure_domain"], "infrastructure")
+        self.assertEqual(result["reward_outcome"], "pending")
+        self.assertFalse(result["metric_eligibility"]["protocol_yield"])
+
+    def test_hidden_test_timeout_is_candidate_not_infrastructure(self) -> None:
+        metrics = benchmark._result_metrics_v2(
+            agent_ok=True,
+            agent_timed_out=False,
+            integrity_ok=True,
+            protocol_ok=True,
+            hidden={
+                "timed_out": True,
+                "pytest": {"quality_score": 0.0, "returncode": 124, "all_passed": False},
+            },
+            failure_class="reward_timeout",
+        )
+
+        self.assertEqual(metrics["reward_outcome"], "candidate_timeout")
+        self.assertEqual(metrics["timeout_scope"], "reward")
+        self.assertFalse(metrics["is_infrastructure"])
+        self.assertFalse(metrics["retryable"])
+        self.assertEqual(metrics["failure_domain"], "candidate")
+
+    def test_reward_infrastructure_timeout_is_retryable_and_not_scored(self) -> None:
+        metrics = benchmark._result_metrics_v2(
+            agent_ok=True,
+            agent_timed_out=False,
+            integrity_ok=True,
+            protocol_ok=True,
+            hidden={
+                "error": "sandbox provisioning timed out",
+                "infrastructure_timed_out": True,
+                "pytest": {"quality_score": 0.0, "returncode": 124, "all_passed": False},
+            },
+            failure_class="scorer_infrastructure",
+        )
+
+        self.assertEqual(metrics["reward_outcome"], "infra_timeout")
+        self.assertFalse(metrics["reward_score_valid"])
+        self.assertIsNone(metrics["code_quality_score"])
+        self.assertIsNone(metrics["effective_quality_score"])
+        self.assertFalse(any(metrics["metric_eligibility"].values()))
+        self.assertTrue(metrics["is_infrastructure"])
+        self.assertTrue(metrics["retryable"])
+        self.assertEqual(metrics["timeout_scope"], "reward")
+
+    def test_reward_infrastructure_excludes_failed_protocol_from_qpe(self) -> None:
+        metrics = benchmark._result_metrics_v2(
+            agent_ok=True,
+            agent_timed_out=False,
+            integrity_ok=True,
+            protocol_ok=False,
+            hidden={
+                "error": "scorer sandbox unavailable",
+                "pytest": {
+                    "quality_score": 0.0,
+                    "returncode": 1,
+                    "all_passed": False,
+                },
+            },
+            failure_class="scorer_infrastructure",
+        )
+
+        # The final Team state remains useful diagnosis, but this scorer attempt
+        # is not an observation of any Q/P/E metric.
+        self.assertEqual(metrics["protocol_status"], "failed")
+        self.assertEqual(metrics["protocol_credit"], 0.0)
+        self.assertEqual(metrics["reward_outcome"], "infra_error")
+        self.assertIsNone(metrics["code_quality_score"])
+        self.assertIsNone(metrics["effective_quality_score"])
+        self.assertFalse(any(metrics["metric_eligibility"].values()))
+        self.assertEqual(metrics["failure_domain"], "infrastructure")
+        self.assertTrue(metrics["retryable"])
+
+    def test_scheduler_failure_domain_depends_on_phase(self) -> None:
+        task = {"id": "sample", "difficulty": "Easy", "expected_tests": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = benchmark._failed_case_result(
+                task,
+                "adaptive",
+                "rollout",
+                RuntimeError("agent child failed"),
+                output_root=root,
+                provider="qwen",
+                model="test",
+                execution_backend="ags",
+                score_backend="ags",
+            )
+            reward = benchmark._failed_case_result(
+                task,
+                "forced-team",
+                "reward",
+                TimeoutError("sandbox unavailable"),
+                output_root=root,
+                provider="qwen",
+                model="test",
+                execution_backend="ags",
+                score_backend="ags",
+            )
+
+        self.assertEqual(rollout["failure_domain"], "candidate")
+        self.assertFalse(rollout["is_infrastructure"])
+        self.assertEqual(rollout["reward_outcome"], "missing_artifact")
+        self.assertNotIn("error", rollout["hidden_tests"])
+        self.assertTrue(rollout["hidden_tests"]["skipped"])
+        self.assertEqual(reward["failure_domain"], "infrastructure")
+        self.assertTrue(reward["is_infrastructure"])
+        self.assertEqual(reward["reward_outcome"], "infra_timeout")
+        self.assertEqual(reward["timeout_scope"], "reward")
+        self.assertIn("error", reward["hidden_tests"])
 
     def test_rescore_reuses_workspace_and_preserves_reward_history(self) -> None:
         task = {"id": "sample-task", "expected_tests": 2}
@@ -396,7 +1144,10 @@ class TestNL2RepoPilot(unittest.TestCase):
                     {
                         "agent_ok": True,
                         "integrity_ok": True,
-                        "protocol_ok": True,
+                        # Protocol accounting is deliberately stale; a rescore must
+                        # derive it again from the final persisted team manifest.
+                        "protocol_ok": False,
+                        "protocol_status": "failed",
                         "quality_score": 0.0,
                         "success": False,
                         "hidden_tests": {"error": "old scorer failure"},
@@ -417,6 +1168,8 @@ class TestNL2RepoPilot(unittest.TestCase):
             persisted = json.loads((case_root / "result.json").read_text())
 
         self.assertEqual(result["quality_score"], 100.0)
+        self.assertTrue(result["protocol_ok"])
+        self.assertEqual(result["protocol_status"], "passed")
         self.assertTrue(result["success"])
         self.assertEqual(result["reward_history"][0]["quality_score"], 0.0)
         self.assertEqual(persisted["hidden_tests"], hidden)
@@ -520,6 +1273,80 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertEqual([event["kind"] for event in progress], ["model_started", "text_chunk"])
         self.assertEqual(result["lead_model_calls"], 0)
         self.assertEqual(result["lead_usage"]["input_tokens"], 3)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["failed"])
+
+    def test_agent_child_persists_explicit_lifecycle_failure(self) -> None:
+        def fake_run_prompt(prompt: str, **kwargs: object) -> AgentLoopResult:
+            return AgentLoopResult(
+                response_text="Team aborted after unrecoverable validation.",
+                usage={"input_tokens": 3, "output_tokens": 2},
+                num_turns=2,
+                failed=True,
+                failure_reason="team_aborted",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt_path = root / "PROMPT.md"
+            result_path = root / "agent-result.json"
+            progress_path = root / "progress.jsonl"
+            prompt_path.write_text("Build it.", encoding="utf-8")
+            with patch("src.runner.run_prompt", side_effect=fake_run_prompt):
+                returncode = benchmark._run_agent_child(
+                    root,
+                    prompt_path,
+                    result_path,
+                    "anthropic",
+                    "test-model",
+                    5,
+                    3,
+                    8192,
+                    False,
+                    progress_path,
+                )
+            result = json.loads(result_path.read_text())
+
+        self.assertEqual(returncode, 0)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["failed"])
+        self.assertEqual(result["failure_reason"], "team_aborted")
+
+    def test_agent_child_classifies_terminal_team_budget_exhaustion(self) -> None:
+        def fake_run_prompt(prompt: str, **kwargs: object) -> AgentLoopResult:
+            return AgentLoopResult(
+                response_text="Team execution budget exhausted.",
+                usage={"input_tokens": 30, "output_tokens": 2},
+                num_turns=3,
+                failed=True,
+                failure_reason="team_budget_exhausted",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt_path = root / "PROMPT.md"
+            result_path = root / "agent-result.json"
+            progress_path = root / "progress.jsonl"
+            prompt_path.write_text("Build it.", encoding="utf-8")
+            with patch("src.runner.run_prompt", side_effect=fake_run_prompt):
+                returncode = benchmark._run_agent_child(
+                    root,
+                    prompt_path,
+                    result_path,
+                    "anthropic",
+                    "test-model",
+                    5,
+                    3,
+                    8192,
+                    False,
+                    progress_path,
+                )
+            result = json.loads(result_path.read_text())
+
+        self.assertEqual(returncode, 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["rollout_outcome"], "budget_exhausted")
+        self.assertEqual(result["failure_reason"], "team_budget_exhausted")
 
     def test_forced_team_agent_child_precreates_active_team(self) -> None:
         observed: dict[str, object] = {}
@@ -556,8 +1383,15 @@ class TestNL2RepoPilot(unittest.TestCase):
         self.assertEqual(returncode, 0)
         self.assertIsNotNone(observed["team"])
         self.assertEqual(observed["team"].team_name, "nl2repo-forced-team")
+        self.assertEqual(observed["team"].protocol_version, 2)
+        self.assertEqual(observed["team"].lifecycle_state, "draft")
+        self.assertEqual(observed["team"].settings["protocol_version"], 2)
         self.assertTrue(observed["team"].settings["quality_gates"]["strict"])
+        self.assertEqual(
+            observed["team"].settings["quality_gates"]["protocol_version"], 2
+        )
         self.assertEqual(progress[0]["kind"], "forced_team_precreated")
+        self.assertEqual(progress[0]["protocol_version"], 2)
 
     def test_agent_child_preserves_terminal_usage_when_provider_raises(self) -> None:
         def fake_run_prompt(prompt: str, **kwargs: object) -> AgentLoopResult:
