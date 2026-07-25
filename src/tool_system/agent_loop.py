@@ -179,6 +179,24 @@ def _build_effective_system_prompt(style_prompt: str, tool_context: ToolContext)
     return f"{style_prompt}\n\n{context_prompt}"
 
 
+def _normalize_tool_result_content(output: Any) -> str | list[dict[str, Any]]:
+    """Convert tool output to a form acceptable as Anthropic tool_result content.
+
+    The Anthropic API requires tool_result.content to be a string or a list of
+    content blocks. Dict/non-string outputs are serialized to JSON so they stay
+    readable by the model.
+    """
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        return output
+    # dict, int, bool, None, etc. → JSON string
+    try:
+        return json.dumps(output, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(output)
+
+
 def summarize_tool_use(name: str, tool_input: dict[str, Any]) -> str:
     lowered = name.lower()
     if lowered == "bash":
@@ -428,7 +446,9 @@ def run_agent_loop(
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, result_output)
+                    # Anthropic API requires tool_result content to be a string or list
+                    tool_result_content = _normalize_tool_result_content(result_output)
+                    conversation.add_tool_result_message(tool_id, tool_result_content)
                 else:
                     # Add tool result in OpenAI format
                     openai_messages.append({
