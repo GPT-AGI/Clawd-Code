@@ -169,8 +169,13 @@ class ClawdREPL:
             @self.bindings.add("/")  # type: ignore[attr-defined]
             def _show_slash_completions(event):  # type: ignore[no-untyped-def]
                 buf = event.current_buffer
-                if buf.text == "":
-                    buf.insert_text("/")
+                # This binding consumes every '/' keypress, so it must always
+                # insert the character. Inserting only on an empty buffer
+                # silently dropped mid-line slashes, so "read src/repl/core.py"
+                # reached the model as "read srcreplcore.py".
+                buf.insert_text("/")
+                # Only offer the command palette when '/' starts the line.
+                if buf.text == "/":
                     buf.start_completion(select_first=False)
 
         self.prompt_session = PromptSession(
@@ -358,6 +363,7 @@ class ClawdREPL:
             conversation=self.session.conversation,
             cost_tracker=self.cost_tracker,
             history=self.history_log,
+            provider=self.provider,
         )
 
         # Merge new commands with built-in list for completion
