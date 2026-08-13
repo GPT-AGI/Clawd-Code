@@ -224,6 +224,7 @@ def create_command_context(
     history: Any = None,
     cwd: str | Path | None = None,
     config: dict[str, Any] | None = None,
+    provider: Any = None,
 ) -> CommandContext:
     """
     Create a command context.
@@ -249,4 +250,5 @@ def create_command_context(
         cost_tracker=cost_tracker,
         history=history,
         config=config or {},
+        provider=provider,
     )
