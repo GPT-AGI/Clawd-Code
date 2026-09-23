@@ -39,6 +39,10 @@ dev = [
     "twine>=5.0.0",
     "pytest>=8.0.0",
 ]
+openmythos = [
+    "open-mythos>=0.4.0",
+    "torch>=2.4,<3",
+]
 
 [project.scripts]
 clawd = "src.cli:main"
