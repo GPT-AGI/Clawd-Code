@@ -1,0 +1,328 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any, ClassVar
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _require_status(status: str, allowed: set[str], kind: str) -> None:
+    if status not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ValueError(f"invalid {kind} status {status!r}; expected one of: {choices}")
+
+
+@dataclass
+class Team:
+    STATUSES: ClassVar[set[str]] = {"created", "running", "completed", "failed", "cancelled"}
+    TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        "created": {"running", "cancelled"},
+        "running": {"completed", "failed", "cancelled"},
+        "failed": {"running", "cancelled"},
+        # A persistent team may receive another task after a previously completed
+        # batch.  Reopening keeps the same team identity, history, and usage.
+        "completed": {"running"},
+        "cancelled": {"running"},
+    }
+
+    team_id: str
+    team_name: str
+    lead_agent_id: str
+    description: str | None = None
+    agent_type: str | None = None
+    status: str = "created"
+    protocol_version: int = 1
+    # ``status`` is the original coarse-grained state and remains the compatibility
+    # surface for v1 callers.  Protocol v2 persists its finer state machine here so
+    # a process restart cannot accidentally turn verification/repair into success.
+    lifecycle_state: str | None = None
+    settings: dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, int] = field(default_factory=dict)
+    cancel_requested_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+    schema_version: int = 3
+
+    LIFECYCLE_STATES: ClassVar[set[str]] = {
+        "draft",
+        "ready",
+        "running",
+        "awaiting_verification",
+        "verifying",
+        "repair_required",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "aborted",
+        "budget_exhausted",
+    }
+    STATUS_LIFECYCLE: ClassVar[dict[str, str]] = {
+        "created": "draft",
+        "running": "running",
+        "completed": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }
+
+    def __post_init__(self) -> None:
+        _require_status(self.status, self.STATUSES, "team")
+        if self.protocol_version < 1:
+            raise ValueError("team protocol_version must be at least 1")
+        if self.lifecycle_state is None:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[self.status]
+        elif self.lifecycle_state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid team lifecycle state {self.lifecycle_state!r}; "
+                f"expected one of: {choices}"
+            )
+
+    def transition_to(self, status: str) -> None:
+        _require_status(status, self.STATUSES, "team")
+        if status != self.status and status not in self.TRANSITIONS[self.status]:
+            raise ValueError(f"cannot transition team from {self.status!r} to {status!r}")
+        changed = status != self.status
+        self.status = status
+        if changed:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[status]
+        self.updated_at = utc_now()
+
+    def set_lifecycle_state(self, state: str) -> None:
+        if state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid team lifecycle state {state!r}; expected one of: {choices}"
+            )
+        self.lifecycle_state = state
+        self.updated_at = utc_now()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Team":
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        if "lifecycle_state" not in values:
+            values["lifecycle_state"] = cls.STATUS_LIFECYCLE.get(
+                str(values.get("status") or "created"), "draft"
+            )
+        values["schema_version"] = 3
+        return cls(**values)
+
+
+@dataclass
+class AgentRecord:
+    STATUSES: ClassVar[set[str]] = {
+        "created",
+        "running",
+        "idle",
+        "stopping",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+    TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        "created": {"running", "stopping", "cancelled"},
+        "running": {"idle", "stopping", "completed", "failed", "cancelled"},
+        "idle": {"running", "stopping", "completed", "cancelled"},
+        "stopping": {"cancelled"},
+        "failed": {"running", "stopping", "cancelled"},
+        # Completed teammates are persistent and can be reused when their team is
+        # reopened for a later task.
+        "completed": {"running"},
+        "cancelled": {"running"},
+    }
+
+    agent_id: str
+    team_id: str
+    name: str
+    role: str
+    session_id: str
+    model: str | None = None
+    instructions: str = ""
+    tools: list[str] = field(default_factory=list)
+    workspace_mode: str = "shared"
+    workspace_path: str | None = None
+    auto_integrate: bool = False
+    status: str = "created"
+    stop_requested_at: str | None = None
+    stop_reason: str | None = None
+    stop_task_policy: str | None = None
+    stopped_at: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+    schema_version: int = 3
+
+    def __post_init__(self) -> None:
+        _require_status(self.status, self.STATUSES, "agent")
+        if self.workspace_mode not in {"shared", "worktree"}:
+            raise ValueError("workspace_mode must be 'shared' or 'worktree'")
+        if self.stop_task_policy not in {None, "requeue", "cancel"}:
+            raise ValueError("stop_task_policy must be 'requeue' or 'cancel'")
+
+    def transition_to(self, status: str) -> None:
+        _require_status(status, self.STATUSES, "agent")
+        if status != self.status and status not in self.TRANSITIONS[self.status]:
+            raise ValueError(f"cannot transition agent from {self.status!r} to {status!r}")
+        self.status = status
+        self.updated_at = utc_now()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AgentRecord":
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        values["schema_version"] = 3
+        return cls(**values)
+
+
+@dataclass
+class TeamTask:
+    STATUSES: ClassVar[set[str]] = {"pending", "in_progress", "completed", "failed", "cancelled"}
+    TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        "pending": {"in_progress", "completed", "cancelled"},
+        "in_progress": {"pending", "completed", "failed", "cancelled"},
+        "failed": {"pending", "in_progress", "cancelled"},
+        "completed": set(),
+        "cancelled": {"pending"},
+    }
+
+    id: str
+    subject: str
+    description: str
+    key: str | None = None
+    activeForm: str = ""
+    status: str = "pending"
+    # v2 distinguishes a worker's delivery (produced) from harness acceptance.
+    # The legacy status remains ``completed`` for both states so v1 tools and task
+    # dependency stores continue to round-trip unchanged.
+    lifecycle_state: str | None = None
+    owner: str | None = None
+    blocks: list[str] = field(default_factory=list)
+    blockedBy: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    owned_files: list[str] = field(default_factory=list)
+    provides_interfaces: list[str] = field(default_factory=list)
+    depends_on_interfaces: list[str] = field(default_factory=list)
+    acceptance_checks: list[str] = field(default_factory=list)
+    output: str = ""
+    attempt: int = 0
+    max_retries: int = 0
+    lease_id: str | None = None
+    lease_expires_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    last_error: str | None = None
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+    schema_version: int = 4
+
+    LIFECYCLE_STATES: ClassVar[set[str]] = {
+        "pending",
+        "in_progress",
+        "produced",
+        "accepted",
+        "failed",
+        "cancelled",
+    }
+    STATUS_LIFECYCLE: ClassVar[dict[str, str]] = {
+        "pending": "pending",
+        "in_progress": "in_progress",
+        "completed": "produced",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }
+
+    def __post_init__(self) -> None:
+        _require_status(self.status, self.STATUSES, "task")
+        if self.lifecycle_state is None:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[self.status]
+        elif self.lifecycle_state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid task lifecycle state {self.lifecycle_state!r}; "
+                f"expected one of: {choices}"
+            )
+
+    def transition_to(self, status: str) -> None:
+        _require_status(status, self.STATUSES, "task")
+        if status != self.status and status not in self.TRANSITIONS[self.status]:
+            raise ValueError(f"cannot transition task from {self.status!r} to {status!r}")
+        changed = status != self.status
+        self.status = status
+        if changed:
+            self.lifecycle_state = self.STATUS_LIFECYCLE[status]
+        self.updated_at = utc_now()
+
+    def set_lifecycle_state(self, state: str) -> None:
+        if state not in self.LIFECYCLE_STATES:
+            choices = ", ".join(sorted(self.LIFECYCLE_STATES))
+            raise ValueError(
+                f"invalid task lifecycle state {state!r}; expected one of: {choices}"
+            )
+        self.lifecycle_state = state
+        self.updated_at = utc_now()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TeamTask":
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        if "lifecycle_state" not in values:
+            values["lifecycle_state"] = cls.STATUS_LIFECYCLE.get(
+                str(values.get("status") or "pending"), "pending"
+            )
+        values["schema_version"] = 4
+        return cls(**values)
+
+
+@dataclass
+class Message:
+    STATUSES: ClassVar[set[str]] = {"queued", "delivered", "consumed", "failed"}
+    TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        "queued": {"delivered", "failed"},
+        "delivered": {"consumed", "failed"},
+        "consumed": set(),
+        "failed": set(),
+    }
+
+    message_id: str
+    team_id: str
+    sender_id: str
+    recipient_id: str
+    content: Any
+    summary: str | None = None
+    status: str = "queued"
+    created_at: str = field(default_factory=utc_now)
+    delivered_at: str | None = None
+    consumed_at: str | None = None
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        _require_status(self.status, self.STATUSES, "message")
+
+    def transition_to(self, status: str) -> None:
+        _require_status(status, self.STATUSES, "message")
+        if status != self.status and status not in self.TRANSITIONS[self.status]:
+            raise ValueError(f"cannot transition message from {self.status!r} to {status!r}")
+        now = utc_now()
+        self.status = status
+        if status == "delivered":
+            self.delivered_at = now
+        elif status == "consumed":
+            self.consumed_at = now
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Message":
+        return cls(**{key: data[key] for key in cls.__dataclass_fields__ if key in data})

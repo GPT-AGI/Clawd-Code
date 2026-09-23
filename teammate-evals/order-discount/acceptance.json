@@ -1,0 +1,41 @@
+{
+  "model": "glm-5.2",
+  "required_agents": [
+    "researcher",
+    "coder",
+    "reviewer"
+  ],
+  "required_tasks": [
+    {
+      "name": "analysis",
+      "owner": "researcher",
+      "blocked_by": []
+    },
+    {
+      "name": "implementation",
+      "owner": "coder",
+      "blocked_by": ["analysis"]
+    },
+    {
+      "name": "review",
+      "owner": "reviewer",
+      "blocked_by": ["implementation"]
+    }
+  ],
+  "required_messages": [
+    {
+      "from": "researcher",
+      "to": "coder"
+    },
+    {
+      "from": "coder",
+      "to": "reviewer"
+    },
+    {
+      "from": "reviewer",
+      "to": "lead"
+    }
+  ],
+  "required_test_command": "python -m unittest checks.order_acceptance -v",
+  "required_final_status": "completed"
+}

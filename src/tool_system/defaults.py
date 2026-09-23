@@ -26,6 +26,7 @@ from .tools import (
     MCPTool,
     NotebookEditTool,
     PowerShellTool,
+    ReadMessagesTool,
     REPLTool,
     ReadMcpResourceTool,
     RemoteTriggerTool,
@@ -34,12 +35,25 @@ from .tools import (
     SkillTool,
     SleepTool,
     StructuredOutputTool,
+    TeamAbortTool,
     TeamCreateTool,
+    TeamConfigureTool,
+    TeamCancelTool,
     TeamDeleteTool,
+    TeamIntegrateTool,
+    TeamPlanTool,
+    TeamReplanTool,
+    TeamResumeTool,
+    TeammateCreateTool,
+    TeammateResumeTool,
+    TeammateStopTool,
+    TeamRunTool,
+    TeamVerifyTool,
     TaskCreateTool,
     TaskGetTool,
     TaskListTool,
     TaskOutputTool,
+    TaskRetryTool,
     TaskStopTool,
     TaskUpdateTool,
     TestingPermissionTool,
@@ -49,55 +63,109 @@ from .tools import (
 )
 from .tools.agent import AgentTool
 from .tools.tool_search import ToolSearchTool
+from .remote_tools import (
+    RemoteBashTool,
+    RemoteFileEditTool,
+    RemoteFileReadTool,
+    RemoteFileWriteTool,
+    RemoteGlobTool,
+    RemoteGrepTool,
+)
 
 
-def build_default_registry(*, include_user_tools: bool = True) -> ToolRegistry:
-    registry = ToolRegistry(
-        tools=[
-            SendUserMessageTool(),
+def build_default_registry(
+    *,
+    include_user_tools: bool = True,
+    workspace_backend: object | None = None,
+    include_team_tools: bool = True,
+) -> ToolRegistry:
+    workspace_tools = (
+        [
+            RemoteBashTool(),
+            RemoteFileReadTool(),
+            RemoteFileWriteTool(),
+            RemoteFileEditTool(),
+            RemoteGlobTool(),
+            RemoteGrepTool(),
+        ]
+        if workspace_backend is not None
+        else [
             BashTool(),
             FileReadTool(),
             FileWriteTool(),
             FileEditTool(),
             GlobTool(),
             GrepTool(),
-            WebFetchTool(),
-            WebSearchTool(),
-            SleepTool(),
+        ]
+    )
+    collaboration_tools = (
+        [
             TaskStopTool(),
-            ConfigTool(),
-            MCPTool(),
-            ListMcpResourcesTool(),
-            ReadMcpResourceTool(),
-            LSPTool(),
-            SkillTool(),
-            BriefTool(),
-            AskUserQuestionTool(),
-            TodoWriteTool(),
             TaskCreateTool(),
             TaskGetTool(),
             TaskListTool(),
             TaskUpdateTool(),
             TaskOutputTool(),
+            TaskRetryTool(),
             TeamCreateTool(),
+            TeamConfigureTool(),
+            TeamPlanTool(),
+            TeammateCreateTool(),
+            TeamRunTool(),
+            TeamVerifyTool(),
+            TeamReplanTool(),
+            TeamResumeTool(),
+            TeamCancelTool(),
+            TeamAbortTool(),
+            TeammateStopTool(),
+            TeammateResumeTool(),
+            TeamIntegrateTool(),
             TeamDeleteTool(),
+            SendMessageTool(),
+            ReadMessagesTool(),
+            RemoteTriggerTool(),
+        ]
+        if include_team_tools
+        else []
+    )
+    registry = ToolRegistry(
+        tools=[
+            SendUserMessageTool(),
+            *workspace_tools,
+            WebFetchTool(),
+            WebSearchTool(),
+            SleepTool(),
+            ConfigTool(),
+            MCPTool(),
+            ListMcpResourcesTool(),
+            ReadMcpResourceTool(),
+            *([] if workspace_backend is not None else [LSPTool()]),
+            SkillTool(),
+            BriefTool(),
+            AskUserQuestionTool(),
+            TodoWriteTool(),
+            *collaboration_tools,
             EnterPlanModeTool(),
             ExitPlanModeTool(),
-            EnterWorktreeTool(),
-            ExitWorktreeTool(),
+            *(
+                []
+                if workspace_backend is not None
+                else [EnterWorktreeTool(), ExitWorktreeTool()]
+            ),
             CronCreateTool(),
             CronListTool(),
             CronDeleteTool(),
-            SendMessageTool(),
             StructuredOutputTool(),
-            RemoteTriggerTool(),
-            PowerShellTool(),
-            NotebookEditTool(),
-            REPLTool(),
+            *(
+                []
+                if workspace_backend is not None
+                else [PowerShellTool(), NotebookEditTool(), REPLTool()]
+            ),
             TestingPermissionTool(),
         ]
     )
-    registry.register(AgentTool(registry))
+    if include_team_tools:
+        registry.register(AgentTool(registry))
     registry.register(ToolSearchTool(registry))
 
     if include_user_tools:

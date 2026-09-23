@@ -451,6 +451,9 @@ class TestREPL(unittest.TestCase):
 class TestConversation(unittest.TestCase):
     """Test conversation management."""
 
+    def test_default_max_history(self):
+        self.assertEqual(Conversation().max_history, 300)
+
     def test_add_message(self):
         """Test adding messages to conversation."""
         conv = Conversation()

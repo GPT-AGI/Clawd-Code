@@ -281,7 +281,7 @@ class TestBuiltinCommands(unittest.TestCase):
         self.assertIn("test-project-skill", result)
 
 
-class TestCommandEngine(unittest.TestCase):
+class TestCommandEngine(unittest.IsolatedAsyncioTestCase):
     """Tests for the command engine."""
 
     def setUp(self):
@@ -367,7 +367,7 @@ class TestSkillsIntegration(unittest.TestCase):
         self.assertEqual(cmd.markdown_content, "Hello $name")
 
 
-class TestInitCommand(unittest.TestCase):
+class TestInitCommand(unittest.IsolatedAsyncioTestCase):
     """Tests for the /init command implementation."""
 
     def setUp(self):

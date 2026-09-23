@@ -9,6 +9,7 @@ from ..errors import ToolInputError, ToolPermissionError
 from ..permission_handler import PermissionResult
 from ..protocol import ToolResult
 from ..diff_utils import unified_diff_hunks
+from ..ownership import require_owned_path
 from ..registry import ToolSpec
 
 
@@ -61,15 +62,19 @@ class FileWriteTool:
 
         path = context.ensure_allowed_path(file_path)
 
-        original_file: str | None = None
-        if path.exists():
-            if not context.was_file_read_and_unchanged(path):
-                raise ToolInputError("refusing to overwrite: file must be read first and unchanged since last read")
-            original_file = path.read_text(encoding="utf-8", errors="replace")
+        with context.mutation_lock:
+            require_owned_path(context, path, tool_name="Write")
+            original_file: str | None = None
+            if path.exists():
+                if not context.was_file_read_and_unchanged(path):
+                    raise ToolInputError(
+                        "refusing to overwrite: file must be read first and unchanged since last read"
+                    )
+                original_file = path.read_text(encoding="utf-8", errors="replace")
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        context.mark_file_read(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            context.mark_file_read(path)
         before_lines = (original_file or "").splitlines(keepends=True)
         after_lines = content.splitlines(keepends=True)
         diff_lines = list(

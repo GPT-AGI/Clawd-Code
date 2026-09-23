@@ -79,6 +79,7 @@ from src.providers import get_provider_class
 from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.base import ChatMessage
 from src.providers.minimax_provider import MinimaxProvider
+from src.teammate.runtime import TeammateRuntime
 from src.tool_system.context import ToolContext
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.protocol import ToolCall
@@ -129,6 +130,7 @@ class ClawdREPL:
 
         self.tool_registry = build_default_registry()
         self.tool_context = ToolContext(workspace_root=Path.cwd())
+        self.tool_context.teammate_runtime = TeammateRuntime(self.provider, self.tool_registry)
         self.tool_context.ask_user = self._ask_user_questions
         # Permission handler with status control for proper input handling
         self._current_status = None
@@ -1313,6 +1315,7 @@ class ClawdREPL:
             model=config.get("default_model")
         )
         self.provider_name = provider
+        self.tool_context.teammate_runtime = TeammateRuntime(self.provider, self.tool_registry)
 
         self.console.print("[green]✓ Provider reinitialized. You can continue chatting![/green]\n")
 

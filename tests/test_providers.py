@@ -9,6 +9,7 @@ from src.providers import get_provider_class
 from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.glm_provider import GLMProvider
 from src.providers.openai_provider import OpenAIProvider
+from src.providers.qwen_provider import QwenProvider
 from src.providers.base import ChatMessage, ChatResponse
 
 
@@ -43,6 +44,7 @@ class TestChatResponse(unittest.TestCase):
         self.assertEqual(response.model, "gpt-4")
         self.assertIsNone(response.reasoning_content)
 
+
     def test_response_with_reasoning(self):
         """Test response with reasoning content."""
         response = ChatResponse(
@@ -53,6 +55,21 @@ class TestChatResponse(unittest.TestCase):
             reasoning_content="Reasoning process...",
         )
         self.assertEqual(response.reasoning_content, "Reasoning process...")
+
+
+class TestOpenAICompatibleUsage(unittest.TestCase):
+    def test_cached_prompt_tokens_are_preserved(self):
+        provider = OpenAIProvider(api_key="test-key")
+        usage = MagicMock(
+            prompt_tokens=100,
+            completion_tokens=20,
+            total_tokens=120,
+            prompt_tokens_details={"cached_tokens": 80},
+        )
+
+        actual = provider._build_usage_dict(usage)
+
+        self.assertEqual(actual["cache_read_input_tokens"], 80)
 
 
 class TestAnthropicProvider(unittest.TestCase):
@@ -359,6 +376,169 @@ class TestGLMProvider(unittest.TestCase):
         self.assertEqual(response.reasoning_content, "Thinking...")
 
 
+class TestQwenProvider(unittest.TestCase):
+    def test_tencent_defaults(self):
+        provider = QwenProvider(api_key="test-token")
+        self.assertEqual(provider.model, "ms-mnhdj86z")
+        self.assertTrue(provider.base_url.endswith("/ms-mnhdj86z/v1"))
+
+    @patch("src.providers.qwen_provider.OpenAI")
+    def test_client_uses_tione_authorization_value(self, mock_openai):
+        provider = QwenProvider(api_key="test-token", routing_key="agent-123")
+        _ = provider.client
+
+        mock_openai.assert_called_once_with(
+            api_key="test-token",
+            base_url=provider.base_url,
+            default_headers={
+                "Authorization": "test-token",
+                "X-Clawd-Route-Key": "agent-123",
+            },
+        )
+
+    @patch("src.providers.qwen_provider.OpenAI")
+    def test_routing_key_is_stable_per_provider_and_distinct_between_agents(
+        self, mock_openai
+    ):
+        first = QwenProvider(api_key="test-token")
+        second = QwenProvider(api_key="test-token")
+
+        _ = first.client
+        _ = first.client
+        _ = second.client
+
+        self.assertNotEqual(first.routing_key, second.routing_key)
+        self.assertEqual(len(first.routing_key), 32)
+        self.assertEqual(mock_openai.call_count, 2)
+        self.assertEqual(
+            mock_openai.call_args_list[0].kwargs["default_headers"][
+                "X-Clawd-Route-Key"
+            ],
+            first.routing_key,
+        )
+
+    @patch.dict("os.environ", {"QWEN_ROUTING_KEY": "fixed-rollout"})
+    def test_routing_key_can_be_overridden_from_environment(self):
+        provider = QwenProvider(api_key="test-token")
+
+        self.assertEqual(provider.routing_key, "fixed-rollout")
+
+    @patch("src.providers.qwen_provider.OpenAI")
+    def test_chat_disables_thinking_by_default(self, mock_openai):
+        mock_client = MagicMock()
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "QWEN_OK"
+        response.choices[0].message.reasoning_content = None
+        response.choices[0].message.tool_calls = None
+        response.choices[0].finish_reason = "stop"
+        response.model = "ms-mnhdj86z"
+        response.usage = None
+        mock_client.chat.completions.create.return_value = response
+        mock_openai.return_value = mock_client
+
+        provider = QwenProvider(api_key="test-token")
+        actual = provider.chat([ChatMessage(role="user", content="Hi")])
+
+        self.assertEqual(actual.content, "QWEN_OK")
+        request = mock_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            request["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
+    @patch.dict("os.environ", {"QWEN_ENABLE_THINKING": "1"})
+    @patch("src.providers.qwen_provider.OpenAI")
+    def test_chat_can_enable_thinking_from_environment(self, mock_openai):
+        mock_client = MagicMock()
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "QWEN_OK"
+        response.choices[0].message.reasoning_content = "thinking"
+        response.choices[0].message.tool_calls = None
+        response.choices[0].finish_reason = "stop"
+        response.model = "ms-rns547kc"
+        response.usage = None
+        mock_client.chat.completions.create.return_value = response
+        mock_openai.return_value = mock_client
+
+        provider = QwenProvider(api_key="test-token")
+        provider.chat([ChatMessage(role="user", content="Hi")])
+
+        request = mock_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            request["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": True}},
+        )
+
+    @patch.dict("os.environ", {"QWEN_ENABLE_THINKING": "0"})
+    @patch("src.providers.qwen_provider.OpenAI")
+    def test_explicit_thinking_setting_is_isolated_from_process_environment(
+        self, mock_openai
+    ):
+        mock_client = MagicMock()
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "QWEN_OK"
+        response.choices[0].message.reasoning_content = "thinking"
+        response.choices[0].message.tool_calls = None
+        response.choices[0].finish_reason = "stop"
+        response.model = "ms-rns547kc"
+        response.usage = None
+        mock_client.chat.completions.create.return_value = response
+        mock_openai.return_value = mock_client
+
+        provider = QwenProvider(api_key="test-token", enable_thinking=True)
+        provider.chat([ChatMessage(role="user", content="Hi")])
+
+        request = mock_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            request["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": True}},
+        )
+
+    @patch("src.providers.qwen_provider.OpenAI")
+    def test_stream_requests_and_collects_terminal_usage_chunk(self, mock_openai):
+        mock_client = MagicMock()
+
+        content_chunk = MagicMock()
+        content_chunk.model = "ms-rns547kc"
+        content_chunk.usage = None
+        content_chunk.choices = [MagicMock()]
+        content_chunk.choices[0].finish_reason = "stop"
+        content_chunk.choices[0].delta.content = "QWEN_OK"
+        content_chunk.choices[0].delta.reasoning_content = None
+        content_chunk.choices[0].delta.tool_calls = []
+
+        usage_chunk = MagicMock()
+        usage_chunk.model = "ms-rns547kc"
+        usage_chunk.usage = MagicMock(
+            prompt_tokens=120,
+            completion_tokens=8,
+            total_tokens=128,
+            prompt_tokens_details={"cached_tokens": 100},
+        )
+        usage_chunk.choices = []
+
+        mock_client.chat.completions.create.return_value = iter(
+            [content_chunk, usage_chunk]
+        )
+        mock_openai.return_value = mock_client
+
+        provider = QwenProvider(api_key="test-token")
+        actual = provider.chat_stream_response(
+            [ChatMessage(role="user", content="Hi")]
+        )
+
+        request = mock_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["stream_options"], {"include_usage": True})
+        self.assertEqual(actual.content, "QWEN_OK")
+        self.assertEqual(actual.usage["input_tokens"], 120)
+        self.assertEqual(actual.usage["output_tokens"], 8)
+        self.assertEqual(actual.usage["total_tokens"], 128)
+        self.assertEqual(actual.usage["cache_read_input_tokens"], 100)
+
+
 class TestGetProviderClass(unittest.TestCase):
     """Test get_provider_class function."""
 
@@ -376,6 +556,10 @@ class TestGetProviderClass(unittest.TestCase):
         """Test getting GLM provider class."""
         cls = get_provider_class("glm")
         self.assertEqual(cls, GLMProvider)
+
+    def test_get_qwen_provider_and_alias(self):
+        self.assertEqual(get_provider_class("qwen"), QwenProvider)
+        self.assertEqual(get_provider_class("qwen3.5"), QwenProvider)
 
     def test_get_unknown_provider(self):
         """Test getting unknown provider."""

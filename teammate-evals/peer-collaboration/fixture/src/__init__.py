@@ -1,0 +1,1 @@
+"""Coupled peer smoke fixture."""

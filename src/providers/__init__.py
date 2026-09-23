@@ -7,6 +7,17 @@ from typing import TypedDict
 from .base import BaseProvider, ChatMessage, ChatResponse
 
 
+PROVIDER_ALIASES = {
+    "qwen3.5": "qwen",
+}
+
+
+def normalize_provider_name(provider_name: str) -> str:
+    """Return the canonical provider key for a provider/profile alias."""
+    normalized = provider_name.strip().lower()
+    return PROVIDER_ALIASES.get(normalized, normalized)
+
+
 # Provider metadata for login/UI
 class ProviderInfo(TypedDict):
     label: str
@@ -89,6 +100,15 @@ PROVIDER_INFO: dict[str, ProviderInfo] = {
             "zai/glm-3-turbo",
         ],
     },
+    "qwen": {
+        "label": "Qwen 3.5 (Tencent TI-ONE)",
+        "default_base_url": (
+            "https://ms-mnhdj86z-100034032793-sw.gw.ap-zhongwei.ti.tencentcs.com/"
+            "ms-mnhdj86z/v1"
+        ),
+        "default_model": "ms-mnhdj86z",
+        "available_models": ["ms-mnhdj86z"],
+    },
     "minimax": {
         "label": "Minimax AI",
         "default_base_url": "https://api.minimaxi.com/anthropic",
@@ -111,6 +131,7 @@ PROVIDER_INFO: dict[str, ProviderInfo] = {
 
 def get_provider_info(provider_name: str) -> ProviderInfo:
     """Get provider info by name."""
+    provider_name = normalize_provider_name(provider_name)
     if provider_name not in PROVIDER_INFO:
         raise ValueError(f"Unknown provider: {provider_name}")
     return PROVIDER_INFO[provider_name]
@@ -118,6 +139,7 @@ def get_provider_info(provider_name: str) -> ProviderInfo:
 
 def get_provider_class(provider_name: str):
     """Get provider class by name."""
+    provider_name = normalize_provider_name(provider_name)
     if provider_name == "anthropic":
         from .anthropic_provider import AnthropicProvider
 
@@ -130,6 +152,10 @@ def get_provider_class(provider_name: str):
         from .glm_provider import GLMProvider
 
         return GLMProvider
+    if provider_name == "qwen":
+        from .qwen_provider import QwenProvider
+
+        return QwenProvider
     if provider_name == "minimax":
         from .minimax_provider import MinimaxProvider
 
@@ -149,4 +175,6 @@ __all__ = [
     "get_provider_info",
     "PROVIDER_INFO",
     "AVAILABLE_PROVIDERS",
+    "PROVIDER_ALIASES",
+    "normalize_provider_name",
 ]

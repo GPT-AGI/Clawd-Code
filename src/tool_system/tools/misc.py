@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import platform
+import time
+import uuid
 from typing import Any
 
+from ...teammate.models import Message
 from ..context import ToolContext
 from ..errors import ToolInputError, ToolPermissionError
 from ..protocol import ToolResult
@@ -13,7 +16,10 @@ class SendMessageTool:
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="SendMessage",
-            description="Send a message to another recipient (best-effort, local only).",
+            description=(
+                "Send and persist a direct message to any teammate or to the lead. "
+                "Peer-to-peer messages do not need to pass through the lead."
+            ),
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -24,7 +30,7 @@ class SendMessageTool:
                 },
                 "required": ["to", "message"],
             },
-            is_read_only=True,
+            is_read_only=False,
             max_result_size_chars=100_000,
         )
 
@@ -36,8 +42,143 @@ class SendMessageTool:
             raise ToolInputError("to must be a non-empty string")
         if summary is not None and not isinstance(summary, str):
             raise ToolInputError("summary must be a string when provided")
-        context.outbox.append({"tool": "SendMessage", "to": to, "summary": summary, "message": message})
-        return ToolResult(name="SendMessage", output={"success": True, "message": f"Message queued for {to}"})
+        if context.team is None:
+            raise ToolInputError("SendMessage requires an active team")
+
+        team_id = str(context.team["team_id"])
+        lead_id = str(context.team["lead_agent_id"])
+        recipient_name = to.strip()
+        if recipient_name.lower() == "lead" or recipient_name == lead_id:
+            recipient_id = lead_id
+        else:
+            recipient = context.team_store.find_agent(team_id, recipient_name)
+            if recipient is None:
+                raise ToolInputError(f"unknown message recipient: {recipient_name}")
+            recipient_id = recipient.agent_id
+        sender_id = context.actor_id or lead_id
+        if sender_id != lead_id and context.team_store.load_agent(team_id, sender_id) is None:
+            raise ToolInputError(f"unknown message sender: {sender_id}")
+
+        persisted = Message(
+            message_id=uuid.uuid4().hex,
+            team_id=team_id,
+            sender_id=sender_id,
+            recipient_id=recipient_id,
+            content=message,
+            summary=summary,
+        )
+        persisted.transition_to("delivered")
+        path = context.team_store.save_message(persisted)
+        context.team_store.append_event(team_id, "message.delivered", {"message": persisted.to_dict()})
+        context.outbox.append(
+            {
+                "tool": "SendMessage",
+                "message_id": persisted.message_id,
+                "from": sender_id,
+                "to": recipient_id,
+                "summary": summary,
+                "message": message,
+            }
+        )
+        return ToolResult(
+            name="SendMessage",
+            output={
+                "success": True,
+                "message_id": persisted.message_id,
+                "sender_id": sender_id,
+                "recipient_id": recipient_id,
+                "status": persisted.status,
+                "message_file_path": str(path),
+            },
+        )
+
+
+class ReadMessagesTool:
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="ReadMessages",
+            description=(
+                "Read and consume newly delivered team messages for the current agent. "
+                "Teammates may use wait_s during parallel work. Leads should call TeamRun before "
+                "expecting an idle or newly created teammate to send messages."
+            ),
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"wait_s": {"type": "number"}},
+            },
+            is_read_only=False,
+            max_result_size_chars=100_000,
+            strict=True,
+        )
+
+    def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
+        if context.team is None:
+            raise ToolInputError("ReadMessages requires an active team")
+        wait_s = tool_input.get("wait_s", 0)
+        if isinstance(wait_s, bool) or not isinstance(wait_s, (int, float)):
+            raise ToolInputError("wait_s must be numeric")
+        if wait_s < 0 or wait_s > 60:
+            raise ToolInputError("wait_s must be between 0 and 60")
+
+        team_id = str(context.team["team_id"])
+        lead_id = str(context.team["lead_agent_id"])
+        recipient_id = context.actor_id or lead_id
+        if recipient_id != lead_id and context.team_store.load_agent(team_id, recipient_id) is None:
+            raise ToolInputError(f"unknown message recipient: {recipient_id}")
+
+        deadline = time.monotonic() + float(wait_s)
+        incoming = context.team_store.consume_messages(team_id, recipient_id)
+        if not incoming and wait_s > 0 and context.actor_id is None:
+            context.reload_team_state()
+            agents = context.team_store.list_agents(team_id)
+            running = any(agent.status == "running" for agent in agents)
+            in_progress = any(
+                task.get("status") == "in_progress" for task in context.tasks.values()
+            )
+            if not running and not in_progress:
+                has_tasks = bool(context.tasks)
+                next_tool = "TeamRun" if has_tasks else "TaskCreate"
+                instruction = (
+                    "Call TeamRun to execute the pending tasks before waiting for worker messages."
+                    if has_tasks
+                    else "Create a teammate-owned task with TaskCreate, then call TeamRun."
+                )
+                return ToolResult(
+                    name="ReadMessages",
+                    output={
+                        "messages": [],
+                        "wait_skipped": True,
+                        "warning": "No teammate is currently running; waiting cannot produce a new message.",
+                        "next_required_actions": [
+                            {"tool": next_tool, "instruction": instruction}
+                        ],
+                    },
+                )
+        while not incoming and time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            incoming = context.team_store.consume_messages(team_id, recipient_id)
+
+        names = {
+            agent.agent_id: agent.name for agent in context.team_store.list_agents(team_id)
+        }
+        names[lead_id] = "lead"
+        return ToolResult(
+            name="ReadMessages",
+            output={
+                "messages": [
+                    {
+                        "message_id": message.message_id,
+                        "from": names.get(message.sender_id, message.sender_id),
+                        "sender_id": message.sender_id,
+                        "summary": message.summary,
+                        "message": message.content,
+                        "status": message.status,
+                    }
+                    for message in incoming
+                ]
+            },
+        )
 
 
 class RemoteTriggerTool:
@@ -117,4 +258,3 @@ class TestingPermissionTool:
 
     def run(self, tool_input: dict[str, Any], context: ToolContext) -> ToolResult:
         return ToolResult(name="TestingPermission", output="TestingPermission executed successfully", content_type="text")
-

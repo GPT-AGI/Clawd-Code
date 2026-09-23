@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 from pathlib import Path
 import tempfile
 import json
@@ -19,6 +19,7 @@ from src.config import (
     set_api_key,
     set_default_provider,
     get_default_provider,
+    use_model_profile,
     _encode_api_key,
     _decode_api_key
 )
@@ -43,7 +44,7 @@ class TestConfigPath(unittest.TestCase):
             self.assertFalse(config_dir.exists())
 
             with patch('src.config.Path.home', return_value=home):
-                path = get_config_path()
+                get_config_path()
                 self.assertTrue(config_dir.exists())
 
 
@@ -59,6 +60,7 @@ class TestDefaultConfig(unittest.TestCase):
         self.assertIn("anthropic", config["providers"])
         self.assertIn("openai", config["providers"])
         self.assertIn("glm", config["providers"])
+        self.assertIn("qwen", config["providers"])
 
     def test_default_provider_is_anthropic(self):
         """Test that default provider is Anthropic."""
@@ -80,6 +82,22 @@ class TestDefaultConfig(unittest.TestCase):
             config["providers"]["glm"]["default_model"],
             "zai/glm-5"
         )
+        self.assertEqual(config["providers"]["qwen"]["default_model"], "ms-mnhdj86z")
+        self.assertTrue(config["providers"]["qwen"]["base_url"].endswith("/ms-mnhdj86z/v1"))
+
+    def test_existing_config_is_migrated_with_qwen_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / ".clawd" / "config.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                json.dumps({"default_provider": "glm", "providers": {"glm": {"api_key": ""}}}),
+                encoding="utf-8",
+            )
+            with patch('src.config.get_config_path', return_value=config_path):
+                config = load_config()
+
+            self.assertIn("qwen", config["providers"])
+            self.assertEqual(config["providers"]["glm"]["default_model"], "zai/glm-5")
 
 
 class TestAPIKeyEncoding(unittest.TestCase):
@@ -314,6 +332,34 @@ class TestDefaultProvider(unittest.TestCase):
             with patch('src.config.get_config_path', return_value=config_path):
                 provider = get_default_provider()
                 self.assertEqual(provider, "anthropic")
+
+    def test_model_profiles_switch_protocol_endpoint_and_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / ".clawd" / "config.json"
+            with patch('src.config.get_config_path', return_value=config_path):
+                use_model_profile("qwen3.5")
+                self.assertEqual(get_default_provider(), "qwen")
+                qwen = get_provider_config("qwen")
+                self.assertEqual(qwen["default_model"], "ms-mnhdj86z")
+
+                use_model_profile("glm5")
+                self.assertEqual(get_default_provider(), "anthropic")
+                glm = get_provider_config("anthropic")
+                self.assertEqual(glm["base_url"], "https://api.z.ai/api/anthropic")
+                self.assertEqual(glm["default_model"], "glm-5.2")
+
+    def test_profile_switch_preserves_saved_api_keys(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / ".clawd" / "config.json"
+            with patch('src.config.get_config_path', return_value=config_path):
+                set_api_key("anthropic", "glm-secret")
+                set_api_key("qwen", "qwen-secret")
+                use_model_profile("qwen")
+                use_model_profile("glm")
+                config = load_config()
+
+            self.assertEqual(config["providers"]["anthropic"]["api_key"], "glm-secret")
+            self.assertEqual(config["providers"]["qwen"]["api_key"], "qwen-secret")
 
 
 if __name__ == '__main__':

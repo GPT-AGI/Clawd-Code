@@ -48,6 +48,11 @@ class OpenAICompatibleProvider(BaseProvider):
     The client is created lazily on first use.
     """
 
+    # OpenAI-compatible gateways do not uniformly support stream_options.
+    # Providers that do must opt in so non-streaming and legacy endpoints are
+    # not sent an unsupported parameter.
+    STREAM_INCLUDE_USAGE = False
+
     def __init__(
         self,
         api_key: str,
@@ -83,11 +88,28 @@ class OpenAICompatibleProvider(BaseProvider):
     def _build_usage_dict(self, usage: Any) -> dict[str, Any]:
         if usage is None:
             return {}
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        if isinstance(prompt_details, dict):
+            cached_tokens = prompt_details.get("cached_tokens", 0)
+        else:
+            cached_tokens = getattr(prompt_details, "cached_tokens", 0)
         return {
             "input_tokens": getattr(usage, "prompt_tokens", 0),
             "output_tokens": getattr(usage, "completion_tokens", 0),
             "total_tokens": getattr(usage, "total_tokens", 0),
+            "cache_read_input_tokens": cached_tokens or 0,
         }
+
+    def _build_request_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build provider-specific request options after common argument filtering."""
+        return {k: v for k, v in kwargs.items() if k not in ["model", "tools"]}
+
+    def _build_stream_request_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build streaming options, requesting the terminal usage chunk when supported."""
+        options = self._build_request_kwargs(kwargs)
+        if self.STREAM_INCLUDE_USAGE:
+            options.setdefault("stream_options", {"include_usage": True})
+        return options
 
     def chat(
         self,
@@ -121,7 +143,7 @@ class OpenAICompatibleProvider(BaseProvider):
             model=model,
             messages=provider_messages,
             **extra_kwargs,
-            **{k: v for k, v in kwargs.items() if k not in ["model", "tools"]},
+            **self._build_request_kwargs(kwargs),
         )
 
         # Extract content
@@ -192,7 +214,7 @@ class OpenAICompatibleProvider(BaseProvider):
             messages=provider_messages,
             stream=True,
             **extra_kwargs,
-            **{k: v for k, v in kwargs.items() if k not in ["model", "tools"]},
+            **self._build_stream_request_kwargs(kwargs),
         )
 
         for chunk in stream:
@@ -220,7 +242,7 @@ class OpenAICompatibleProvider(BaseProvider):
             messages=provider_messages,
             stream=True,
             **extra_kwargs,
-            **{k: v for k, v in kwargs.items() if k not in ["model", "tools"]},
+            **self._build_stream_request_kwargs(kwargs),
         )
 
         content_parts: list[str] = []

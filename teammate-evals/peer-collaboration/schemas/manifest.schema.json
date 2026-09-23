@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Clawd peer collaboration manifest",
+  "type": "object",
+  "required": [
+    "schema_version", "run_id", "created_at", "config", "repo_path",
+    "repo_revision", "mission_sha256", "mission", "peer_ids", "backend",
+    "noncommunication_tools", "communication_tools", "process_isolation"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer"},
+    "run_id": {"type": "string"},
+    "created_at": {"type": "string"},
+    "config": {
+      "type": "object",
+      "required": [
+        "repo_path", "mission", "peers", "communication", "workspace_mode",
+        "provider", "timeout_seconds", "max_turns", "max_output_tokens",
+        "cleanup_worktrees"
+      ]
+    },
+    "repo_path": {"type": "string"},
+    "repo_revision": {"type": "string"},
+    "mission_sha256": {"type": "string"},
+    "mission": {"type": "string"},
+    "peer_ids": {"type": "array", "items": {"type": "string"}},
+    "backend": {"type": "string"},
+    "noncommunication_tools": {"type": "array", "items": {"type": "string"}},
+    "communication_tools": {"type": "array", "items": {"type": "string"}},
+    "process_isolation": {"type": "boolean"}
+  }
+}
