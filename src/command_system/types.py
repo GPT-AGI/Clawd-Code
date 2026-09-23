@@ -54,6 +54,10 @@ class CommandContext:
     cost_tracker: Any
     history: Any
     config: dict[str, Any] = field(default_factory=dict)
+    # Active LLM provider, so a command can inspect or reconfigure it
+    # (model/provider switching, status readouts). Optional and defaulted,
+    # so existing callers are unaffected.
+    provider: Any = None
 
 
 # Protocol for local command callables
