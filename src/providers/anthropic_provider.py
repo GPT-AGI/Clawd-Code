@@ -57,10 +57,31 @@ class AnthropicProvider(BaseProvider):
                 if text_val is not None:
                     content_text += str(text_val)
             elif block_type == "tool_use":
+                tool_name = str(getattr(block, "name", ""))
+                raw_input = getattr(block, "input", {})
+                parsed_input = dict(raw_input)
+
+                if tool_name.lower() == "sendusermessage":
+                    raw_input_keys = (
+                        sorted(raw_input.keys())
+                        if isinstance(raw_input, dict)
+                        else []
+                    )
+                    print(
+                        "[TRACE Anthropic raw SendUserMessage] "
+                        f"input_type={type(raw_input).__name__} "
+                        f"input_keys={raw_input_keys}"
+                    )
+                    print(
+                        "[TRACE Anthropic parsed SendUserMessage] "
+                        f"input_type={type(parsed_input).__name__} "
+                        f"input_keys={sorted(parsed_input.keys())}"
+                    )
+
                 tool_uses.append({
                     "id": str(getattr(block, "id", "")),
-                    "name": str(getattr(block, "name", "")),
-                    "input": dict(getattr(block, "input", {})),
+                    "name": tool_name,
+                    "input": parsed_input,
                 })
 
         usage = getattr(response, "usage", None)
@@ -181,12 +202,66 @@ class AnthropicProvider(BaseProvider):
             **extra_kwargs,
             **{k: v for k, v in kwargs.items() if k not in ["model", "max_tokens", "tools"]},
         ) as stream:
-            for text in stream.text_stream:
-                if not text:
-                    continue
-                streamed_text += text
-                if on_text_chunk is not None:
-                    on_text_chunk(text)
+            send_user_input_json_events = 0
+            send_user_input_json_chars = 0
+            send_user_block_active = False
+
+            for event in stream:
+                event_type = getattr(event, "type", "")
+
+                if event_type == "text":
+                    text = getattr(event, "text", "")
+                    if not text:
+                        continue
+
+                    streamed_text += text
+
+                    if on_text_chunk is not None:
+                        on_text_chunk(text)
+
+                elif event_type == "content_block_start":
+                    content_block = getattr(event, "content_block", None)
+                    block_type = getattr(content_block, "type", "")
+                    block_name = str(getattr(content_block, "name", ""))
+
+                    send_user_block_active = (
+                        block_type == "tool_use"
+                        and block_name.lower() == "sendusermessage"
+                    )
+
+                    if send_user_block_active:
+                        raw_start_input = getattr(content_block, "input", {})
+                        start_keys = (
+                            sorted(raw_start_input.keys())
+                            if isinstance(raw_start_input, dict)
+                            else []
+                        )
+                        print(
+                            "[TRACE Anthropic stream SendUserMessage start] "
+                            f"input_keys={start_keys}"
+                        )
+
+                elif event_type == "input_json" and send_user_block_active:
+                    partial_json = getattr(event, "partial_json", "")
+                    send_user_input_json_events += 1
+
+                    if isinstance(partial_json, str):
+                        send_user_input_json_chars += len(partial_json)
+
+                elif event_type == "content_block_stop":
+                    content_block = getattr(event, "content_block", None)
+                    block_name = str(getattr(content_block, "name", ""))
+
+                    if (
+                        send_user_block_active
+                        or block_name.lower() == "sendusermessage"
+                    ):
+                        print(
+                            "[TRACE Anthropic stream SendUserMessage deltas] "
+                            f"input_json_events={send_user_input_json_events} "
+                            f"json_chars={send_user_input_json_chars}"
+                        )
+                        send_user_block_active = False
             try:
                 final_message = stream.get_final_message()
             except Exception:

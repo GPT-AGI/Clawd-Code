@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 from src.providers import get_provider_class
 from src.providers.anthropic_provider import AnthropicProvider
@@ -135,7 +136,10 @@ class TestAnthropicProvider(unittest.TestCase):
         mock_stream = MagicMock()
         mock_stream.__enter__.return_value = mock_stream
         mock_stream.__exit__.return_value = False
-        mock_stream.text_stream = iter(["Hello", " world"])
+        mock_stream.__iter__.return_value = iter([
+            SimpleNamespace(type="text", text="Hello"),
+            SimpleNamespace(type="text", text=" world"),
+        ])
 
         final_response = MagicMock()
         text_block = MagicMock()
@@ -167,6 +171,10 @@ class TestAnthropicProvider(unittest.TestCase):
         self.assertEqual(response.content, "Hello world")
         self.assertEqual(response.finish_reason, "tool_use")
         self.assertEqual(response.tool_uses[0]["name"], "Read")
+        self.assertEqual(
+            response.tool_uses[0]["input"],
+            {"file_path": "README.md"},
+        )
 
 
 class TestOpenAIProvider(unittest.TestCase):
@@ -284,6 +292,10 @@ class TestOpenAIProvider(unittest.TestCase):
         self.assertEqual(response.content, "Hello")
         self.assertEqual(response.finish_reason, "tool_calls")
         self.assertEqual(response.tool_uses[0]["name"], "Read")
+        self.assertEqual(
+            response.tool_uses[0]["input"],
+            {"file_path": "README.md"},
+        )
         self.assertEqual(response.usage["total_tokens"], 15)
 
 

@@ -308,6 +308,23 @@ def run_agent_loop(
             api_messages = openai_messages
 
         call_kwargs: dict[str, Any] = {"tools": tool_schemas}
+
+        if _is_anthropic_provider(provider):
+            send_user_schema = next(
+                (
+                    schema
+                    for schema in tool_schemas
+                    if schema.get("name") == "SendUserMessage"
+                ),
+                None,
+            )
+            if send_user_schema is not None:
+                print(
+                    "[TRACE SendUserMessage schema] "
+                    f"turn={turn_count} "
+                    f"strict={send_user_schema.get('strict')} "
+                    f"required={send_user_schema.get('input_schema', {}).get('required', [])}"
+                )
         if _is_anthropic_provider(provider):
             call_kwargs["system"] = effective_system_prompt
         else:
@@ -404,6 +421,20 @@ def run_agent_loop(
                 # Use dispatch to get proper validation and result wrapping
                 from ..tool_system.protocol import ToolCall
                 call = ToolCall(name=tool_name, input=tool_input, tool_use_id=tool_id)
+                if tool_name.lower() == "sendusermessage":
+                    safe_input_keys = (
+                        sorted(tool_input.keys())
+                        if isinstance(tool_input, dict)
+                        else []
+                    )
+                    print(
+                        "[TRACE SendUserMessage] "
+                        f"turn={turn_count} "
+                        f"tool_use_id={tool_id} "
+                        f"input_type={type(tool_input).__name__} "
+                        f"input_keys={safe_input_keys}"
+                    )
+
                 result = tool_registry.dispatch(call, tool_context)
                 result_output = result.output
                 if tool_name.lower() == "sendusermessage" and isinstance(result_output, dict):

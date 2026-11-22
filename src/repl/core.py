@@ -100,11 +100,22 @@ from src.history import HistoryLog
 class ClawdREPL:
     """Interactive REPL for Clawd Codex."""
 
-    def __init__(self, provider_name: str = "glm", stream: bool = False):
+    def __init__(
+        self,
+        provider_name: str = "glm",
+        stream: bool = False,
+        workspace_root: Path | None = None,
+    ):
         self.console = Console()
         self.provider_name = provider_name
         self.stream = stream
         self.multiline_mode = False
+
+        # Determine authoritative workspace root once; all subsequent consumers
+        # use self._workspace_root so there is exactly one source of truth.
+        self._workspace_root: Path = (
+            workspace_root.resolve() if workspace_root is not None else Path.cwd()
+        )
 
         # Load configuration
         config = get_provider_config(provider_name)
@@ -128,7 +139,7 @@ class ClawdREPL:
         )
 
         self.tool_registry = build_default_registry()
-        self.tool_context = ToolContext(workspace_root=Path.cwd())
+        self.tool_context = ToolContext(workspace_root=self._workspace_root)
         self.tool_context.ask_user = self._ask_user_questions
         # Permission handler with status control for proper input handling
         self._current_status = None
@@ -352,9 +363,9 @@ class ClawdREPL:
         self.cost_tracker = CostTracker()
         self.history_log = HistoryLog()
 
-        # Create command context
+        # Create command context using the same authoritative workspace root
         self.command_context = create_command_context(
-            workspace_root=Path.cwd(),
+            workspace_root=self._workspace_root,
             conversation=self.session.conversation,
             cost_tracker=self.cost_tracker,
             history=self.history_log,
@@ -552,11 +563,12 @@ class ClawdREPL:
         return text
 
     def _display_cwd(self) -> str:
-        cwd = str(Path.cwd())
+        """Return a display-friendly representation of the authoritative workspace root."""
+        workspace = str(self._workspace_root)
         home = str(Path.home())
-        if cwd.startswith(home):
-            return cwd.replace(home, "~", 1)
-        return cwd
+        if workspace.startswith(home):
+            return workspace.replace(home, "~", 1)
+        return workspace
 
     def _truncate_middle(self, text: str, limit: int) -> str:
         if limit <= 0 or len(text) <= limit:

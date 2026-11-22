@@ -47,6 +47,12 @@ Examples:
         action='store_true',
         help='Enable live response rendering in the REPL'
     )
+    parser.add_argument(
+        '--workspace',
+        metavar='PATH',
+        default=None,
+        help='Workspace/project root directory for the REPL (default: current working directory)'
+    )
 
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
@@ -75,7 +81,38 @@ Examples:
         return show_config()
 
     # Default: start REPL
-    return start_repl(stream=args.stream)
+    workspace = _resolve_workspace(args.workspace)
+    if workspace is None and args.workspace is not None:
+        # _resolve_workspace already printed the error
+        return 1
+    return start_repl(stream=args.stream, workspace=workspace)
+
+
+def _resolve_workspace(workspace_arg: str | None) -> Path | None:
+    """Resolve and validate the workspace path argument.
+
+    Returns the resolved canonical Path on success, or None on failure (error
+    is printed to stderr before returning).  Returns None also when
+    workspace_arg is None (caller must distinguish via the original arg).
+    """
+    if workspace_arg is None:
+        return None
+
+    try:
+        p = Path(workspace_arg).expanduser().resolve()
+    except Exception as exc:
+        print(f"Error: invalid workspace path '{workspace_arg}': {exc}", file=sys.stderr)
+        return None
+
+    if not p.exists():
+        print(f"Error: workspace does not exist: {p}", file=sys.stderr)
+        return None
+
+    if not p.is_dir():
+        print(f"Error: workspace is not a directory: {p}", file=sys.stderr)
+        return None
+
+    return p
 
 
 def _show_provider_defaults_table() -> None:
@@ -191,13 +228,19 @@ def show_config():
     return 0
 
 
-def start_repl(stream: bool = False):
-    """Start interactive REPL."""
+def start_repl(stream: bool = False, workspace: Path | None = None):
+    """Start interactive REPL.
+
+    Args:
+        stream: Enable live response rendering.
+        workspace: Explicit workspace root directory.  When None the REPL uses
+                   its default (Path.cwd() at construction time).
+    """
     from src.config import get_default_provider
     from src.repl import ClawdREPL
 
     provider = get_default_provider()
-    repl = ClawdREPL(provider_name=provider, stream=stream)
+    repl = ClawdREPL(provider_name=provider, stream=stream, workspace_root=workspace)
     repl.run()
     return 0
 

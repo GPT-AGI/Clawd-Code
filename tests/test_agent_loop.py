@@ -9,6 +9,8 @@ from src.agent.conversation import Conversation
 from src.providers.base import ChatResponse
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.context import ToolContext
+from src.tool_system.protocol import ToolCall
+from src.tool_system.errors import ToolInputError
 from src.tool_system.agent_loop import run_agent_loop, AgentLoopResult
 
 
@@ -26,6 +28,35 @@ class TestAgentLoop(unittest.TestCase):
         """Clean up test fixtures."""
         self.temp_dir.cleanup()
 
+    def test_send_user_message_registry_rejects_missing_required_input(self):
+        """Registry rejects malformed SendUserMessage input before execution."""
+        with self.assertRaises(ToolInputError):
+            self.registry.dispatch(
+                ToolCall(
+                    name="SendUserMessage",
+                    input={},
+                    tool_use_id="toolu_bad_send",
+                ),
+                self.context,
+            )
+
+    def test_send_user_message_registry_accepts_required_input(self):
+        """Registry accepts complete SendUserMessage input."""
+        result = self.registry.dispatch(
+            ToolCall(
+                name="SendUserMessage",
+                input={
+                    "message": "hello",
+                    "status": "normal",
+                },
+                tool_use_id="toolu_good_send",
+            ),
+            self.context,
+        )
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.output["message"], "hello")
+        self.assertEqual(result.tool_use_id, "toolu_good_send")
     def test_agent_loop_calls_tool(self):
         """Test agent loop correctly dispatches a tool call from mocked LLM."""
         conversation = Conversation()
