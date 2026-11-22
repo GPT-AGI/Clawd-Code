@@ -79,25 +79,27 @@ class TestREPL(unittest.TestCase):
                     mock_provider.model = "glm-4.5"
                     mock_provider_class.return_value = Mock(return_value=mock_provider)
 
-                    repl = ClawdREPL(provider_name="glm")
+                    # Pass workspace_root at construction time; ClawdREPL captures it
+                    # once in self._workspace_root and _display_cwd() reads that field
+                    # directly — a post-construction Path.cwd() patch cannot reach it.
+                    repl = ClawdREPL(provider_name="glm", workspace_root=Path(self.temp_dir))
 
-                    with patch('src.repl.core.Path.cwd', return_value=Path(self.temp_dir)):
-                        # Capture stdout to verify fallback path output
-                        import io
-                        from contextlib import redirect_stdout
+                    # Capture stdout to verify startup-header path output
+                    import io
+                    from contextlib import redirect_stdout
 
-                        f = io.StringIO()
-                        with redirect_stdout(f):
-                            repl._print_startup_header()
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        repl._print_startup_header()
 
-                        rendered = f.getvalue()
-                        self.assertIn("Clawd Codex", rendered)
-                        self.assertIn("glm-4.5", rendered)
-                        self.assertIn("GLM Provider", rendered)
-                        # Path may be truncated, just check start and end parts
-                        self.assertTrue(
-                            self.temp_dir[:20] in rendered or self.temp_dir[-20:] in rendered
-                        )
+                    rendered = f.getvalue()
+                    self.assertIn("Clawd Codex", rendered)
+                    self.assertIn("glm-4.5", rendered)
+                    self.assertIn("GLM Provider", rendered)
+                    # Path may be truncated, just check start and end parts
+                    self.assertTrue(
+                        self.temp_dir[:20] in rendered or self.temp_dir[-20:] in rendered
+                    )
 
     def test_handle_command_exit(self):
         """Test /exit command."""

@@ -184,6 +184,20 @@ class ClawdREPL:
                     buf.insert_text("/")
                     buf.start_completion(select_first=False)
 
+        # On Windows, prompt_toolkit attempts Win32Output which crashes with
+        # NoConsoleScreenBufferError when stdout is not a real console (e.g.
+        # under pytest, CI, or Cygwin/MSYS2 terminals).  Inject DummyOutput
+        # in those non-interactive contexts so construction always succeeds;
+        # in a real interactive session isatty() is True and the kwarg is
+        # omitted so prompt_toolkit auto-selects the correct native backend.
+        _pt_output_kwargs: dict[str, Any] = {}
+        if not sys.stdout.isatty():
+            try:
+                from prompt_toolkit.output import DummyOutput as _DummyOutput
+                _pt_output_kwargs["output"] = _DummyOutput()
+            except Exception:
+                pass
+
         self.prompt_session = PromptSession(
             history=FileHistory(str(history_file)),
             auto_suggest=AutoSuggestFromHistory(),
@@ -193,6 +207,7 @@ class ClawdREPL:
             }),
             key_bindings=self.bindings,
             complete_while_typing=True,
+            **_pt_output_kwargs,
         )
 
     def _ask_user_questions(self, questions: list[dict]) -> dict[str, str]:
