@@ -492,5 +492,61 @@ class TestCompoundCdReachesBash(unittest.TestCase):
         mock_run.assert_called_once()
 
 
+# ---------------------------------------------------------------------------
+# 16. Windows text-decoding policy regression
+# ---------------------------------------------------------------------------
+
+class TestWindowsTextDecoding(unittest.TestCase):
+    """Bash subprocess output must use an explicit decoding policy."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.ctx = ToolContext(workspace_root=self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_explicit_text_decoding_policy(self):
+        fake_shell = [r"C:\tools\git\bin\bash.exe", "-lc"]
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = "Ünïcödé output: café résumé naïve\n"
+        mock_proc.stderr = ""
+        mock_proc.returncode = 0
+
+        with patch(
+            "src.tool_system.tools.bash._find_shell",
+            return_value=fake_shell,
+        ), patch(
+            "src.tool_system.tools.bash.subprocess.run",
+            return_value=mock_proc,
+        ) as mock_run:
+            result = BashTool().run(
+                {"command": "echo hello"},
+                self.ctx,
+            )
+
+        kwargs = mock_run.call_args.kwargs
+
+        # text mode must be enabled
+        self.assertTrue(kwargs["text"])
+
+        # encoding must be explicitly UTF-8 (not the Windows locale default)
+        self.assertEqual(kwargs["encoding"].lower(), "utf-8")
+
+        # errors="replace" prevents decoding failures from terminating the tool
+        # and makes undecodable sequences visible as replacement characters
+        # rather than silently dropping them.
+        self.assertEqual(kwargs["errors"].lower(), "replace")
+        self.assertNotEqual(kwargs["errors"].lower(), "ignore")
+
+        # successful ToolResult semantics
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.output["exit_code"], 0)
+        self.assertEqual(result.output["stdout"], mock_proc.stdout)
+        self.assertEqual(result.output["stderr"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
