@@ -1,6 +1,11 @@
 import json
+from unittest.mock import MagicMock
 
-from src.tool_system.agent_loop import _build_openai_tool_result_content
+from src.agent.conversation import Conversation
+from src.providers.anthropic_provider import AnthropicProvider
+from src.providers.base import ChatResponse
+from src.tool_system.agent_loop import _build_openai_tool_result_content, run_agent_loop
+from src.tool_system.context import ToolContext
 from src.tool_system.defaults import build_default_registry
 
 
@@ -71,15 +76,43 @@ def test_send_user_message_has_strict_required_schema():
     ]
 
 
-def test_agent_loop_forwards_strict_tools_to_anthropic():
-    """Anthropic tool definitions must preserve ToolSpec.strict."""
-    from pathlib import Path
+def _tools_sent_to(provider, workspace):
+    """Run one agent-loop turn and return the tool schemas the provider got."""
+    provider.chat_stream_response = MagicMock(side_effect=NotImplementedError())
+    provider.chat = MagicMock(
+        return_value=ChatResponse(
+            content="done",
+            model="test-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+            finish_reason="stop",
+            tool_uses=None,
+        )
+    )
+    conversation = Conversation()
+    conversation.add_user_message("hi")
 
-    source = Path("src/tool_system/agent_loop.py").read_text(
-        encoding="utf-8"
+    run_agent_loop(
+        conversation=conversation,
+        provider=provider,
+        tool_registry=build_default_registry(),
+        tool_context=ToolContext(workspace_root=workspace),
     )
 
-    assert "_is_anthropic_provider(provider)" in source
-    assert 'spec.name == "SendUserMessage"' in source
-    assert "and spec.strict" in source
-    assert 'tool_schema["strict"] = True' in source
+    return provider.chat.call_args.kwargs["tools"]
+
+
+def test_agent_loop_forwards_strict_tools_to_anthropic(tmp_path):
+    """Anthropic receives SendUserMessage, and only it, marked strict."""
+    tools = _tools_sent_to(AnthropicProvider(api_key="test_key"), tmp_path)
+
+    assert [tool["name"] for tool in tools if tool.get("strict")] == [
+        "SendUserMessage"
+    ]
+
+
+def test_agent_loop_sends_no_strict_flag_to_other_providers(tmp_path):
+    """OpenAI-style providers never receive the Anthropic-only strict key."""
+    tools = _tools_sent_to(MagicMock(), tmp_path)
+
+    assert tools
+    assert not any("strict" in tool for tool in tools)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
@@ -56,6 +57,24 @@ class TestREPL(unittest.TestCase):
                     self.assertEqual(repl.provider_name, "glm")
                     self.assertFalse(repl.stream)
                     self.assertFalse(repl.multiline_mode)
+
+    @unittest.skipIf(sys.platform == "win32", "DummyOutput is the intended fallback on Windows")
+    def test_prompt_output_not_silenced_off_windows(self):
+        """Off Windows, a non-terminal stdout keeps prompt_toolkit's own output."""
+        from prompt_toolkit.output import DummyOutput
+
+        with patch('src.config.get_config_path', return_value=self.config_dir / "config.json"):
+            with patch('src.repl.core.Session.create') as mock_session:
+                mock_session.return_value = Mock()
+
+                with patch('src.repl.core.get_provider_class') as mock_provider_class:
+                    mock_provider = Mock()
+                    mock_provider.model = "glm-4.5"
+                    mock_provider_class.return_value = mock_provider
+
+                    repl = ClawdREPL(provider_name="glm")
+
+        self.assertNotIsInstance(repl.prompt_session.app.output, DummyOutput)
 
     def test_repl_initialization_with_stream_enabled(self):
         """Test REPL can start with stream mode enabled."""

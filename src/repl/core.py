@@ -190,8 +190,10 @@ class ClawdREPL:
         # in those non-interactive contexts so construction always succeeds;
         # in a real interactive session isatty() is True and the kwarg is
         # omitted so prompt_toolkit auto-selects the correct native backend.
+        # Windows only: elsewhere prompt_toolkit already falls back to plain
+        # text, and DummyOutput would hide the prompt (e.g. `clawd | tee log`).
         _pt_output_kwargs: dict[str, Any] = {}
-        if not sys.stdout.isatty():
+        if sys.platform == "win32" and not sys.stdout.isatty():
             try:
                 from prompt_toolkit.output import DummyOutput as _DummyOutput
                 _pt_output_kwargs["output"] = _DummyOutput()
