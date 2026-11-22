@@ -428,7 +428,10 @@ def run_agent_loop(
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, result_output)
+                    conversation.add_tool_result_message(
+                        tool_id,
+                        _build_openai_tool_result_content(result_output),
+                    )
                 else:
                     # Add tool result in OpenAI format
                     openai_messages.append({
