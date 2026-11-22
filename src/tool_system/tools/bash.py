@@ -174,6 +174,11 @@ class BashTool:
         if not isinstance(timeout_s, int) or timeout_s < 1 or timeout_s > 600:
             raise ToolInputError("timeout_s must be an integer between 1 and 600")
 
+        # A missing cwd makes subprocess raise FileNotFoundError too; report it
+        # here so it is not mistaken for a missing bash executable below.
+        if not cwd.is_dir():
+            raise ToolInputError(f"working directory does not exist: {cwd}")
+
         # Discover the shell on each call so that tests can mock _find_shell
         # or platform.system without module-level caching complications.
         shell_argv = _find_shell()

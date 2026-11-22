@@ -108,6 +108,14 @@ class TestSubprocessFileNotFoundError(unittest.TestCase):
         self.assertIn("not found", msg.lower())
         self.assertNotIn("WinError", msg)
 
+    def test_missing_cwd_is_reported_as_missing_cwd(self):
+        # A missing working directory also raises FileNotFoundError in
+        # subprocess; it must not be reported as a missing bash executable.
+        missing = self.root / "nope"
+        with self.assertRaises(ToolInputError) as cm:
+            BashTool().run({"command": "echo hi", "cwd": str(missing)}, self.ctx)
+        self.assertIn(str(missing), str(cm.exception))
+
 
 # ---------------------------------------------------------------------------
 # 4. Non-zero exit preserves normal ToolResult error semantics
