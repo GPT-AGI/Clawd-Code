@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -129,6 +131,34 @@ class TestAnthropicProvider(unittest.TestCase):
         )
 
     @patch("src.providers.anthropic_provider.anthropic.Anthropic")
+    def test_chat_with_send_user_message_writes_nothing_to_stdout(self, mock_anthropic):
+        """Parsing a SendUserMessage tool call prints nothing."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        tool_block = MagicMock()
+        tool_block.type = "tool_use"
+        tool_block.id = "toolu_send"
+        tool_block.name = "SendUserMessage"
+        tool_block.input = {"message": "hello", "status": "normal"}
+        mock_response.content = [tool_block]
+        mock_response.model = "claude-sonnet-4-20250514"
+        mock_response.usage = MagicMock(input_tokens=10, output_tokens=5)
+        mock_response.stop_reason = "tool_use"
+        mock_client.messages.create.return_value = mock_response
+        mock_anthropic.return_value = mock_client
+
+        provider = AnthropicProvider(api_key="test_key")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            response = provider.chat([ChatMessage(role="user", content="Hi")])
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            response.tool_uses[0]["input"],
+            {"message": "hello", "status": "normal"},
+        )
+
+    @patch("src.providers.anthropic_provider.anthropic.Anthropic")
     def test_chat_stream_response_with_tool_use(self, mock_anthropic):
         """Structured streaming returns final text and tool uses."""
         mock_client = MagicMock()
@@ -167,6 +197,10 @@ class TestAnthropicProvider(unittest.TestCase):
         self.assertEqual(response.content, "Hello world")
         self.assertEqual(response.finish_reason, "tool_use")
         self.assertEqual(response.tool_uses[0]["name"], "Read")
+        self.assertEqual(
+            response.tool_uses[0]["input"],
+            {"file_path": "README.md"},
+        )
 
 
 class TestOpenAIProvider(unittest.TestCase):
@@ -284,6 +318,10 @@ class TestOpenAIProvider(unittest.TestCase):
         self.assertEqual(response.content, "Hello")
         self.assertEqual(response.finish_reason, "tool_calls")
         self.assertEqual(response.tool_uses[0]["name"], "Read")
+        self.assertEqual(
+            response.tool_uses[0]["input"],
+            {"file_path": "README.md"},
+        )
         self.assertEqual(response.usage["total_tokens"], 15)
 
 

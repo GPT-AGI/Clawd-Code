@@ -267,11 +267,18 @@ def run_agent_loop(
     # Convert tools to schemas (Anthropic format)
     tool_schemas = []
     for spec in tool_registry.list_specs():
-        tool_schemas.append({
+        tool_schema = {
             "name": spec.name,
             "description": spec.description,
             "input_schema": spec.input_schema,
-        })
+        }
+        if (
+            _is_anthropic_provider(provider)
+            and spec.name == "SendUserMessage"
+            and spec.strict
+        ):
+            tool_schema["strict"] = True
+        tool_schemas.append(tool_schema)
 
     # For OpenAI/GLM, keep separate message list in OpenAI format
     openai_messages: list[dict[str, Any]] = []
@@ -428,7 +435,11 @@ def run_agent_loop(
                     ),
                 )
                 if _is_anthropic_provider(provider):
-                    conversation.add_tool_result_message(tool_id, result_output)
+                    conversation.add_tool_result_message(
+                        tool_id,
+                        _build_openai_tool_result_content(result_output),
+                        is_error=result.is_error,
+                    )
                 else:
                     # Add tool result in OpenAI format
                     openai_messages.append({

@@ -28,6 +28,7 @@ class SendUserMessageTool:
             },
             aliases=("Brief",),
             is_read_only=True,
+            strict=True,
             max_result_size_chars=100_000,
         )
 

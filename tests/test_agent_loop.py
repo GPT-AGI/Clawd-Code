@@ -1,14 +1,19 @@
 """Test agent loop with mocked provider to verify tool invocation."""
 
+import contextlib
+import io
 import unittest
 from unittest.mock import MagicMock
 from pathlib import Path
 import tempfile
 
 from src.agent.conversation import Conversation
+from src.providers.anthropic_provider import AnthropicProvider
 from src.providers.base import ChatResponse
 from src.tool_system.defaults import build_default_registry
 from src.tool_system.context import ToolContext
+from src.tool_system.protocol import ToolCall
+from src.tool_system.errors import ToolInputError
 from src.tool_system.agent_loop import run_agent_loop, AgentLoopResult
 
 
@@ -25,6 +30,116 @@ class TestAgentLoop(unittest.TestCase):
     def tearDown(self):
         """Clean up test fixtures."""
         self.temp_dir.cleanup()
+
+    def test_send_user_message_registry_rejects_missing_required_input(self):
+        """Registry rejects malformed SendUserMessage input before execution."""
+        with self.assertRaises(ToolInputError):
+            self.registry.dispatch(
+                ToolCall(
+                    name="SendUserMessage",
+                    input={},
+                    tool_use_id="toolu_bad_send",
+                ),
+                self.context,
+            )
+
+    def test_send_user_message_registry_accepts_required_input(self):
+        """Registry accepts complete SendUserMessage input."""
+        result = self.registry.dispatch(
+            ToolCall(
+                name="SendUserMessage",
+                input={
+                    "message": "hello",
+                    "status": "normal",
+                },
+                tool_use_id="toolu_good_send",
+            ),
+            self.context,
+        )
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.output["message"], "hello")
+        self.assertEqual(result.tool_use_id, "toolu_good_send")
+    def test_anthropic_loop_writes_nothing_to_stdout(self):
+        """A non-verbose Anthropic turn that calls SendUserMessage prints nothing."""
+        provider = AnthropicProvider(api_key="test_key")
+        provider.chat_stream_response = MagicMock(side_effect=NotImplementedError())
+        provider.chat = MagicMock(side_effect=[
+            ChatResponse(
+                content="",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="tool_use",
+                tool_uses=[{
+                    "id": "toolu_send",
+                    "name": "SendUserMessage",
+                    "input": {"message": "hello", "status": "normal"},
+                }],
+            ),
+            ChatResponse(
+                content="done",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+        ])
+        conversation = Conversation()
+        conversation.add_user_message("say hello")
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            run_agent_loop(
+                conversation=conversation,
+                provider=provider,
+                tool_registry=self.registry,
+                tool_context=self.context,
+            )
+
+        self.assertEqual(stdout.getvalue(), "")
+
+
+    def test_anthropic_tool_result_carries_error_flag(self):
+        """A failed tool result is sent back to Anthropic marked as an error."""
+        provider = AnthropicProvider(api_key="test_key")
+        provider.chat_stream_response = MagicMock(side_effect=NotImplementedError())
+        provider.chat = MagicMock(side_effect=[
+            ChatResponse(
+                content="",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="tool_use",
+                # An unknown tool makes the registry return is_error=True
+                # without raising, on any OS.
+                tool_uses=[{"id": "toolu_bad", "name": "NoSuchTool", "input": {}}],
+            ),
+            ChatResponse(
+                content="done",
+                model="test-model",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+                tool_uses=None,
+            ),
+        ])
+        conversation = Conversation()
+        conversation.add_user_message("run it")
+
+        run_agent_loop(
+            conversation=conversation,
+            provider=provider,
+            tool_registry=self.registry,
+            tool_context=self.context,
+        )
+
+        tool_results = [
+            block
+            for message in conversation.get_messages()
+            if isinstance(message["content"], list)
+            for block in message["content"]
+            if block.get("type") == "tool_result"
+        ]
+        self.assertEqual(len(tool_results), 1)
+        self.assertIs(tool_results[0]["is_error"], True)
 
     def test_agent_loop_calls_tool(self):
         """Test agent loop correctly dispatches a tool call from mocked LLM."""

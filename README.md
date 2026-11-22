@@ -126,6 +126,7 @@ clawd              # Start REPL
 clawd login        # Configure API
 clawd --version    # Check version
 clawd config       # View settings
+clawd --workspace PATH   # Use PATH as the project folder
 ```
 
 ***
@@ -392,6 +393,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - API keys obfuscated in config
 - `.env` files ignored
 - Safe for local development workflows
+- File tools are limited to the workspace folder (`--workspace`, default: current directory). Bash commands are **not** restricted to it.
 
 ***
 
@@ -558,6 +560,7 @@ clawd              # 启动 REPL
 clawd login        # 配置 API
 clawd --version    # 检查版本
 clawd config       # 查看设置
+clawd --workspace PATH   # 指定工作区（项目）目录
 ```
 
 ***
@@ -822,6 +825,7 @@ python -m pytest tests/ -v
 - API 密钥在配置中做了基础混淆
 - `.env` 文件被忽略
 - 适合本地开发工作流
+- 文件类工具只能访问工作区目录（`--workspace`，默认为当前目录）；Bash 命令**不受**此限制。
 
 ***
 
