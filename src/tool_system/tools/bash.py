@@ -26,12 +26,30 @@ _DANGEROUS_PATTERNS = [
 ]
 
 
+def _find_git_bash() -> str | None:
+    """Return Git for Windows' bash.exe, located from git.exe on PATH.
+
+    A default Git for Windows install puts <Git>\\cmd on PATH but not
+    bash.exe, which lives in <Git>\\bin.  git.exe itself may sit in
+    <Git>\\cmd, <Git>\\bin or <Git>\\mingw64\\bin.
+    """
+    git = shutil.which("git")
+    if not git:
+        return None
+    for git_root in list(Path(git).parents)[1:3]:
+        candidate = git_root / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def _find_shell() -> list[str]:
     """Return the shell argv prefix to use for command execution.
 
     On POSIX systems the existing behaviour is preserved: ["bash", "-lc"].
 
-    On Windows, shutil.which("bash") is used for deterministic discovery.
+    On Windows, shutil.which("bash") is tried first; if bash is not on PATH,
+    Git for Windows' bash.exe is located from git.exe (see _find_git_bash).
     If bash is not found on Windows, ToolExecutionError is raised with a
     concise actionable message rather than propagating a raw [WinError 2].
     """
@@ -39,10 +57,10 @@ def _find_shell() -> list[str]:
         # Non-Windows: keep the original behaviour exactly.
         return ["bash", "-lc"]
 
-    # Windows: deterministic discovery via PATH only.
-    bash_on_path = shutil.which("bash")
-    if bash_on_path:
-        return [bash_on_path, "-lc"]
+    # Windows: PATH first, then Git for Windows' own bash.
+    bash = shutil.which("bash") or _find_git_bash()
+    if bash:
+        return [bash, "-lc"]
 
     raise ToolExecutionError(
         "Bash is not available on this system. "
@@ -85,6 +103,21 @@ def _is_absolute_path(p: str) -> bool:
     return False
 
 
+_MSYS_DRIVE = re.compile(r"^/([A-Za-z])(?:/|$)")
+
+
+def _msys_to_windows(p: str) -> str:
+    """Map a Git Bash drive path (/d/project) to D:/project on Windows.
+
+    Git Bash prints D:\\project as /d/project, so that is the form a model
+    copies from `pwd`.  Under Windows path rules /d/project would resolve to
+    D:\\d\\project.  Other platforms and other paths are returned unchanged.
+    """
+    if platform.system().lower() != "windows":
+        return p
+    return _MSYS_DRIVE.sub(lambda m: m.group(1).upper() + ":/", p, count=1)
+
+
 def _truncate(s: str, limit: int = 20000) -> str:
     if len(s) <= limit:
         return s
@@ -104,6 +137,7 @@ def _try_extract_cd(command: str) -> Path | None:
     Rejected (three or more tokens — compound, pipe, or CMD-style):
         cd /some/path && git status
         cd /some/path ; pwd
+        cd /some/path;pwd                  (operators need no spaces)
         cd /some/path || exit
         cd /d "D:\\Clawd-Code" && ...      (CMD /d flag -> 3+ tokens)
         cd /d "D:\\Clawd-Code"             (CMD /d flag -> 3 tokens)
@@ -112,14 +146,19 @@ def _try_extract_cd(command: str) -> Path | None:
     if not stripped.startswith("cd "):
         return None
     try:
-        parts = shlex.split(stripped, posix=True)
+        # Like shlex.split, but ; & | < > ( ) are tokens of their own even
+        # without spaces, so "cd sub;pwd" is not mistaken for a plain cd.
+        lexer = shlex.shlex(stripped, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        parts = list(lexer)
     except ValueError:
         return None
     # Exactly two tokens required: ['cd', '<target>'].
     # Three or more tokens means a compound command, shell operator, or
     # extra flags (e.g. CMD /d) -- none of which are standalone Bash cd.
     if len(parts) == 2 and parts[0] == "cd":
-        return Path(parts[1])
+        return Path(_msys_to_windows(parts[1]))
     return None
 
 
@@ -157,7 +196,7 @@ class BashTool:
         if explicit_cwd is not None:
             if not isinstance(explicit_cwd, str) or not _is_absolute_path(explicit_cwd):
                 raise ToolInputError("cwd must be an absolute path when provided")
-            cwd = context.ensure_allowed_path(explicit_cwd)
+            cwd = context.ensure_allowed_path(_msys_to_windows(explicit_cwd))
         else:
             cwd = context.cwd or context.workspace_root
 

@@ -70,6 +70,36 @@ class TestFindShellWindows(unittest.TestCase):
         self.assertIn("Bash", msg)
         self.assertNotIn("WinError", msg)
 
+    def test_git_bash_found_next_to_git_when_bash_not_on_path(self):
+        # A default Git for Windows install puts <Git>\cmd on PATH, not
+        # bash.exe, so bash must be located from git.exe.
+        for git_dir in ("cmd", "bin", "mingw64/bin"):
+            with self.subTest(git_dir=git_dir), tempfile.TemporaryDirectory() as tmp:
+                git_root = Path(tmp) / "Git"
+                (git_root / "bin").mkdir(parents=True)
+                (git_root / git_dir).mkdir(parents=True, exist_ok=True)
+                git_exe = git_root / git_dir / "git.exe"
+                bash_exe = git_root / "bin" / "bash.exe"
+                git_exe.touch()
+                bash_exe.touch()
+                with self._windows_patch(), \
+                     patch("src.tool_system.tools.bash.shutil.which",
+                           side_effect=lambda name: str(git_exe) if name == "git" else None):
+                    result = _find_shell()
+                self.assertEqual(result, [str(bash_exe), "-lc"])
+
+    def test_git_without_bash_next_to_it_still_raises(self):
+        # e.g. a package-manager shim: git.exe on PATH, no Git\bin\bash.exe.
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "shims" / "git.exe"
+            shim.parent.mkdir()
+            shim.touch()
+            with self._windows_patch(), \
+                 patch("src.tool_system.tools.bash.shutil.which",
+                       side_effect=lambda name: str(shim) if name == "git" else None):
+                with self.assertRaises(ToolExecutionError):
+                    _find_shell()
+
     def test_no_cmd_fallback(self):
         # cmd.exe must never be returned as a fallback.
         with self._windows_patch(), \
@@ -375,6 +405,8 @@ class TestTryExtractCd(unittest.TestCase):
     CD-07  cd /d "D:\\Clawd-Code"       -> NOT standalone (CMD /d flag)
     CD-08  standalone cd outside root  -> workspace rejection enforced
     CD-09  git status --short           -> unaffected (not a cd command)
+    CD-10  cd sub;pwd / cd sub&&ls      -> NOT standalone (no spaces needed)
+    CD-11  cd "R&D"                     -> standalone (quoted operator char)
     """
 
     def setUp(self):
@@ -442,6 +474,64 @@ class TestTryExtractCd(unittest.TestCase):
     def test_cd09_normal_command_unaffected(self):
         result = self._extract("git status --short")
         self.assertIsNone(result, "non-cd command must not be intercepted")
+
+    # CD-10: shell operators count even without surrounding spaces
+    def test_cd10_operator_without_spaces_not_standalone(self):
+        for command in ("cd sub;pwd", "cd sub&&ls", "cd sub||exit", "cd sub|cat", "cd sub>out"):
+            with self.subTest(command=command):
+                self.assertIsNone(self._extract(command))
+
+    # CD-11: an operator character inside quotes is part of the directory name
+    def test_cd11_quoted_operator_character_is_standalone(self):
+        self.assertEqual(self._extract('cd "R&D"'), Path("R&D"))
+
+
+# ---------------------------------------------------------------------------
+# Git Bash (MSYS) drive paths: /d/project is D:\project on Windows
+# ---------------------------------------------------------------------------
+
+class TestGitBashDrivePaths(unittest.TestCase):
+    """Git Bash prints D:\\project as /d/project; Windows must map it back."""
+
+    def _platform(self, name):
+        return patch("src.tool_system.tools.bash.platform.system", return_value=name)
+
+    def test_drive_paths_mapped_on_windows(self):
+        from src.tool_system.tools.bash import _msys_to_windows
+        cases = {
+            "/d/project/src": "D:/project/src",
+            "/c": "C:/",
+            "/c/": "C:/",
+            "/tmp/x": "/tmp/x",          # not a drive letter
+            "D:/project": "D:/project",  # already a Windows path
+            "sub/d/x": "sub/d/x",        # relative
+        }
+        with self._platform("Windows"):
+            for given, want in cases.items():
+                with self.subTest(given=given):
+                    self.assertEqual(_msys_to_windows(given), want)
+
+    def test_paths_untouched_off_windows(self):
+        from src.tool_system.tools.bash import _msys_to_windows
+        with self._platform("Linux"):
+            self.assertEqual(_msys_to_windows("/d/project/src"), "/d/project/src")
+
+    def test_standalone_cd_target_mapped_on_windows(self):
+        from src.tool_system.tools.bash import _try_extract_cd
+        with self._platform("Windows"):
+            self.assertEqual(_try_extract_cd("cd /d/project/src"), Path("D:/project/src"))
+
+    def test_explicit_cwd_mapped_before_workspace_check_on_windows(self):
+        # The workspace check must see D:/project, not /d/project.  The check
+        # is stopped right there so the test needs no Windows filesystem.
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = ToolContext(workspace_root=Path(tmp))
+            with self._platform("Windows"), \
+                 patch.object(ToolContext, "ensure_allowed_path",
+                              side_effect=ToolPermissionError("stop")) as check:
+                with self.assertRaises(ToolPermissionError):
+                    BashTool().run({"command": "echo hi", "cwd": "/d/project"}, ctx)
+        self.assertEqual(check.call_args.args[0], "D:/project")
 
 
 # ---------------------------------------------------------------------------
